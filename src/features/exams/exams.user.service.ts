@@ -24,7 +24,7 @@ type SubmitExamPayload = {
   time_taken?: number;
 };
 
-const calculateExamXP = async (
+export const calculateExamXP = async (
   correctCount: number,
   totalQuestions: number
 ): Promise<number> => {
@@ -236,7 +236,7 @@ const sanitizeMedia = (media: AnyObject | null | undefined) => {
   };
 };
 
-const sanitizeQuestionForClient = (
+export const sanitizeQuestionForClient = (
   q: AnyObject,
   options: { includeCorrectAnswers?: boolean } = {}
 ) => ({
@@ -274,7 +274,7 @@ const sanitizeQuestionForClient = (
   category: q.category ?? undefined,
 });
 
-const sanitizeQuestionsForClient = (questions: AnyObject[] = []) => {
+export const sanitizeQuestionsForClient = (questions: AnyObject[] = []) => {
   return questions.map((question) => sanitizeQuestionForClient(question));
 };
 
@@ -578,8 +578,8 @@ const assertSharedGroupMembership = async (
  * Random published, non-premium question ids for a battle paper. The candidate
  * pool is bounded, shuffled in memory and then truncated.
  */
-const selectBattleQuestionIds = async (params: {
-  subjectId: string;
+export const selectGroupBattleQuestionIds = async (params: {
+  subjectId: string | null;
   chapterId: string | null;
   count: number;
   userId: string;
@@ -587,11 +587,12 @@ const selectBattleQuestionIds = async (params: {
   let query = supabase
     .from('questions')
     .select('id')
-    .eq('subject_id', params.subjectId)
     .eq('is_active', true)
     .eq('status', 'published')
     .is('deleted_at', null)
     .limit(MAX_QUESTION_CANDIDATES);
+
+  if (params.subjectId) query = query.eq('subject_id', params.subjectId);
 
   if (params.chapterId) query = query.eq('chapter_id', params.chapterId);
 
@@ -614,6 +615,35 @@ const selectBattleQuestionIds = async (params: {
   const ids = (data || []).map((row: AnyObject) => normalizeId(row.id)).filter(Boolean);
 
   return shuffleInPlace(ids).slice(0, params.count);
+};
+
+/**
+ * Loads the published questions for a group battle, including answer keys.
+ *
+ * Only the backend calls this. The public projection is produced separately
+ * with `sanitizeQuestionsForClient`, so keys never leave the server before
+ * submission.
+ */
+export const loadGroupBattleQuestions = async (questionIds: string[]): Promise<AnyObject[]> => {
+  if (questionIds.length === 0) return [];
+
+  const { data, error } = await supabase
+    .from('questions')
+    .select(EXAM_REVIEW_QUESTION_SELECT_QUERY)
+    .in('id', questionIds)
+    .eq('is_active', true)
+    .eq('status', 'published')
+    .is('deleted_at', null);
+
+  if (error) throw new Error(error.message);
+
+  const byId = new Map<string, AnyObject>(
+    (data || []).map((question: AnyObject) => [normalizeId(question.id), question])
+  );
+
+  return questionIds
+    .map((id) => byId.get(normalizeId(id)))
+    .filter((question): question is AnyObject => Boolean(question));
 };
 
 export class ExamUserService {
@@ -1547,7 +1577,7 @@ export class ExamUserService {
         throw new ExamAttemptError('Subject is required to create a battle', 400);
       }
 
-      questionIds = await selectBattleQuestionIds({
+      questionIds = await selectGroupBattleQuestionIds({
         subjectId,
         chapterId: normalizeId(request?.chapter_id) || null,
         count: requestedQuestionCount,

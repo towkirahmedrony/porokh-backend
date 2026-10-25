@@ -4,6 +4,7 @@ import sendResponse from '../../lib/utils/response';
 import { ExamUserService } from './exams.user.service';
 import { ExamAttemptError, ExamAttemptService } from './exam.attempt.service';
 import { incrementStreakOnExamSubmit } from '../growth/streak.service';
+import { awardGroupXpToActiveGroups } from '../groups/groups.xp';
 
 const getAuthUserId = (req: Request): string => {
   const userId = (req as any).user?.id;
@@ -148,6 +149,13 @@ export const submitExam = catchAsync(async (req: Request, res: Response) => {
         userId,
         message: streakError instanceof Error ? streakError.message : 'unknown error',
       });
+    }
+
+    // Mirror the exact XP that was saved into every active group. This is
+    // fire-and-forget: group XP must never fail or delay an exam submission.
+    const earnedXp = Number((result as any)?.earned_xp ?? 0);
+    if (earnedXp > 0) {
+      void awardGroupXpToActiveGroups(userId, earnedXp);
     }
   }
 

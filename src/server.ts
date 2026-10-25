@@ -5,6 +5,7 @@ import { processDailyStreaks, resetMonthlyFreezes } from './jobs/streak.job'; //
 // 👇 নতুন: এম্বেডিং ওয়ার্কার ইম্পোর্ট করা হলো
 import { startEmbeddingWorker } from './jobs/embedding.worker';
 import { startExamAttemptSweeper } from './jobs/exam.sweeper.job';
+import { initGroupCron } from './jobs/group.job';
 // import { connectRedis } from './config/redis';
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 5000;
@@ -38,6 +39,11 @@ async function bootstrap() {
     // Marks attempts that are past their deadline plus the submission grace
     // window as expired. Runs every five minutes.
     startExamAttemptSweeper();
+
+    // ==========================================
+    // 🌟 Group competition maintenance 🌟
+    // ==========================================
+    initGroupCron();
 
     // প্রতিদিন রাত ১২:০১ মিনিটে স্ট্রিক প্রসেস হবে
     cron.schedule('1 0 * * *', () => {

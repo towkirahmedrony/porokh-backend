@@ -15,6 +15,10 @@ import dashboardAdminRoutes from './features/dashboard/dashboard.admin.routes';
 import mediaRoutes from './features/media/media.routes';
 import enterpriseRoutes from './features/enterprise/enterprise.routes';
 import leaderboardRoutes from './features/leaderboard/leaderboard.routes';
+import groupRoutes from './features/groups/groups.routes';
+import groupBattleRoutes from './features/groups/groupBattles.routes';
+import groupInternalRoutes from './features/groups/groups.internal.routes';
+import { GROUP_ERROR_CODES } from './features/groups/groups.errors';
 
 // এক্সাম, সিস্টেম, ফাইন্যান্স, নোটিফিকেশন এবং হিস্ট্রি রাউট ইম্পোর্ট
 import { ExamUserRoutes } from './features/exams/exams.user.routes';
@@ -139,6 +143,12 @@ app.use('/api/v1/reports', reportRoutes); // Retain original route
 
 app.use('/api/v1/leaderboard', leaderboardRoutes);
 
+// 🏠 Groups: squads, communities, group battles and their leaderboards
+app.use('/api/v1/groups', groupRoutes);
+app.use('/api/v1/battles', groupBattleRoutes);
+app.use('/api/v1/internal', groupInternalRoutes);
+app.use('/internal', groupInternalRoutes);
+
 // এক্সাম মডিউট রাউট
 app.use('/api/v1/exams/user', ExamUserRoutes);
 app.use('/api/v1/exams/admin', ExamAdminRoutes);
@@ -199,6 +209,7 @@ const EXPOSED_ERROR_CODES = new Set([
   'ALREADY_ATTEMPTED',
   'PAYMENT_NOT_PENDING',
   'VALIDATION_FAILED',
+  ...GROUP_ERROR_CODES,
 ]);
 
 /**
@@ -246,7 +257,9 @@ app.use((err: CustomError, req: Request, res: Response, next: NextFunction) => {
   const candidateCode =
     typeof err.errorCode === 'string' ? err.errorCode : typeof err.code === 'string' ? err.code : undefined;
   const code =
-    candidateCode && EXPOSED_ERROR_CODES.has(candidateCode) ? candidateCode : undefined;
+    candidateCode && statusCode < 500 && EXPOSED_ERROR_CODES.has(candidateCode)
+      ? candidateCode
+      : undefined;
   const details =
     statusCode < 500 && err.details !== undefined ? err.details : undefined;
 
