@@ -3,6 +3,8 @@ import crypto from 'crypto';
 import { supabaseAdmin } from '../../config/supabaseAdmin';
 import { groupError, mapDataError } from './groups.errors';
 import { notifyGroupUsers } from './groups.notifications';
+import { buildReplyMeta, containsBlockedContact } from './groups.chat';
+import { isUuid, isValidSlug, normalizeReportReason, normalizeSlug } from './groups.validation';
 
 type AnyObject = Record<string, any>;
 
@@ -11,7 +13,7 @@ type AnyObject = Record<string, any>;
  * projection: it is only readable through the owner/admin RPC.
  */
 const GROUP_FIELDS =
-  'id, name, icon, description, group_type, max_members, visibility, member_count, total_xp, group_level, current_streak, last_activity_date, is_active, created_by, created_at, updated_at';
+  'id, slug, name, icon, description, group_type, max_members, visibility, member_count, total_xp, group_level, current_streak, last_activity_date, is_active, created_by, created_at, updated_at';
 
 const SAFE_PROFILE_FIELDS = 'id, full_name, username, avatar_url, institution, total_xp';
 
@@ -98,14 +100,15 @@ export const isPlatformAdmin = async (userId: string): Promise<boolean> => {
 
 export const getGroupRow = async (
   client: SupabaseClient,
-  groupId: string
+  identifier: string
 ): Promise<AnyObject | null> => {
-  const { data, error } = await client
-    .from('study_groups')
-    .select(GROUP_FIELDS)
-    .eq('id', groupId)
-    .maybeSingle();
+  const value = normalizeId(identifier);
+  if (!value) return null;
 
+  let query = client.from('study_groups').select(GROUP_FIELDS);
+  query = isUuid(value) ? query.eq('id', value) : query.eq('slug', normalizeSlug(value));
+
+  const { data, error } = await query.maybeSingle();
   if (error) throw mapDataError(error);
   return data ?? null;
 };
@@ -195,6 +198,13 @@ export const getGroupsConfig = async () => {
     battleWinnerBonusXp: readNumber('group_battle_winner_bonus_xp'),
     leaderboardMinMembers: readNumber('group_leaderboard_min_members'),
   };
+};
+
+const mapGroupWriteError = (error: any, slugRequested: boolean): never => {
+  if (slugRequested && error?.code === '23505') {
+    throw groupError('SLUG_TAKEN', 409);
+  }
+  throw mapDataError(error);
 };
 
 const withMembershipGroup = async (
@@ -306,6 +316,7 @@ export const createGroup = async (
     groupType?: 'squad' | 'community';
     maxMembers?: number | null;
     visibility?: 'public' | 'code' | 'approval';
+    slug?: string | null;
   }
 ) => {
   if (input.groupType === 'community' && !(await isPlatformAdmin(userId))) {
@@ -316,6 +327,8 @@ export const createGroup = async (
   if (name.length < 2 || name.length > 50) throw groupError('INVALID_NAME', 400);
 
   const description = normalizeText(input.description).slice(0, 300);
+  const slug = input.slug === null || input.slug === undefined ? null : normalizeSlug(input.slug);
+  if (slug !== null && !isValidSlug(slug)) throw groupError('INVALID_SLUG', 400);
   const config = await getGroupsConfig();
   const cap = input.groupType === 'community' ? config.communityMaxMembers : config.squadMaxMembers;
   const requestedMax =
@@ -332,9 +345,10 @@ export const createGroup = async (
     p_group_type: input.groupType ?? 'squad',
     p_max_members: Math.min(requestedMax, cap),
     p_visibility: input.visibility ?? 'code',
+    ...(slug !== null ? { p_slug: slug } : {}),
   });
 
-  if (error) throw mapDataError(error);
+  if (error) mapGroupWriteError(error, slug !== null);
 
   const createdId = typeof groupId === 'string' ? groupId : normalizeId(groupId);
   const group = await getGroupRow(client, createdId);
@@ -405,7 +419,7 @@ const notifyGroupAdmins = async (group: AnyObject): Promise<void> => {
       titleEn: 'New join request',
       bodyBn: `"${group.name}" গ্রুপে নতুন সদস্য যোগদানের অনুরোধ করেছেন।`,
       bodyEn: `Someone requested to join "${group.name}".`,
-      actionLink: `/groups/${group.id}?tab=members`,
+      actionLink: `/groups/${group.slug ?? group.id}?tab=members`,
     });
   } catch (error) {
     console.error(
@@ -424,11 +438,12 @@ export const leaveGroup = async (client: SupabaseClient, groupId: string) => {
 export const getGroupDetail = async (
   client: SupabaseClient,
   userId: string,
-  groupId: string
+  identifier: string
 ) => {
-  const group = await getGroupRow(client, groupId);
+  const group = await getGroupRow(client, identifier);
   if (!group || group.is_active === false) throw groupError('GROUP_NOT_FOUND', 404);
 
+  const groupId = normalizeId(group.id);
   const membership = await getMembership(client, groupId, userId);
   const isActiveMember = membership?.status === 'active';
 
@@ -464,6 +479,24 @@ export const getGroupDetail = async (
   };
 };
 
+export const getGroupPreview = async (
+  client: SupabaseClient,
+  identifier: string
+) => {
+  const value = normalizeId(identifier);
+  if (!value) throw groupError('GROUP_NOT_FOUND', 404);
+
+  const params: AnyObject = isUuid(value)
+    ? { p_group_id: value, p_slug: null }
+    : { p_slug: normalizeSlug(value), p_group_id: null };
+
+  const { data, error } = await client.rpc('get_group_preview', params);
+  if (error) throw mapDataError(error);
+  if (!data) throw groupError('GROUP_NOT_FOUND', 404);
+
+  return { preview: data };
+};
+
 export const updateGroup = async (
   client: SupabaseClient,
   userId: string,
@@ -473,6 +506,7 @@ export const updateGroup = async (
     icon?: string | null;
     description?: string | null;
     visibility?: 'public' | 'code' | 'approval';
+    slug?: string;
     maxMembers?: number;
     regenerateJoinCode?: boolean;
     disband?: boolean;
@@ -484,7 +518,14 @@ export const updateGroup = async (
 
   await requireGroupAdmin(client, group, userId);
 
+  const resolvedGroupId = normalizeId(group.id);
   const patch: AnyObject = {};
+
+  if (input.slug !== undefined) {
+    const slug = normalizeSlug(input.slug);
+    if (!isValidSlug(slug)) throw groupError('INVALID_SLUG', 400);
+    if (slug !== group.slug) patch.slug = slug;
+  }
 
   if (input.name !== undefined) {
     const name = normalizeText(input.name);
@@ -520,11 +561,11 @@ export const updateGroup = async (
     const { data, error } = await client
       .from('study_groups')
       .update(patch)
-      .eq('id', groupId)
+      .eq('id', resolvedGroupId)
       .select(GROUP_FIELDS)
       .maybeSingle();
 
-    if (error) throw mapDataError(error);
+    if (error) mapGroupWriteError(error, input.slug !== undefined);
     if (!data) throw groupError('FORBIDDEN', 403);
     updatedGroup = data;
   }
@@ -537,7 +578,7 @@ export const updateGroup = async (
     const { error } = await supabaseAdmin
       .from('study_groups')
       .update({ join_code: joinCode })
-      .eq('id', groupId);
+      .eq('id', resolvedGroupId);
 
     if (error) throw mapDataError(error);
   }
@@ -612,7 +653,7 @@ export const reviewJoinRequest = async (
     bodyEn: approve
       ? `Your request to join "${group.name}" was approved.`
       : `Your request to join "${group.name}" was rejected.`,
-    actionLink: `/groups/${group.id}`,
+    actionLink: `/groups/${group.slug ?? group.id}`,
   });
 
   return { result: typeof data === 'string' ? data : approve ? 'approved' : 'rejected' };
@@ -733,10 +774,6 @@ const loadAutoBanDictionary = async (): Promise<AnyObject[]> => {
   return autoBanCache.entries;
 };
 
-const URL_PATTERN =
-  /(https?:\/\/|www\.|t\.me\/|wa\.me\/|\b[a-z0-9-]+\.(?:com|net|org|bd|xyz|link|site|online|app)\b)/i;
-const PHONE_PATTERN = /(?:\+?88)?0?1[3-9]\d{8}/;
-
 const findDictionaryMatch = (content: string, entries: AnyObject[]): AnyObject | null => {
   const normalized = content.trim().toLowerCase();
 
@@ -801,7 +838,7 @@ export const createMessage = async (
   client: SupabaseClient,
   userId: string,
   groupId: string,
-  input: { content: string; messageType?: string }
+  input: { content: string; messageType?: string; replyToId?: string | null }
 ) => {
   await requireActiveMember(client, groupId, userId);
 
@@ -816,7 +853,7 @@ export const createMessage = async (
   }
 
   // The audience includes minors: links and phone numbers are blocked outright.
-  if (URL_PATTERN.test(content) || PHONE_PATTERN.test(content)) {
+  if (containsBlockedContact(content)) {
     throw groupError('MESSAGE_BLOCKED', 400);
   }
 
@@ -828,6 +865,34 @@ export const createMessage = async (
     throw groupError('MESSAGE_BLOCKED', 400);
   }
 
+  let metaData: AnyObject | null = null;
+  const replyToId = normalizeId(input.replyToId);
+  if (replyToId) {
+    if (!isUuid(replyToId)) throw groupError('MESSAGE_NOT_FOUND', 404);
+
+    const { data: replied, error: replyError } = await client
+      .from('group_chats')
+      .select('id, group_id, sender_id, content, deleted_at')
+      .eq('id', replyToId)
+      .maybeSingle();
+
+    if (replyError) throw mapDataError(replyError);
+    if (!replied || normalizeId(replied.group_id) !== groupId || replied.deleted_at) {
+      throw groupError('MESSAGE_NOT_FOUND', 404);
+    }
+
+    const replyProfile = (await loadSafeProfiles([replied.sender_id])).get(
+      normalizeId(replied.sender_id)
+    );
+    metaData = {
+      reply_to: buildReplyMeta({
+        id: normalizeId(replied.id),
+        senderName: String(replyProfile?.full_name || replyProfile?.username || 'Student'),
+        content: String(replied.content ?? ''),
+      }),
+    };
+  }
+
   const { data, error } = await client
     .from('group_chats')
     .insert({
@@ -836,6 +901,7 @@ export const createMessage = async (
       message_type: messageType,
       content,
       is_flagged: Boolean(match),
+      meta_data: metaData,
     })
     .select(MESSAGE_FIELDS)
     .single();
@@ -848,7 +914,7 @@ export const createMessage = async (
         chat_id: data.id,
         group_id: groupId,
         sender_id: userId,
-        offense_type: 'auto_ban_dictionary',
+        offense_type: 'Other',
         flagged_by_system: true,
       });
       if (flagError) {
@@ -870,6 +936,34 @@ export const createMessage = async (
       sender: profileMap.get(userId) ?? null,
     },
   };
+};
+
+export const deleteMessage = async (
+  client: SupabaseClient,
+  userId: string,
+  messageId: string
+) => {
+  if (!userId) throw groupError('AUTH_REQUIRED', 401);
+  const { error } = await client.rpc('delete_group_message', { p_message_id: messageId });
+  if (error) throw mapDataError(error);
+  return { deleted: true };
+};
+
+export const reportMessage = async (
+  client: SupabaseClient,
+  userId: string,
+  messageId: string,
+  offenseType: string,
+  reason?: string | null
+) => {
+  if (!userId) throw groupError('AUTH_REQUIRED', 401);
+  const { error } = await client.rpc('report_group_message', {
+    p_message_id: messageId,
+    p_offense_type: offenseType,
+    p_reason: normalizeReportReason(reason) || null,
+  });
+  if (error) throw mapDataError(error);
+  return { reported: true };
 };
 
 export const getActiveGroupMemberIds = async (groupId: string): Promise<string[]> => {
@@ -897,7 +991,7 @@ export const notifyBattleCreated = async (group: AnyObject, creatorId: string) =
       titleEn: 'New group battle',
       bodyBn: `"${group.name}" গ্রুপে একটি নতুন ব্যাটল শুরু হয়েছে।`,
       bodyEn: `A new battle was created in "${group.name}".`,
-      actionLink: `/groups/${group.id}?tab=battles`,
+      actionLink: `/groups/${group.slug ?? group.id}?tab=battles`,
     }
   );
 };

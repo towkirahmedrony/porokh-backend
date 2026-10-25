@@ -16,6 +16,7 @@ import mediaRoutes from './features/media/media.routes';
 import enterpriseRoutes from './features/enterprise/enterprise.routes';
 import leaderboardRoutes from './features/leaderboard/leaderboard.routes';
 import groupRoutes from './features/groups/groups.routes';
+import groupAdminRoutes from './features/groups/groups.admin.routes';
 import groupBattleRoutes from './features/groups/groupBattles.routes';
 import groupInternalRoutes from './features/groups/groups.internal.routes';
 import { GROUP_ERROR_CODES } from './features/groups/groups.errors';
@@ -174,6 +175,7 @@ app.use('/api/v1/app-builder', appBuilderRoutes);
 // Admin & Management Routes
 app.use('/api/v1/admin/profile', adminProfileRoutes);
 app.use('/api/v1/admin/users', usersAdminRoutes);
+app.use('/api/v1/admin/groups', groupAdminRoutes);
 app.use('/api/v1/admin/access', accessRoutes.adminAccess);
 
 // Frontend Compatibility Routes 

@@ -6,6 +6,10 @@ import { rateLimit } from '../../middlewares/rateLimit';
 const router = Router();
 
 const chatSendLimit = rateLimit({ windowMs: 60_000, max: 20, keyPrefix: 'group-chat' });
+const reportLimit = rateLimit({ windowMs: 60_000, max: 10, keyPrefix: 'group-report' });
+
+// Public invite preview. Declared before requireAuth and before `/:id`.
+router.get('/preview/:identifier', controller.getPublicPreview);
 
 router.use(requireAuth);
 
@@ -28,6 +32,8 @@ router.post('/:id/members/:userId/kick', controller.kickMember);
 
 router.get('/:id/messages', controller.getMessages);
 router.post('/:id/messages', chatSendLimit, controller.postMessage);
+router.delete('/:id/messages/:messageId', controller.deleteMessage);
+router.post('/:id/messages/:messageId/report', reportLimit, controller.reportMessage);
 
 router.get('/:id/battles', controller.listBattles);
 router.post('/:id/battles', controller.createBattle);

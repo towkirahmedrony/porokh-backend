@@ -1,17 +1,13 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { supabaseAdmin } from '../../config/supabaseAdmin';
 import {
-  findOptionById,
-  isAnswerCorrect,
-  normalizeOptionId,
-} from '../exams/exam.grading';
-import {
   loadGroupBattleQuestions,
   sanitizeQuestionsForClient,
   selectGroupBattleQuestionIds,
 } from '../exams/exams.user.service';
 import { groupError, mapDataError } from './groups.errors';
 import { deriveBattleState, finalizableAt } from './groups.battleState';
+import { computeTimeTaken, scoreBattleAnswers } from './groups.scoring';
 import {
   getGroupRow,
   loadSafeProfiles,
@@ -31,7 +27,6 @@ const MIN_BATTLE_QUESTIONS = 5;
 const MAX_BATTLE_QUESTIONS = 50;
 const MAX_BATTLE_DURATION_MINUTES = 180;
 const FINALIZE_GRACE_MS = 2 * 60 * 1000;
-const NEGATIVE_MARKS = 0.25;
 
 const normalizeId = (value: unknown): string => String(value ?? '').trim();
 
@@ -224,7 +219,7 @@ export const getBattleDetail = async (
   battleId: string
 ) => {
   const battle = await loadBattle(client, battleId);
-  if (!battle) throw groupError('GROUP_NOT_FOUND', 404);
+  if (!battle) throw groupError('BATTLE_NOT_FOUND', 404);
 
   await requireActiveMember(client, battle.group_id, userId);
 
@@ -272,7 +267,7 @@ export const joinBattle = async (
   battleId: string
 ) => {
   const battle = await loadBattle(client, battleId);
-  if (!battle) throw groupError('GROUP_NOT_FOUND', 404);
+  if (!battle) throw groupError('BATTLE_NOT_FOUND', 404);
 
   await requireActiveMember(client, battle.group_id, userId);
 
@@ -304,7 +299,7 @@ export const getBattleQuestions = async (
   battleId: string
 ) => {
   const battle = await loadBattle(client, battleId);
-  if (!battle) throw groupError('GROUP_NOT_FOUND', 404);
+  if (!battle) throw groupError('BATTLE_NOT_FOUND', 404);
 
   await requireActiveMember(client, battle.group_id, userId);
 
@@ -344,7 +339,7 @@ export const submitBattleAnswers = async (
   answers: Record<string, unknown>
 ) => {
   const battle = await loadBattle(client, battleId);
-  if (!battle) throw groupError('GROUP_NOT_FOUND', 404);
+  if (!battle) throw groupError('BATTLE_NOT_FOUND', 404);
 
   await requireActiveMember(client, battle.group_id, userId);
 
@@ -370,47 +365,13 @@ export const submitBattleAnswers = async (
   const questions = await loadGroupBattleQuestions(questionIds);
   if (questions.length === 0) throw groupError('INVALID_QUESTIONS', 409);
 
-  const allowed = new Set(questions.map((question) => normalizeId(question.id)));
-  let correct = 0;
-  let wrong = 0;
-  let skipped = 0;
-  let totalScore = 0;
-
-  questions.forEach((question) => {
-    const questionId = normalizeId(question.id);
-    const raw = answers?.[questionId];
-    const selectedId = raw === null || raw === undefined ? '' : normalizeOptionId(raw);
-    const options = Array.isArray(question.options) ? question.options : [];
-
-    if (!allowed.has(questionId) || !selectedId) {
-      skipped += 1;
-      return;
-    }
-
-    if (!findOptionById(options, selectedId)) {
-      skipped += 1;
-      return;
-    }
-
-    if (isAnswerCorrect(options, selectedId)) {
-      correct += 1;
-      totalScore += 1;
-    } else {
-      wrong += 1;
-      totalScore -= NEGATIVE_MARKS;
-    }
-  });
-
-  const score = Math.max(0, Number(totalScore.toFixed(2)));
-  const durationSeconds = clampInt(
-    Number(battle.duration_minutes) * 60,
-    1200,
-    60,
-    MAX_BATTLE_DURATION_MINUTES * 60
-  );
-  const timeTaken = Math.max(
-    0,
-    Math.min(durationSeconds, Math.round((nowMs - start) / 1000))
+  const result = scoreBattleAnswers(questions, answers);
+  const { score, correct_count: correct, wrong_count: wrong, skipped_count: skipped } = result;
+  const timeTaken = computeTimeTaken(
+    battle.start_time,
+    nowMs,
+    Number(battle.duration_minutes),
+    MAX_BATTLE_DURATION_MINUTES
   );
 
   const { error } = await supabaseAdmin.rpc('record_group_battle_score', {
@@ -451,7 +412,7 @@ export const cancelBattle = async (
   battleId: string
 ) => {
   const battle = await loadBattle(client, battleId);
-  if (!battle) throw groupError('GROUP_NOT_FOUND', 404);
+  if (!battle) throw groupError('BATTLE_NOT_FOUND', 404);
 
   const group = await getGroupRow(client, battle.group_id);
   if (!group) throw groupError('GROUP_NOT_FOUND', 404);
@@ -470,7 +431,7 @@ export const finalizeBattle = async (
   battleId: string
 ) => {
   const battle = await loadBattle(client, battleId);
-  if (!battle) throw groupError('GROUP_NOT_FOUND', 404);
+  if (!battle) throw groupError('BATTLE_NOT_FOUND', 404);
 
   await requireActiveMember(client, battle.group_id, userId);
 
