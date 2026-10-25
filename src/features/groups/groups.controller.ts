@@ -4,10 +4,12 @@ import { z } from 'zod';
 import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response';
 import { createUserSupabaseClient } from '../../config/userSupabase';
+import { createPublicSupabaseClient } from '../../config/publicSupabase';
 import { groupError } from './groups.errors';
 import * as groupsService from './groups.service';
 import * as battleService from './groups.battle.service';
 import { runGroupsTick } from '../../jobs/group.job';
+import { isOffenseType, SLUG_PATTERN } from './groups.validation';
 
 interface AuthRequest extends Request {
   user?: { id: string };
@@ -32,6 +34,9 @@ const parseWith = <T extends z.ZodTypeAny>(schema: T, value: unknown): z.infer<T
 };
 
 const uuidSchema = z.string().uuid();
+const slugSchema = z.string().regex(SLUG_PATTERN);
+const groupIdentifierSchema = z.union([uuidSchema, slugSchema]);
+const messageIdSchema = z.string().uuid();
 
 const createGroupSchema = z.object({
   name: z.string(),
@@ -40,6 +45,7 @@ const createGroupSchema = z.object({
   groupType: z.enum(['squad', 'community']).optional(),
   maxMembers: z.number().int().min(2).max(500).nullable().optional(),
   visibility: z.enum(['public', 'code', 'approval']).optional(),
+  slug: slugSchema.optional(),
 });
 
 const joinSchema = z.object({
@@ -56,6 +62,7 @@ const updateGroupSchema = z.object({
   icon: z.string().max(16).nullable().optional(),
   description: z.string().max(300).nullable().optional(),
   visibility: z.enum(['public', 'code', 'approval']).optional(),
+  slug: slugSchema.optional(),
   maxMembers: z.number().int().min(2).max(500).optional(),
   regenerateJoinCode: z.boolean().optional(),
   disband: z.boolean().optional(),
@@ -71,6 +78,12 @@ const kickSchema = z.object({
 const messageSchema = z.object({
   content: z.string().min(1).max(500),
   messageType: z.enum(['text', 'emoji', 'question_share']).optional(),
+  replyToId: uuidSchema.nullable().optional(),
+});
+
+const reportMessageSchema = z.object({
+  offenseType: z.string().refine(isOffenseType, 'INVALID_OFFENSE_TYPE'),
+  reason: z.string().max(200).nullable().optional(),
 });
 
 const createBattleSchema = z.object({
@@ -84,6 +97,20 @@ const createBattleSchema = z.object({
 
 const submitBattleSchema = z.object({
   answers: z.record(z.union([z.string(), z.number(), z.null()])),
+});
+
+export const getPublicPreview = catchAsync(async (req: Request, res: Response) => {
+  const identifier = parseWith(groupIdentifierSchema, req.params.identifier);
+  const data = await groupsService.getGroupPreview(
+    createPublicSupabaseClient(),
+    identifier
+  );
+  return sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: 'Group preview fetched',
+    data,
+  });
 });
 
 export const getConfig = catchAsync(async (_req: Request, res: Response) => {
@@ -178,8 +205,8 @@ export const leaveGroup = catchAsync(async (req: AuthRequest, res: Response) => 
 
 export const getGroup = catchAsync(async (req: AuthRequest, res: Response) => {
   const { userId, client } = getAuthContext(req);
-  const groupId = parseWith(uuidSchema, req.params.id);
-  const data = await groupsService.getGroupDetail(client, userId, groupId);
+  const identifier = parseWith(groupIdentifierSchema, req.params.id);
+  const data = await groupsService.getGroupDetail(client, userId, identifier);
   return sendResponse(res, {
     statusCode: 200,
     success: true,
@@ -314,6 +341,37 @@ export const postMessage = catchAsync(async (req: AuthRequest, res: Response) =>
     statusCode: 201,
     success: true,
     message: 'Message sent',
+    data,
+  });
+});
+
+export const deleteMessage = catchAsync(async (req: AuthRequest, res: Response) => {
+  const { userId, client } = getAuthContext(req);
+  const messageId = parseWith(messageIdSchema, req.params.messageId);
+  const data = await groupsService.deleteMessage(client, userId, messageId);
+  return sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: 'Message deleted',
+    data,
+  });
+});
+
+export const reportMessage = catchAsync(async (req: AuthRequest, res: Response) => {
+  const { userId, client } = getAuthContext(req);
+  const messageId = parseWith(messageIdSchema, req.params.messageId);
+  const body = parseWith(reportMessageSchema, req.body);
+  const data = await groupsService.reportMessage(
+    client,
+    userId,
+    messageId,
+    body.offenseType,
+    body.reason ?? null
+  );
+  return sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: 'Message reported',
     data,
   });
 });

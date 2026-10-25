@@ -14,7 +14,7 @@ type AnyObject = Record<string, any>;
  * exposed by accident.
  */
 const GROUP_ADMIN_FIELDS =
-  'id, name, icon, description, group_type, max_members, visibility, member_count, total_xp, group_level, current_streak, last_activity_date, is_active, created_by, created_at, updated_at';
+  'id, slug, name, icon, description, group_type, max_members, visibility, member_count, total_xp, group_level, current_streak, last_activity_date, is_active, created_by, created_at, updated_at';
 
 const GROUP_DETAIL_FIELDS = `${GROUP_ADMIN_FIELDS}, join_code`;
 
@@ -30,6 +30,7 @@ const MAX_NAME_LENGTH = 50;
 const MAX_DESCRIPTION_LENGTH = 300;
 const MAX_ICON_LENGTH = 16;
 const MAX_JOIN_CODE_LENGTH = 16;
+const ADMIN_GROUP_CAP = 500;
 
 const GROUP_SORTS = [
   'created_at',
@@ -254,6 +255,8 @@ export const getAdminGroupStats = async () => {
     activeMembers,
     pendingRequests,
     ongoingBattles,
+    battlesThisWeek,
+    pendingReports,
   ] = await Promise.all([
     count('study_groups'),
     count('study_groups', (query) => query.eq('is_active', true)),
@@ -263,6 +266,10 @@ export const getAdminGroupStats = async () => {
     count('group_members', (query) => query.eq('status', 'active')),
     count('group_members', (query) => query.eq('status', 'pending')),
     count('group_battles', (query) => query.eq('status', 'ongoing')),
+    count('group_battles', (query) =>
+      query.gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
+    ),
+    count('flagged_messages', (query) => query.eq('status', 'pending')),
   ]);
 
   return {
@@ -274,6 +281,8 @@ export const getAdminGroupStats = async () => {
     activeMembers,
     pendingRequests,
     ongoingBattles,
+    battlesThisWeek,
+    pendingReports,
   };
 };
 
@@ -315,6 +324,7 @@ export const listAdminGroups = async (params: {
       const code = sanitizeJoinCode(term);
       const filters = [
         `name.ilike.%${term}%`,
+        `slug.ilike.%${term}%`,
         `description.ilike.%${term}%`,
       ];
       if (code) filters.push(`join_code.eq.${code}`);
@@ -521,6 +531,7 @@ export const createAdminGroup = async (
     groupType?: 'squad' | 'community';
     maxMembers?: number;
     visibility?: 'public' | 'code' | 'approval';
+    slug?: string | null;
   }
 ) => {
   const name = normalizeText(input.name);
@@ -528,13 +539,10 @@ export const createAdminGroup = async (
 
   const groupType = input.groupType === 'community' ? 'community' : 'squad';
   const config = await getGroupsConfig();
-  const cap = groupType === 'community' ? config.communityMaxMembers : config.squadMaxMembers;
-  const maxMembers = resolveMaxMembersInput(
-    groupType,
-    input.maxMembers,
-    groupType === 'community' ? cap : config.squadDefaultMembers,
-    cap
-  );
+  const defaultMax =
+    groupType === 'community' ? config.communityMaxMembers : config.squadDefaultMembers;
+  const cap = ADMIN_GROUP_CAP;
+  const maxMembers = resolveMaxMembersInput(groupType, input.maxMembers, defaultMax, cap);
 
   const description =
     normalizeText(input.description).slice(0, MAX_DESCRIPTION_LENGTH) || null;
@@ -550,6 +558,7 @@ export const createAdminGroup = async (
       group_type: groupType,
       max_members: maxMembers,
       visibility: input.visibility ?? 'code',
+      ...(input.slug ? { slug: normalizeText(input.slug).toLowerCase() } : {}),
       created_by: actorId,
       join_code: joinCode,
       is_active: true,
@@ -596,6 +605,7 @@ export const updateAdminGroup = async (
     icon?: string | null;
     description?: string | null;
     visibility?: 'public' | 'code' | 'approval';
+    slug?: string;
     maxMembers?: number;
     isActive?: boolean;
     regenerateJoinCode?: boolean;
@@ -617,11 +627,11 @@ export const updateAdminGroup = async (
     patch.description = normalizeText(input.description).slice(0, MAX_DESCRIPTION_LENGTH) || null;
   }
   if (input.visibility !== undefined) patch.visibility = input.visibility;
+  if (input.slug !== undefined) patch.slug = normalizeText(input.slug).toLowerCase();
   if (input.isActive !== undefined) patch.is_active = input.isActive;
 
   if (input.maxMembers !== undefined) {
-    const config = await getGroupsConfig();
-    const cap = group.group_type === 'community' ? config.communityMaxMembers : config.squadMaxMembers;
+    const cap = ADMIN_GROUP_CAP;
     const activeMembers = await countActiveMembers(groupId);
     const requested = toBoundedInt(input.maxMembers, Number(group.max_members ?? cap), 2, cap);
 
@@ -889,4 +899,635 @@ export const transferAdminGroupOwnership = async (
   });
 
   return { group: data, transferred: true };
+};
+
+const FLAG_FIELDS =
+  'id, chat_id, group_id, sender_id, offense_type, flagged_by_system, status, action_taken, created_at, resolved_by, reported_by, reason';
+
+const MODERATION_PAGE_SIZE = 20;
+const MODERATION_MAX_PAGE_SIZE = 50;
+
+type FlagContext = {
+  flag: AnyObject;
+  message: AnyObject;
+  group: AnyObject;
+};
+
+const getFlagContext = async (flagId: string): Promise<FlagContext> => {
+  const { data: flag, error } = await supabaseAdmin
+    .from('flagged_messages')
+    .select(FLAG_FIELDS)
+    .eq('id', flagId)
+    .maybeSingle();
+
+  if (error) throw mapDataError(error);
+  if (!flag) throw groupError('MESSAGE_NOT_FOUND', 404);
+
+  const [{ data: message, error: messageError }, { data: group, error: groupErrorResult }] =
+    await Promise.all([
+      supabaseAdmin
+        .from('group_chats')
+        .select('id, group_id, sender_id, message_type, content, created_at, deleted_at, is_flagged')
+        .eq('id', flag.chat_id)
+        .maybeSingle(),
+      supabaseAdmin
+        .from('study_groups')
+        .select('id, slug, name, created_by, group_type')
+        .eq('id', flag.group_id)
+        .maybeSingle(),
+    ]);
+
+  if (messageError) throw mapDataError(messageError);
+  if (groupErrorResult) throw mapDataError(groupErrorResult);
+  if (!message || !group) throw groupError('MESSAGE_NOT_FOUND', 404);
+
+  return { flag, message, group };
+};
+
+export const listModerationQueue = async (params: {
+  status?: 'pending' | 'reviewed' | 'ignored' | 'all';
+  page?: number;
+  pageSize?: number;
+}) => {
+  const page = clampPositiveInt(params.page, 1, 100000);
+  const pageSize = clampPositiveInt(
+    params.pageSize,
+    MODERATION_PAGE_SIZE,
+    MODERATION_MAX_PAGE_SIZE
+  );
+  const status = params.status ?? 'pending';
+  const start = (page - 1) * pageSize;
+
+  let query = supabaseAdmin
+    .from('flagged_messages')
+    .select(FLAG_FIELDS, { count: 'exact' });
+
+  if (status !== 'all') query = query.eq('status', status);
+
+  const { data, error, count } = await query
+    .order('created_at', { ascending: true })
+    .range(start, start + pageSize - 1);
+
+  if (error) throw mapDataError(error);
+
+  const rows = (data || []) as AnyObject[];
+  const chatIds = rows.map((row) => normalizeId(row.chat_id)).filter(Boolean);
+  const groupIds = Array.from(new Set(rows.map((row) => normalizeId(row.group_id)).filter(Boolean)));
+  const userIds = rows.flatMap((row) => [row.sender_id, row.reported_by]);
+
+  const [chatsResult, groupsResult, profileMap] = await Promise.all([
+    chatIds.length
+      ? supabaseAdmin
+          .from('group_chats')
+          .select('id, content, message_type, created_at, deleted_at, sender_id, group_id')
+          .in('id', chatIds)
+      : Promise.resolve({ data: [], error: null } as AnyObject),
+    groupIds.length
+      ? supabaseAdmin
+          .from('study_groups')
+          .select('id, slug, name, group_type')
+          .in('id', groupIds)
+      : Promise.resolve({ data: [], error: null } as AnyObject),
+    loadProfiles(userIds),
+  ]);
+
+  if (chatsResult.error) throw mapDataError(chatsResult.error);
+  if (groupsResult.error) throw mapDataError(groupsResult.error);
+
+  const chatMap = new Map<string, AnyObject>(
+    ((chatsResult.data || []) as AnyObject[]).map((row) => [normalizeId(row.id), row])
+  );
+  const groupMap = new Map<string, AnyObject>(
+    ((groupsResult.data || []) as AnyObject[]).map((row) => [normalizeId(row.id), row])
+  );
+
+  const items = rows.map((row) => ({
+    ...row,
+    chat: chatMap.get(normalizeId(row.chat_id)) ?? null,
+    group: groupMap.get(normalizeId(row.group_id)) ?? null,
+    sender: profileMap.get(normalizeId(row.sender_id)) ?? null,
+    reporter: profileMap.get(normalizeId(row.reported_by)) ?? null,
+    resolver: profileMap.get(normalizeId(row.resolved_by)) ?? null,
+  }));
+
+  const total = typeof count === 'number' ? count : items.length;
+  return {
+    items,
+    page,
+    pageSize,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    hasMore: start + items.length < total,
+    pendingCount:
+      status === 'pending'
+        ? total
+        : await supabaseAdmin
+            .from('flagged_messages')
+            .select('id', { count: 'exact', head: true })
+            .eq('status', 'pending')
+            .then((result) => result.count ?? 0),
+  };
+};
+
+export const ignoreFlaggedMessage = async (actorId: string, flagId: string) => {
+  const { flag } = await getFlagContext(flagId);
+  if (flag.status !== 'pending') throw groupError('VALIDATION_FAILED', 409);
+
+  const { error } = await supabaseAdmin
+    .from('flagged_messages')
+    .update({ status: 'ignored', resolved_by: actorId })
+    .eq('id', flagId);
+
+  if (error) throw mapDataError(error);
+  await writeAudit(actorId, 'group.moderation.ignore', normalizeId(flag.group_id), {
+    flagId,
+  });
+  return { ignored: true };
+};
+
+export const warnFlaggedMessage = async (
+  actorId: string,
+  flagId: string,
+  reason?: string | null
+) => {
+  const { flag, message } = await getFlagContext(flagId);
+  if (flag.status !== 'pending') throw groupError('VALIDATION_FAILED', 409);
+
+  const warningReason =
+    normalizeText(reason).slice(0, 300) ||
+    `Community guideline violation (${normalizeText(flag.offense_type) || 'Other'})`;
+
+  const { error: warningError } = await supabaseAdmin.from('user_warnings').insert({
+    user_id: message.sender_id,
+    issued_by: actorId,
+    warning_reason: warningReason,
+    strike_weight: 1,
+    target_chat_id: message.id,
+  });
+  if (warningError) throw mapDataError(warningError);
+
+  const { error } = await supabaseAdmin
+    .from('flagged_messages')
+    .update({ status: 'reviewed', action_taken: 'warned', resolved_by: actorId })
+    .eq('id', flagId);
+  if (error) throw mapDataError(error);
+
+  await writeAudit(actorId, 'group.moderation.warn', normalizeId(flag.group_id), {
+    flagId,
+    userId: normalizeId(message.sender_id),
+  });
+  return { warned: true };
+};
+
+export const deleteFlaggedMessage = async (actorId: string, flagId: string) => {
+  const { flag, message } = await getFlagContext(flagId);
+  if (flag.status !== 'pending') throw groupError('VALIDATION_FAILED', 409);
+
+  if (!message.deleted_at) {
+    const { error } = await supabaseAdmin
+      .from('group_chats')
+      .update({ deleted_at: new Date().toISOString(), deleted_by: actorId })
+      .eq('id', message.id);
+    if (error) throw mapDataError(error);
+  }
+
+  const { error } = await supabaseAdmin
+    .from('flagged_messages')
+    .update({ status: 'reviewed', action_taken: 'deleted', resolved_by: actorId })
+    .eq('id', flagId);
+  if (error) throw mapDataError(error);
+
+  await writeAudit(actorId, 'group.moderation.delete', normalizeId(flag.group_id), {
+    flagId,
+    messageId: normalizeId(message.id),
+  });
+  return { deleted: true };
+};
+
+const banGroupSender = async (
+  actorId: string,
+  group: AnyObject,
+  userId: string,
+  banHours: number,
+  reason: string
+): Promise<{ bannedUntil: string }> => {
+  if (normalizeId(group.created_by) === userId) {
+    throw groupError('CANNOT_REMOVE_OWNER', 409);
+  }
+
+  const membership = await getMembership(normalizeId(group.id), userId);
+  if (!membership || (membership.status !== 'active' && membership.status !== 'pending')) {
+    throw groupError('MEMBER_NOT_FOUND', 404);
+  }
+
+  const bannedUntil = new Date(Date.now() + banHours * 60 * 60 * 1000).toISOString();
+  const { error } = await supabaseAdmin
+    .from('group_members')
+    .update({
+      status: 'kicked',
+      banned_until: bannedUntil,
+      role: 'member',
+    })
+    .eq('id', membership.id);
+  if (error) throw mapDataError(error);
+
+  await syncMemberCount(normalizeId(group.id));
+
+  if (group.group_type === 'squad') {
+    await supabaseAdmin
+      .from('profiles')
+      .update({ current_group_id: null })
+      .eq('id', userId)
+      .eq('current_group_id', normalizeId(group.id));
+  }
+
+  await writeAudit(actorId, 'group.moderation.ban', normalizeId(group.id), {
+    userId,
+    banHours,
+    reason,
+  });
+
+  return { bannedUntil };
+};
+
+export const banFlaggedSender = async (
+  actorId: string,
+  flagId: string,
+  banHours: number
+) => {
+  const { flag, message, group } = await getFlagContext(flagId);
+  if (flag.status !== 'pending') throw groupError('VALIDATION_FAILED', 409);
+
+  const { bannedUntil } = await banGroupSender(
+    actorId,
+    group,
+    normalizeId(message.sender_id),
+    banHours,
+    `Moderation case ${flagId}`
+  );
+
+  const { error } = await supabaseAdmin
+    .from('flagged_messages')
+    .update({ status: 'reviewed', action_taken: 'banned', resolved_by: actorId })
+    .eq('id', flagId);
+  if (error) throw mapDataError(error);
+
+  await writeAudit(actorId, 'group.moderation.flagged_ban', normalizeId(flag.group_id), {
+    flagId,
+    userId: normalizeId(message.sender_id),
+    banHours,
+  });
+
+  return { banned: true, banned_until: bannedUntil };
+};
+
+export const listAdminGroupFlags = async (groupId: string) => {
+  await getGroupOrThrow(groupId);
+  const { data, error } = await supabaseAdmin
+    .from('flagged_messages')
+    .select(FLAG_FIELDS)
+    .eq('group_id', groupId)
+    .order('created_at', { ascending: false })
+    .limit(100);
+
+  if (error) throw mapDataError(error);
+
+  const rows = (data || []) as AnyObject[];
+  const profileMap = await loadProfiles(
+    rows.flatMap((row) => [row.sender_id, row.reported_by])
+  );
+
+  return {
+    items: rows.map((row) => ({
+      ...row,
+      sender: profileMap.get(normalizeId(row.sender_id)) ?? null,
+      reporter: profileMap.get(normalizeId(row.reported_by)) ?? null,
+    })),
+  };
+};
+
+export const getAdminGroupMessages = async (
+  groupId: string,
+  params: { limit?: number; before?: string }
+) => {
+  await getGroupOrThrow(groupId);
+  const limit = clampPositiveInt(params.limit, 50, 100);
+
+  let query = supabaseAdmin
+    .from('group_chats')
+    .select('id, group_id, sender_id, message_type, content, meta_data, created_at, deleted_at, is_flagged')
+    .eq('group_id', groupId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (params.before) {
+    const before = new Date(params.before);
+    if (!Number.isNaN(before.getTime())) {
+      query = query.lt('created_at', before.toISOString());
+    }
+  }
+
+  const { data, error } = await query;
+  if (error) throw mapDataError(error);
+
+  const rows = ((data || []) as AnyObject[]).slice().reverse();
+  const profileMap = await loadProfiles(rows.map((row) => row.sender_id));
+
+  return {
+    items: rows.map((row) => ({
+      ...row,
+      sender: profileMap.get(normalizeId(row.sender_id)) ?? null,
+    })),
+  };
+};
+
+export const adminDeleteGroupMessage = async (
+  actorId: string,
+  groupId: string,
+  messageId: string
+) => {
+  const group = await getGroupOrThrow(groupId);
+
+  const { data, error } = await supabaseAdmin
+    .from('group_chats')
+    .update({ deleted_at: new Date().toISOString(), deleted_by: actorId })
+    .eq('id', messageId)
+    .eq('group_id', groupId)
+    .is('deleted_at', null)
+    .select('id')
+    .maybeSingle();
+
+  if (error) throw mapDataError(error);
+  if (!data) throw groupError('MESSAGE_NOT_FOUND', 404);
+
+  await supabaseAdmin
+    .from('flagged_messages')
+    .update({ status: 'reviewed', action_taken: 'deleted', resolved_by: actorId })
+    .eq('chat_id', messageId)
+    .eq('status', 'pending');
+
+  await writeAudit(actorId, 'group.message.delete', normalizeId(group.id), {
+    messageId,
+  });
+  return { deleted: true };
+};
+
+export const adminCancelGroupBattle = async (
+  actorId: string,
+  groupId: string,
+  battleId: string
+) => {
+  const group = await getGroupOrThrow(groupId);
+
+  const { data, error } = await supabaseAdmin
+    .from('group_battles')
+    .update({ status: 'cancelled' })
+    .eq('id', battleId)
+    .eq('group_id', groupId)
+    .in('status', ['pending', 'ongoing'])
+    .select('id')
+    .maybeSingle();
+
+  if (error) throw mapDataError(error);
+  if (!data) throw groupError('BATTLE_NOT_FOUND', 404);
+
+  await writeAudit(actorId, 'group.battle.cancel', normalizeId(group.id), {
+    battleId,
+  });
+  return { cancelled: true };
+};
+
+export const adminKickGroupMember = async (
+  actorId: string,
+  groupId: string,
+  userId: string,
+  banHours: number
+) => {
+  const group = await getGroupOrThrow(groupId);
+  const result = await banGroupSender(
+    actorId,
+    group,
+    normalizeId(userId),
+    banHours,
+    'Admin panel action'
+  );
+  return { kicked: true, banned_until: result.bannedUntil };
+};
+
+export const listDictionaryEntries = async () => {
+  const { data, error } = await supabaseAdmin
+    .from('auto_ban_dictionary')
+    .select('id, word, match_type, auto_delete, created_by, created_at')
+    .order('created_at', { ascending: false })
+    .limit(500);
+
+  if (error) throw mapDataError(error);
+  return { items: data || [] };
+};
+
+export const createDictionaryEntry = async (
+  actorId: string,
+  input: { word: string; matchType?: 'contains' | 'exact'; autoDelete?: boolean }
+) => {
+  const word = normalizeText(input.word).slice(0, 100);
+  if (word.length < 1) throw groupError('VALIDATION_FAILED', 400);
+
+  const { data, error } = await supabaseAdmin
+    .from('auto_ban_dictionary')
+    .insert({
+      word,
+      match_type: input.matchType ?? 'contains',
+      auto_delete: input.autoDelete ?? true,
+      created_by: actorId,
+    })
+    .select('id, word, match_type, auto_delete, created_by, created_at')
+    .single();
+
+  if (error) throw mapDataError(error);
+  await writeAudit(actorId, 'group.dictionary.create', normalizeId(data.id), { word });
+  return { entry: data };
+};
+
+export const updateDictionaryEntry = async (
+  actorId: string,
+  entryId: string,
+  input: { word?: string; matchType?: 'contains' | 'exact'; autoDelete?: boolean }
+) => {
+  const patch: AnyObject = {};
+  if (input.word !== undefined) {
+    const word = normalizeText(input.word).slice(0, 100);
+    if (!word) throw groupError('VALIDATION_FAILED', 400);
+    patch.word = word;
+  }
+  if (input.matchType !== undefined) patch.match_type = input.matchType;
+  if (input.autoDelete !== undefined) patch.auto_delete = input.autoDelete;
+  if (Object.keys(patch).length === 0) throw groupError('VALIDATION_FAILED', 400);
+
+  const { data, error } = await supabaseAdmin
+    .from('auto_ban_dictionary')
+    .update(patch)
+    .eq('id', entryId)
+    .select('id, word, match_type, auto_delete, created_by, created_at')
+    .maybeSingle();
+
+  if (error) throw mapDataError(error);
+  if (!data) throw groupError('VALIDATION_FAILED', 404);
+
+  await writeAudit(actorId, 'group.dictionary.update', entryId, {
+    fields: Object.keys(patch),
+  });
+  return { entry: data };
+};
+
+export const deleteDictionaryEntry = async (actorId: string, entryId: string) => {
+  const { data, error } = await supabaseAdmin
+    .from('auto_ban_dictionary')
+    .delete()
+    .eq('id', entryId)
+    .select('id')
+    .maybeSingle();
+
+  if (error) throw mapDataError(error);
+  if (!data) throw groupError('VALIDATION_FAILED', 404);
+
+  await writeAudit(actorId, 'group.dictionary.delete', entryId);
+  return { deleted: true };
+};
+
+const SETTING_KEYS = [
+  'group_squad_default_members',
+  'group_squad_max_members',
+  'group_community_max_members',
+  'group_battle_participation_xp',
+  'group_battle_winner_bonus_xp',
+  'group_leaderboard_min_members',
+] as const;
+
+export type GroupSettingKey = (typeof SETTING_KEYS)[number];
+
+const SETTING_DEFAULTS: Record<GroupSettingKey, number> = {
+  group_squad_default_members: 30,
+  group_squad_max_members: 50,
+  group_community_max_members: 200,
+  group_battle_participation_xp: 10,
+  group_battle_winner_bonus_xp: 20,
+  group_leaderboard_min_members: 3,
+};
+
+const readSettingNumber = (value: unknown): number | null => {
+  const raw =
+    value && typeof value === 'object' && !Array.isArray(value) && 'value' in (value as AnyObject)
+      ? (value as AnyObject).value
+      : value;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? Math.floor(parsed) : null;
+};
+
+export const getAdminGroupSettings = async () => {
+  const { data, error } = await supabaseAdmin
+    .from('app_configs')
+    .select('key, value')
+    .in('key', SETTING_KEYS);
+
+  if (error) throw mapDataError(error);
+
+  const values = new Map(
+    (data || []).map((row: AnyObject) => [String(row.key), row.value])
+  );
+
+  const settings = Object.fromEntries(
+    SETTING_KEYS.map((key) => [
+      key,
+      readSettingNumber(values.get(key)) ?? SETTING_DEFAULTS[key],
+    ])
+  ) as Record<GroupSettingKey, number>;
+
+  return { settings, defaults: SETTING_DEFAULTS, caps: { min: 1, max: 500 } };
+};
+
+export const updateAdminGroupSettings = async (
+  actorId: string,
+  input: Partial<Record<GroupSettingKey, number>>
+) => {
+  const entries = Object.entries(input).filter(
+    (entry): entry is [GroupSettingKey, number] =>
+      SETTING_KEYS.includes(entry[0] as GroupSettingKey) && Number.isFinite(entry[1])
+  );
+  if (entries.length === 0) throw groupError('VALIDATION_FAILED', 400);
+
+  const rows = entries.map(([key, rawValue]) => {
+    const value = Math.floor(rawValue);
+    if (value < 1 || value > 500) throw groupError('VALIDATION_FAILED', 400);
+    return { key, value };
+  });
+
+  const { error } = await supabaseAdmin
+    .from('app_configs')
+    .upsert(rows, { onConflict: 'key' });
+
+  if (error) throw mapDataError(error);
+
+  await writeAudit(actorId, 'group.settings.update', 'group_settings', {
+    keys: rows.map((row) => row.key),
+  });
+
+  return getAdminGroupSettings();
+};
+
+export const getAdminGroupLeaderboard = async (params: {
+  period: 'weekly' | 'monthly' | 'all_time';
+  page?: number;
+  pageSize?: number;
+}) => {
+  const page = clampPositiveInt(params.page, 1, 100000);
+  const pageSize = clampPositiveInt(params.pageSize, MODERATION_PAGE_SIZE, MODERATION_MAX_PAGE_SIZE);
+  const start = (page - 1) * pageSize;
+
+  const { data, error, count } = await supabaseAdmin
+    .from('group_leaderboard_cache')
+    .select(
+      'group_id, period_type, rank, previous_rank, total_xp, avg_xp, member_count, last_updated_at',
+      { count: 'exact' }
+    )
+    .eq('period_type', params.period)
+    .order('rank', { ascending: true })
+    .range(start, start + pageSize - 1);
+
+  if (error) throw mapDataError(error);
+
+  const rows = (data || []) as AnyObject[];
+  const groupIds = rows.map((row) => normalizeId(row.group_id)).filter(Boolean);
+  const { data: groups, error: groupsError } = groupIds.length
+    ? await supabaseAdmin
+        .from('study_groups')
+        .select('id, slug, name, icon, group_type, member_count, is_active')
+        .in('id', groupIds)
+    : { data: [], error: null };
+
+  if (groupsError) throw mapDataError(groupsError);
+
+  const groupMap = new Map<string, AnyObject>(
+    ((groups || []) as AnyObject[]).map((group) => [normalizeId(group.id), group])
+  );
+
+  const total = typeof count === 'number' ? count : rows.length;
+  return {
+    period: params.period,
+    items: rows.map((row) => ({
+      ...row,
+      group: groupMap.get(normalizeId(row.group_id)) ?? null,
+    })),
+    page,
+    pageSize,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    hasMore: start + rows.length < total,
+  };
+};
+
+export const refreshAdminGroupLeaderboard = async (actorId: string) => {
+  const { error } = await supabaseAdmin.rpc('refresh_group_leaderboard');
+  if (error) throw mapDataError(error);
+  await writeAudit(actorId, 'group.leaderboard.refresh', 'group_leaderboard_cache');
+  return { refreshed: true };
 };
