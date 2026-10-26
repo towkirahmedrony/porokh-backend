@@ -139,6 +139,32 @@ export const isAttemptExpired = (
   return nowMs > deadline;
 };
 
+export const QUIZ_PRACTICE_MODES = ['wrong_from_history', 'wrong_global'] as const;
+
+export const isQuizPracticeMode = (mode: unknown): boolean =>
+  QUIZ_PRACTICE_MODES.includes(String(mode ?? '') as (typeof QUIZ_PRACTICE_MODES)[number]);
+
+/**
+ * Quiz-mode mistake practice is deliberately untimed. A null deadline only
+ * means unlimited for these two practice modes; every other attempt still
+ * fails closed when its deadline is missing.
+ */
+export const isUntimedPracticeAttempt = (attempt: {
+  practice_mode?: string | null;
+  deadline_at?: string | null;
+} | null | undefined): boolean =>
+  attempt?.deadline_at === null &&
+  isQuizPracticeMode(attempt?.practice_mode);
+
+export const isAttemptExpiredForAttempt = (
+  attempt: { practice_mode?: string | null; deadline_at?: string | null } | null | undefined,
+  nowMs: number = Date.now()
+): boolean => {
+  if (isUntimedPracticeAttempt(attempt)) return false;
+
+  return isAttemptExpired(attempt?.deadline_at, nowMs);
+};
+
 export const resolvePracticeDeadline = (
   startedAtMs: number,
   durationMinutes?: number | null

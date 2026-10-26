@@ -508,7 +508,7 @@ test('a missing publish time fails closed', async () => {
   assert.equal(hasCorrectFlag(result.details_json.questions[0].options), false);
 });
 
-test('omitting exam_id never enables answer disclosure', async () => {
+test('a tracked practice attempt reveals answers without an exam id', async () => {
   const attempt = seedAttempt({ exam_id: null, kind: 'practice', question_ids: [uuid('1')] });
 
   const result = await ExamUserService.submitExamResult({
@@ -520,10 +520,10 @@ test('omitting exam_id never enables answer disclosure', async () => {
   });
 
   assert.equal(result.exam_id, null);
-  assert.equal(result.details_json.correct_answers_revealed, false);
-  assert.equal(hasCorrectFlag(result.details_json.questions[0].options), false);
-  assert.equal(result.details_json.questions[0].explanation, null);
-  assert.equal('correct_option_id' in result.details_json.details[0], false);
+  assert.equal(result.details_json.correct_answers_revealed, true);
+  assert.equal(hasCorrectFlag(result.details_json.questions[0].options), true);
+  assert.equal(result.details_json.questions[0].explanation.en, 'Explanation one');
+  assert.equal(result.details_json.details[0].correct_option_id, uuid('b'));
 });
 
 test('submitting question ids without answers does not reveal answer keys', async () => {
@@ -548,7 +548,7 @@ test('submitting question ids without answers does not reveal answer keys', asyn
   assert.equal('correct_option_text' in result.details_json.details[0], false);
 });
 
-test('omitting exam_id with question ids but no answers reveals nothing protected', async () => {
+test('a tracked practice skipped question still reveals its key after submission', async () => {
   const attempt = seedAttempt({ exam_id: null, kind: 'practice', question_ids: [uuid('1')] });
 
   const result = await ExamUserService.submitExamResult({
@@ -558,10 +558,10 @@ test('omitting exam_id with question ids but no answers reveals nothing protecte
     time_taken: 10,
   });
 
-  assert.equal(result.details_json.correct_answers_revealed, false);
-  assert.equal(hasCorrectFlag(result.details_json.questions[0].options), false);
-  assert.equal(result.details_json.questions[0].explanation, null);
-  assert.equal('correct_option_id' in result.details_json.details[0], false);
+  assert.equal(result.details_json.correct_answers_revealed, true);
+  assert.equal(hasCorrectFlag(result.details_json.questions[0].options), true);
+  assert.equal(result.details_json.details[0].status, 'skipped');
+  assert.equal(result.details_json.details[0].correct_option_id, uuid('b'));
 });
 
 test('an unknown exam id is rejected and no result is written', async () => {
@@ -835,4 +835,40 @@ test("another user's attempt cannot be submitted", async () => {
   );
 
   assert.equal(state.insertedHistory.length, 0);
+});
+
+test('a tracked practice result reveals keys and explanations for its own questions', async () => {
+  const attempt = seedAttempt({
+    exam_id: null,
+    kind: 'practice',
+    practice_mode: 'wrong_global',
+    question_ids: [uuid('1'), uuid('2')],
+  });
+
+  const result = await ExamUserService.submitExamResult({
+    attempt_id: attempt.id,
+    user_id: 'user-1',
+    answers: { [uuid('1')]: uuid('b') },
+    question_ids: [uuid('1'), uuid('2')],
+    time_taken: 10,
+  });
+
+  assert.equal(result.details_json.correct_answers_revealed, true);
+  assert.equal(hasCorrectFlag(result.details_json.questions[0].options), true);
+  assert.equal(result.details_json.details[0].correct_option_id, uuid('b'));
+  assert.equal(result.details_json.details[0].correct_option_text, 'খ');
+
+  const skippedDetail = result.details_json.details.find(
+    (detail: Row) => detail.question_id === uuid('2')
+  );
+  assert.equal(skippedDetail.status, 'skipped');
+  assert.equal(skippedDetail.correct_option_id, uuid('c'));
+
+  const review = await ExamUserService.getExamResult('user-1', result.id);
+  assert.equal(review.details_json.correct_answers_revealed, true);
+  assert.equal(hasCorrectFlag(review.details_json.questions[1].options), true);
+  assert.equal(review.details_json.questions[0].explanation.en, 'Explanation one');
+
+  const foreign = await ExamUserService.getExamResult('user-2', result.id);
+  assert.equal(foreign, null);
 });

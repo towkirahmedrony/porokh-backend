@@ -1,53 +1,5 @@
 import { supabase } from '../../config/supabase';
 
-const mapWithConcurrency = async <T, R>(
-  items: T[],
-  limit: number,
-  task: (item: T) => Promise<R>
-): Promise<R[]> => {
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-  const workerCount = Math.min(Math.max(1, limit), items.length);
-
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (true) {
-        const index = nextIndex;
-        nextIndex += 1;
-
-        if (index >= items.length) return;
-
-        results[index] = await task(items[index]);
-      }
-    })
-  );
-
-  return results;
-};
-
-const loadAvailableCount = async (
-  rpcName: 'get_history_question_set' | 'get_history_wrong_questions',
-  userId: string,
-  historyId: string
-): Promise<number> => {
-  try {
-    const { data, error } = await supabase.rpc(rpcName, {
-      p_user_id: userId,
-      p_history_id: historyId,
-    });
-
-    if (error) return 0;
-
-    return (Array.isArray(data) ? data : []).filter(
-      (row: any) => row?.available === true
-    ).length;
-  } catch {
-    // Availability flags enrich the list; they must never make the whole
-    // history page unavailable. A start request still re-checks the source.
-    return 0;
-  }
-};
-
 export const getUserExamHistory = async (userId: string) => {
   // The history list only needs attempt summaries. details_json is intentionally
   // omitted: it can contain answer-key snapshots that must go through the
@@ -64,21 +16,18 @@ export const getUserExamHistory = async (userId: string) => {
 
   const rows = data ?? [];
 
-  // The existing database functions are the single source of truth for what can
-  // be practised. Running them per history row (bounded concurrency) keeps the
-  // response honest without introducing another schema object.
-  return mapWithConcurrency(rows, 4, async (row: any) => {
-    const historyId = String(row.id ?? '');
-
-    const [retakeAvailable, wrongAvailable] = await Promise.all([
-      loadAvailableCount('get_history_question_set', userId, historyId),
-      loadAvailableCount('get_history_wrong_questions', userId, historyId),
-    ]);
+  // Row counters are enough to decide whether the action is worth offering.
+  // Exact availability is checked when the student starts the mode, so the
+  // history list no longer runs two RPCs per row.
+  return rows.map((row: any) => {
+    const correct = Math.max(0, Number(row.correct_count ?? 0));
+    const wrong = Math.max(0, Number(row.wrong_count ?? 0));
+    const skipped = Math.max(0, Number(row.skipped_count ?? 0));
 
     return {
       ...row,
-      retake_available_count: retakeAvailable,
-      wrong_available_count: wrongAvailable,
+      retake_available_count: correct + wrong + skipped,
+      wrong_available_count: wrong + skipped,
     };
   });
 };

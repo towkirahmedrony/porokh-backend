@@ -5,6 +5,8 @@ import {
   ATTEMPT_STATUS,
   checkExamWindow,
   isAttemptExpired,
+  isAttemptExpiredForAttempt,
+  isUntimedPracticeAttempt,
   resolveAttemptDeadline,
   resolvePracticeDeadline,
   resolveSubmitGraceMs,
@@ -499,7 +501,7 @@ export class ExamAttemptService {
 
     if (
       attempt.status === ATTEMPT_STATUS.IN_PROGRESS &&
-      isAttemptExpired(attempt.deadline_at)
+      isAttemptExpiredForAttempt(attempt)
     ) {
       await ExamAttemptService.expireAttempt(attempt.id);
 
@@ -521,7 +523,7 @@ export class ExamAttemptService {
     if (attempt.status !== ATTEMPT_STATUS.IN_PROGRESS) {
       throw new ExamAttemptError('Attempt is no longer in progress', 409);
     }
-    if (isAttemptExpired(attempt.deadline_at)) {
+    if (isAttemptExpiredForAttempt(attempt)) {
       await ExamAttemptService.expireAttempt(attempt.id);
       throw new ExamAttemptError('Exam attempt has expired', 409);
     }
@@ -535,7 +537,7 @@ export class ExamAttemptService {
     // The update is conditional on in_progress AND an unexpired deadline so a
     // concurrent submit/expire cannot be overwritten, and it never touches
     // started_at/deadline_at (a retry can never extend the exam).
-    const { data, error } = await supabase
+    let updateQuery = supabase
       .from('exam_progress')
       .update({
         answers_draft: safeAnswers,
@@ -544,9 +546,13 @@ export class ExamAttemptService {
       })
       .eq('id', attempt.id)
       .eq('user_id', userId)
-      .eq('status', ATTEMPT_STATUS.IN_PROGRESS)
-      .gt('deadline_at', toIso(now))
-      .select(ATTEMPT_SELECT);
+      .eq('status', ATTEMPT_STATUS.IN_PROGRESS);
+
+    if (!isUntimedPracticeAttempt(attempt)) {
+      updateQuery = updateQuery.gt('deadline_at', toIso(now));
+    }
+
+    const { data, error } = await updateQuery.select(ATTEMPT_SELECT);
 
     if (error) throw new Error(error.message);
     if (!data || data.length === 0) {
@@ -580,14 +586,17 @@ export class ExamAttemptService {
     const graceMs = resolveSubmitGraceMs();
     const now = Date.now();
 
+    const untimed = isUntimedPracticeAttempt(attempt);
+
     // `isAttemptExpired` is inclusive at the boundary; subtracting the grace is
     // exactly the same instant the database filter compares against below.
-    if (isAttemptExpired(attempt.deadline_at, now - graceMs)) {
+    if (!untimed && isAttemptExpired(attempt.deadline_at, now - graceMs)) {
       await ExamAttemptService.expireAttempt(attempt.id);
 
       return { attempt: { ...attempt, status: ATTEMPT_STATUS.EXPIRED }, claimed: false };
     }
-    const { data, error } = await supabase
+
+    let updateQuery = supabase
       .from('exam_progress')
       .update({
         status: ATTEMPT_STATUS.SUBMITTED,
@@ -597,9 +606,13 @@ export class ExamAttemptService {
       })
       .eq('id', attempt.id)
       .eq('user_id', userId)
-      .eq('status', ATTEMPT_STATUS.IN_PROGRESS)
-      .gt('deadline_at', toIso(now - graceMs))
-      .select(ATTEMPT_SELECT);
+      .eq('status', ATTEMPT_STATUS.IN_PROGRESS);
+
+    if (!untimed) {
+      updateQuery = updateQuery.gt('deadline_at', toIso(now - graceMs));
+    }
+
+    const { data, error } = await updateQuery.select(ATTEMPT_SELECT);
 
     if (error) throw new Error(error.message);
 

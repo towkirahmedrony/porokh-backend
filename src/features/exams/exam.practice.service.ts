@@ -3,9 +3,11 @@ import { supabase } from '../../config/supabase';
 import {
   ATTEMPT_KIND,
   ATTEMPT_STATUS,
-  isAttemptExpired,
+  isAttemptExpiredForAttempt,
+  isQuizPracticeMode,
   resolvePracticeDeadline,
 } from './exam.timing';
+import { findOptionById, isAnswerCorrect, isOptionCorrect } from './exam.grading';
 import {
   ATTEMPT_ERROR_CODES,
   ATTEMPT_SELECT,
@@ -128,6 +130,21 @@ const loadHistoryQuestionSet = async (
     available,
     unavailable: ordered.length - available.length,
   };
+};
+
+const loadHistoryTimeLimit = async (
+  userId: string,
+  historyId: string
+): Promise<number | null> => {
+  const { data, error } = await supabase.rpc('get_history_time_limit', {
+    p_user_id: userId,
+    p_history_id: historyId,
+  });
+
+  if (error) mapPracticeRpcError(error, 'exam_history');
+
+  const seconds = Number(data);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.trunc(seconds) : null;
 };
 
 const loadHistoryWrongSet = async (
@@ -280,14 +297,15 @@ const insertPracticeAttempt = async (params: {
   questionIds: string[];
   counts: { available: number; unavailable: number; total: number; requested?: number };
   now: number;
+  timeLimitSeconds?: number | null;
 }): Promise<PracticeStartedResult> => {
-  const { userId, mode, sourceHistoryId, questionIds, counts, now } = params;
+  const { userId, mode, sourceHistoryId, questionIds, counts, now, timeLimitSeconds } = params;
 
   return withPracticeLock(`${userId}:${mode}:${sourceHistoryId ?? 'global'}`, async () => {
     const existing = await findInProgressPracticeAttempt(userId, mode, sourceHistoryId);
 
     if (existing) {
-      if (!isAttemptExpired(existing.deadline_at, now)) {
+      if (!isAttemptExpiredForAttempt(existing, now)) {
         await consumePracticeQuota(userId, quotaFeatureFor(mode), existing.id);
 
         return {
@@ -311,8 +329,18 @@ const insertPracticeAttempt = async (params: {
 
     await consumePracticeQuota(userId, feature, attemptId);
 
-    const durationMinutes = await loadPracticeDurationMinutes();
-    const deadline = resolvePracticeDeadline(now, durationMinutes);
+    const untimed = isQuizPracticeMode(mode);
+    let deadline: number | null = null;
+
+    if (!untimed) {
+      const durationMinutes = await loadPracticeDurationMinutes();
+      const limitSeconds = Number(timeLimitSeconds);
+
+      deadline =
+        Number.isFinite(limitSeconds) && limitSeconds > 0
+          ? now + Math.trunc(limitSeconds) * 1000
+          : resolvePracticeDeadline(now, durationMinutes);
+    }
 
     const insertPayload: AnyObject = {
       id: attemptId,
@@ -322,11 +350,11 @@ const insertPracticeAttempt = async (params: {
       status: ATTEMPT_STATUS.IN_PROGRESS,
       practice_mode: mode,
       started_at: toIso(now),
-      deadline_at: toIso(deadline),
+      deadline_at: deadline === null ? null : toIso(deadline),
       question_ids: questionIds,
       answers_draft: {},
       current_question_index: 0,
-      time_remaining: Math.max(0, Math.ceil((deadline - now) / 1000)),
+      time_remaining: deadline === null ? null : Math.max(0, Math.ceil((deadline - now) / 1000)),
       last_updated_at: toIso(now),
     };
 
@@ -385,6 +413,26 @@ const insertPracticeAttempt = async (params: {
   });
 };
 
+
+const normalizePracticeExplanation = (
+  value: unknown
+): { bn: string; en: string } | null => {
+  if (value === null || value === undefined) return null;
+
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text ? { bn: text, en: text } : null;
+  }
+
+  if (typeof value !== 'object') return null;
+
+  const explanation = value as AnyObject;
+  const bn = typeof explanation.bn === 'string' ? explanation.bn : '';
+  const en = typeof explanation.en === 'string' ? explanation.en : '';
+
+  return bn || en ? { bn, en } : null;
+};
+
 export class ExamPracticeService {
   static async getMistakePool(userId: string): Promise<{ available_count: number }> {
     if (!userId) throw new ExamAttemptError('Unauthorized', 401);
@@ -431,6 +479,8 @@ export class ExamPracticeService {
       );
     }
 
+    const timeLimitSeconds = await loadHistoryTimeLimit(userId, normalizedHistoryId);
+
     return insertPracticeAttempt({
       userId,
       mode: PRACTICE_MODES.RETAKE,
@@ -438,6 +488,7 @@ export class ExamPracticeService {
       questionIds: set.available,
       counts: { available: set.available.length, unavailable: set.unavailable, total: set.total },
       now: Date.now(),
+      timeLimitSeconds,
     });
   }
 
@@ -544,4 +595,114 @@ export class ExamPracticeService {
       now: Date.now(),
     });
   }
+  static async answerPracticeQuestion(
+    userId: string,
+    attemptId: unknown,
+    questionId: unknown,
+    selectedOption: unknown
+  ) {
+    if (!userId) throw new ExamAttemptError('Unauthorized', 401);
+
+    const normalizedAttemptId = normalizeId(attemptId);
+    const normalizedQuestionId = normalizeId(questionId);
+    const normalizedOptionId = normalizeId(selectedOption);
+
+    if (!normalizedAttemptId) throw new ExamAttemptError('Attempt id is required', 400);
+    if (!normalizedQuestionId) throw new ExamAttemptError('Question id is required', 400);
+    if (!normalizedOptionId) throw new ExamAttemptError('Selected option is required', 400);
+
+    return withPracticeLock(`answer:${normalizedAttemptId}`, async () => {
+      const attempt = await ExamAttemptService.getAttempt(userId, normalizedAttemptId);
+
+      if (!attempt) throw new ExamAttemptError('Attempt not found', 404);
+      if (attempt.status !== ATTEMPT_STATUS.IN_PROGRESS) {
+        throw new ExamAttemptError('Attempt is no longer in progress', 409);
+      }
+      if (!isQuizPracticeMode(attempt.practice_mode)) {
+        throw new ExamAttemptError('This attempt does not support answer reveal', 409);
+      }
+      if (isAttemptExpiredForAttempt(attempt)) {
+        await ExamAttemptService.expireAttempt(attempt.id);
+        throw new ExamAttemptError('Attempt has expired', 409);
+      }
+
+      const questionIds = normalizeQuestionIds(attempt.question_ids);
+      const questionIndex = questionIds.indexOf(normalizedQuestionId);
+
+      if (questionIndex < 0) {
+        throw new ExamAttemptError('Question does not belong to this attempt', 400);
+      }
+
+      const answersDraft =
+        attempt.answers_draft &&
+        typeof attempt.answers_draft === 'object' &&
+        !Array.isArray(attempt.answers_draft)
+          ? { ...attempt.answers_draft }
+          : {};
+
+      const existingAnswer = answersDraft[normalizedQuestionId];
+      if (existingAnswer !== undefined && existingAnswer !== null && String(existingAnswer).trim() !== '') {
+        throw new ExamAttemptError('This question has already been answered', 409);
+      }
+
+      const { data: question, error } = await supabase
+        .from('questions')
+        .select('id, options, explanation, is_active, status, deleted_at')
+        .eq('id', normalizedQuestionId)
+        .maybeSingle();
+
+      if (error) throw new Error(error.message);
+
+      if (
+        !question ||
+        question.is_active !== true ||
+        question.status !== 'published' ||
+        question.deleted_at !== null
+      ) {
+        throw new ExamAttemptError('Question is no longer available', 409);
+      }
+
+      const options: AnyObject[] = Array.isArray(question.options) ? question.options : [];
+      const selected = findOptionById(options, normalizedOptionId);
+
+      if (!selected) throw new ExamAttemptError('Selected option is invalid', 400);
+
+      const correct = options.find((option) => isOptionCorrect(option)) ?? null;
+      const isCorrect = isAnswerCorrect(options, normalizedOptionId);
+      const now = Date.now();
+
+      answersDraft[normalizedQuestionId] = normalizedOptionId;
+
+      const { data: updated, error: updateError } = await supabase
+        .from('exam_progress')
+        .update({
+          answers_draft: answersDraft,
+          current_question_index: questionIndex,
+          last_updated_at: toIso(now),
+        })
+        .eq('id', attempt.id)
+        .eq('user_id', userId)
+        .eq('status', ATTEMPT_STATUS.IN_PROGRESS)
+        .select(ATTEMPT_SELECT);
+
+      if (updateError) throw new Error(updateError.message);
+      if (!updated || updated.length === 0) {
+        throw new ExamAttemptError('Attempt is no longer in progress', 409);
+      }
+
+      return {
+        is_correct: isCorrect,
+        correct_option: correct
+          ? {
+              id: normalizeId(correct.id),
+              text_bn: correct.text_bn ?? null,
+              text_en: correct.text_en ?? null,
+              image_url: correct.image_url ?? null,
+            }
+          : null,
+        explanation: normalizePracticeExplanation(question.explanation),
+      };
+    });
+  }
+
 }

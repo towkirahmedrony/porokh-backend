@@ -15,6 +15,7 @@ import {
   startRetakePractice,
   startWrongPractice,
   startMistakePractice,
+  answerPracticeQuestion,
 } from './exams.user.controller';
 import { requireAuth } from '../../middlewares/requireAuth';
 import { rateLimit } from '../../middlewares/rateLimit';
@@ -28,6 +29,7 @@ const submissionLimit = rateLimit({ windowMs: 60_000, max: 20, keyPrefix: 'exam-
 // Autosave must stay permissive enough for legitimate retries after a network
 // drop, but it still cannot extend a deadline (see ExamAttemptService).
 const answerSaveLimit = rateLimit({ windowMs: 60_000, max: 180, keyPrefix: 'exam-answers' });
+const practiceAnswerLimit = rateLimit({ windowMs: 60_000, max: 120, keyPrefix: 'practice-answer' });
 
 router.post('/generate', requireAuth, questionReadLimit, generateExam);
 router.get('/arena', requireAuth, questionReadLimit, getArena);
@@ -44,6 +46,7 @@ router.get('/practice/mistakes', requireAuth, questionReadLimit, getMistakePool)
 router.post('/practice/retake', requireAuth, submissionLimit, startRetakePractice);
 router.post('/practice/wrong', requireAuth, submissionLimit, startWrongPractice);
 router.post('/practice/mistakes', requireAuth, submissionLimit, startMistakePractice);
+router.post('/practice/:attemptId/answer', requireAuth, practiceAnswerLimit, answerPracticeQuestion);
 router.get('/attempts/:id', requireAuth, getAttemptState);
 router.get('/attempts/:id/questions', requireAuth, questionReadLimit, getAttemptQuestions);
 router.patch('/attempts/:id/answers', requireAuth, answerSaveLimit, saveAttemptAnswers);

@@ -130,6 +130,24 @@ export const getAttemptQuestions = catchAsync(async (req: Request, res: Response
   });
 });
 
+/** Reveals one answer immediately for an untimed wrong+skipped quiz attempt. */
+export const answerPracticeQuestion = catchAsync(async (req: Request, res: Response) => {
+  const userId = getAuthUserId(req);
+  const result = await ExamPracticeService.answerPracticeQuestion(
+    userId,
+    req.params.attemptId,
+    req.body?.question_id,
+    req.body?.selected_option
+  );
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: 'Answer revealed',
+    data: result,
+  });
+});
+
 /** Available unique wrong questions across the student's history. */
 export const getMistakePool = catchAsync(async (req: Request, res: Response) => {
   const userId = getAuthUserId(req);

@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { supabase } from '../../config/supabase';
 import { GenerateExamDTO, SubmitHistoryDTO } from './exams.types';
-import { ATTEMPT_STATUS, isAttemptExpired } from './exam.timing';
+import { ATTEMPT_STATUS, isAttemptExpiredForAttempt } from './exam.timing';
 import { ExamAttemptError, ExamAttemptService, loadUserAccess } from './exam.attempt.service';
 import {
   findOptionById,
@@ -962,18 +962,19 @@ export class ExamUserService {
       questionMap.set(normalizeId(q.id), q);
     });
 
-    const includeCorrectAnswers = isAnswerDisclosureAllowed(
-      examId,
-      resultPublishTime
-    );
+    const isPracticeAttempt =
+      Boolean(attempt) && (Boolean(attempt?.practice_mode) || examId === null);
+    const includeCorrectAnswers =
+      isPracticeAttempt || isAnswerDisclosureAllowed(examId, resultPublishTime);
 
-    // Questions without a submitted answer never reveal their correct option,
-    // even when the exam policy permits review. This prevents a caller from
-    // harvesting the key by sending bare question ids.
+    // For normal exams, questions without a submitted answer never reveal their
+    // correct option, even when review is permitted. A practice result is owned
+    // by the student and may reveal every question in that attempt.
     const answeredQuestionIds = new Set(
       questionIds.filter((questionId) => !isEmptyAnswer(answers[questionId]))
     );
-    const revealKeys = includeCorrectAnswers && answeredQuestionIds.size > 0;
+    const revealKeys =
+      includeCorrectAnswers && (isPracticeAttempt || answeredQuestionIds.size > 0);
 
     let correct = 0;
     let wrong = 0;
@@ -1016,7 +1017,7 @@ export class ExamUserService {
             status: 'skipped',
           },
           q,
-          false
+          revealKeys && isPracticeAttempt
         );
       }
 
@@ -1050,7 +1051,10 @@ export class ExamUserService {
         Boolean(entry.question)
       )
       .map(({ questionId, question }) =>
-        buildQuestionSnapshot(question, revealKeys && answeredQuestionIds.has(questionId))
+        buildQuestionSnapshot(
+          question,
+          revealKeys && (isPracticeAttempt || answeredQuestionIds.has(questionId))
+        )
       );
 
     const sanitizedAnswers = sanitizeAnswerMap(
@@ -1314,7 +1318,10 @@ export class ExamUserService {
 
     if (!attempt) throw new ExamAttemptError('Attempt not found', 404);
 
-    if (attempt.status !== ATTEMPT_STATUS.IN_PROGRESS || isAttemptExpired(attempt.deadline_at)) {
+    if (
+      attempt.status !== ATTEMPT_STATUS.IN_PROGRESS ||
+      isAttemptExpiredForAttempt(attempt)
+    ) {
       if (attempt.status === ATTEMPT_STATUS.IN_PROGRESS) {
         await ExamAttemptService.expireAttempt(attempt.id);
       }
@@ -1403,7 +1410,10 @@ export class ExamUserService {
 
     const examId = record.exam_id ? normalizeId(record.exam_id) : null;
     const resultPublishTime = await loadResultPublishTime(examId);
-    const includeCorrectAnswers = isAnswerDisclosureAllowed(examId, resultPublishTime);
+    const isPracticeResult =
+      Boolean(record.practice_mode) || (examId === null && Boolean(record.attempt_id));
+    const includeCorrectAnswers =
+      isPracticeResult || isAnswerDisclosureAllowed(examId, resultPublishTime);
 
     // Legacy attempts may have been written through the trust-based history
     // endpoint, so their stored question ids are untrusted. When an exam is set,
@@ -1436,7 +1446,7 @@ export class ExamUserService {
         .map(([questionId]) => normalizeId(questionId))
         .filter((questionId) => questionIds.includes(questionId))
     );
-    const revealKeys = includeCorrectAnswers && answeredQuestionIds.size > 0;
+    const revealKeys = includeCorrectAnswers && (isPracticeResult || answeredQuestionIds.size > 0);
 
     const questionMap =
       questionIds.length > 0
@@ -1450,7 +1460,8 @@ export class ExamUserService {
 
     const questions: AnyObject[] = questionIds
       .map((questionId): AnyObject | null => {
-        const revealForQuestion = revealKeys && answeredQuestionIds.has(questionId);
+        const revealForQuestion =
+          revealKeys && (isPracticeResult || answeredQuestionIds.has(questionId));
         const currentQuestion = questionMap.get(questionId);
 
         if (currentQuestion) {
@@ -1469,7 +1480,7 @@ export class ExamUserService {
       sanitizeDetailForClient(
         detail,
         questionMap.get(normalizeId(detail?.question_id)),
-        revealKeys && !isEmptyAnswer(detail?.selected_option)
+        revealKeys && (isPracticeResult || !isEmptyAnswer(detail?.selected_option))
       )
     );
 

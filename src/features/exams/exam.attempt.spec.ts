@@ -492,3 +492,47 @@ test('attempt questions are never served for an expired attempt', async () => {
   assert.equal(stateAfter.status, ATTEMPT_STATUS.EXPIRED);
   assert.equal(stateAfter.seconds_remaining, 0);
 });
+
+test('an untimed quiz practice attempt stays resumable, editable and submittable', async () => {
+  const now = Date.now();
+  state.attempts.push({
+    id: 'quiz-attempt',
+    user_id: 'user-1',
+    exam_id: null,
+    kind: 'practice',
+    status: ATTEMPT_STATUS.IN_PROGRESS,
+    started_at: new Date(now - 60_000).toISOString(),
+    deadline_at: null,
+    submitted_at: null,
+    answers_draft: {},
+    current_question_index: 0,
+    time_remaining: null,
+    last_updated_at: new Date(now).toISOString(),
+    exam_history_id: null,
+    question_ids: ['q-1'],
+    practice_mode: 'wrong_global',
+    source_history_id: null,
+  });
+
+  const resumed = await ExamAttemptService.getAttemptState('user-1', 'quiz-attempt');
+  assert.equal(resumed.status, ATTEMPT_STATUS.IN_PROGRESS);
+  assert.equal(resumed.deadline_at, null);
+  assert.equal(resumed.seconds_remaining, null);
+
+  const saved = await ExamAttemptService.saveDraftAnswers(
+    'user-1',
+    'quiz-attempt',
+    { 'q-1': 'opt-a' },
+    1
+  );
+  assert.equal(saved.answers_draft['q-1'], 'opt-a');
+  assert.equal(saved.current_question_index, 1);
+
+  const claim = await ExamAttemptService.claimAttemptForSubmission(
+    'user-1',
+    'quiz-attempt',
+    'history-quiz'
+  );
+  assert.equal(claim.claimed, true);
+  assert.equal(state.attempts[0].status, ATTEMPT_STATUS.SUBMITTED);
+});
