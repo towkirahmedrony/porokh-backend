@@ -517,8 +517,16 @@ export class ExamAttemptService {
     answers: unknown,
     currentQuestionIndex?: unknown
   ): Promise<AttemptDto> {
-    const attempt = await ExamAttemptService.getAttempt(userId, attemptId);
+    // Only the timing/ownership fields are needed here. Selecting the full
+    // attempt would pull the whole answer draft on every autosave.
+    const { data: attempt, error: attemptError } = await supabase
+      .from('exam_progress')
+      .select('id, status, practice_mode, deadline_at')
+      .eq('id', normalizeId(attemptId))
+      .eq('user_id', userId)
+      .maybeSingle();
 
+    if (attemptError) throw new Error(attemptError.message);
     if (!attempt) throw new ExamAttemptError('Attempt not found', 404);
     if (attempt.status !== ATTEMPT_STATUS.IN_PROGRESS) {
       throw new ExamAttemptError('Attempt is no longer in progress', 409);
@@ -528,22 +536,30 @@ export class ExamAttemptService {
       throw new ExamAttemptError('Exam attempt has expired', 409);
     }
 
-    const safeAnswers =
-      answers && typeof answers === 'object' && !Array.isArray(answers) ? answers : {};
+    // `answers === undefined` is a position-only save (quiz navigation). It
+    // must not overwrite a newer draft written by the answer endpoint.
+    const hasAnswers = answers !== undefined;
+    const safeAnswers = hasAnswers
+      ? answers && typeof answers === 'object' && !Array.isArray(answers)
+        ? answers
+        : {}
+      : null;
 
     const index = Number(currentQuestionIndex);
     const now = Date.now();
+    const updates: AnyObject = {
+      current_question_index: Number.isFinite(index) && index >= 0 ? Math.floor(index) : 0,
+      last_updated_at: toIso(now),
+    };
+
+    if (safeAnswers !== null) updates.answers_draft = safeAnswers;
 
     // The update is conditional on in_progress AND an unexpired deadline so a
     // concurrent submit/expire cannot be overwritten, and it never touches
     // started_at/deadline_at (a retry can never extend the exam).
     let updateQuery = supabase
       .from('exam_progress')
-      .update({
-        answers_draft: safeAnswers,
-        current_question_index: Number.isFinite(index) && index >= 0 ? Math.floor(index) : 0,
-        last_updated_at: toIso(now),
-      })
+      .update(updates)
       .eq('id', attempt.id)
       .eq('user_id', userId)
       .eq('status', ATTEMPT_STATUS.IN_PROGRESS);

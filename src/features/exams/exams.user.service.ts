@@ -24,17 +24,31 @@ type SubmitExamPayload = {
   time_taken?: number;
 };
 
-export const calculateExamXP = async (
-  correctCount: number,
-  totalQuestions: number
-): Promise<number> => {
+const XP_RULES_CACHE_TTL_MS = 60_000;
+let xpRulesCache: { rules: AnyObject; expiresAt: number } | null = null;
+
+const loadXpRules = async (): Promise<AnyObject> => {
+  if (xpRulesCache && xpRulesCache.expiresAt > Date.now()) {
+    return xpRulesCache.rules;
+  }
+
   const { data } = await supabase
     .from('app_configs')
     .select('value')
     .eq('key', 'xp_rules')
     .maybeSingle();
 
-  const rules = (data?.value as any) || {};
+  const rules = (data?.value as AnyObject) || {};
+  xpRulesCache = { rules, expiresAt: Date.now() + XP_RULES_CACHE_TTL_MS };
+
+  return rules;
+};
+
+export const calculateExamXP = async (
+  correctCount: number,
+  totalQuestions: number
+): Promise<number> => {
+  const rules = await loadXpRules();
 
   let xp = 20;
   const perCorrect = Number(rules.per_correct_answer || 5);
@@ -683,10 +697,14 @@ export class ExamUserService {
       .limit(MAX_QUESTION_CANDIDATES);
 
     // Arena/model-test generation is non-premium content: a student without
-    // access must never be served a locked question.
-    if (!(await userHasPremiumAccess(userId))) {
-      const premiumSubjectIds = await loadPremiumSubjectIds();
+    // access must never be served a locked question. Fetch the access state and
+    // subject list concurrently; neither depends on the other.
+    const [hasPremiumAccess, premiumSubjectIds] = await Promise.all([
+      userHasPremiumAccess(userId),
+      loadPremiumSubjectIds(),
+    ]);
 
+    if (!hasPremiumAccess) {
       if (premiumSubjectIds.length > 0) {
         query = query.not(
           'subject_id',
@@ -1178,16 +1196,6 @@ export class ExamUserService {
         created_at: new Date().toISOString(),
       }));
 
-    if (detailRows.length > 0) {
-      const { error: detailsError } = await supabase
-        .from('exam_history_details')
-        .insert(detailRows);
-
-      if (detailsError) {
-        console.error('Exam history details insert error:', detailsError);
-      }
-    }
-
     // XP is computed on the trustworthy side from authoritative grading and is
     // only awarded for a tracked *exam* attempt this request atomically
     // claimed. Practice attempts, untracked submissions, duplicates and empty
@@ -1200,7 +1208,18 @@ export class ExamUserService {
       !attempt?.practice_mode &&
       answeredCount > 0;
 
-    const earnedXP = xpEligible ? await calculateExamXP(correct, totalQuestions) : 0;
+    // The detail snapshot and the XP rules lookup are independent, so overlap
+    // them instead of paying for two serial round trips.
+    const [detailsResult, earnedXP] = await Promise.all([
+      detailRows.length > 0
+        ? supabase.from('exam_history_details').insert(detailRows)
+        : Promise.resolve({ error: null }),
+      xpEligible ? calculateExamXP(correct, totalQuestions) : Promise.resolve(0),
+    ]);
+
+    if (detailsResult.error) {
+      console.error('Exam history details insert error:', detailsResult.error);
+    }
     let xpAwarded = false;
 
     if (earnedXP > 0) {
@@ -1409,7 +1428,13 @@ export class ExamUserService {
           : {};
 
     const examId = record.exam_id ? normalizeId(record.exam_id) : null;
-    const resultPublishTime = await loadResultPublishTime(examId);
+
+    // Both lookups depend only on examId, so fetch them concurrently.
+    const [resultPublishTime, authorizedIds] = await Promise.all([
+      loadResultPublishTime(examId),
+      examId ? loadExamQuestionIds(examId) : Promise.resolve<string[] | null>(null),
+    ]);
+
     const isPracticeResult =
       Boolean(record.practice_mode) || (examId === null && Boolean(record.attempt_id));
     const includeCorrectAnswers =
@@ -1418,9 +1443,7 @@ export class ExamUserService {
     // Legacy attempts may have been written through the trust-based history
     // endpoint, so their stored question ids are untrusted. When an exam is set,
     // only questions in that exam's authoritative question set are reviewable.
-    const authorizedQuestionIds = examId
-      ? new Set(await loadExamQuestionIds(examId))
-      : null;
+    const authorizedQuestionIds = authorizedIds ? new Set(authorizedIds) : null;
 
     const storedQuestionIds = (
       storedQuestions.length > 0

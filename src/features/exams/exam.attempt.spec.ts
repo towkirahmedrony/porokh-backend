@@ -298,6 +298,21 @@ test('saving draft answers repeatedly never extends the deadline', async () => {
   assert.equal(updated.answers_draft['q-1'], 'opt-b');
 });
 
+test('position-only draft saves preserve the latest answers', async () => {
+  const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
+
+  await ExamAttemptService.saveDraftAnswers('user-1', attempt.id, { 'q-1': 'opt-a' }, 1);
+  const moved = await ExamAttemptService.saveDraftAnswers(
+    'user-1',
+    attempt.id,
+    undefined,
+    1
+  );
+
+  assert.equal(moved.answers_draft['q-1'], 'opt-a');
+  assert.equal(moved.current_question_index, 1);
+});
+
 test('answers cannot be saved once the authoritative deadline has passed', async () => {
   const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
 

@@ -459,7 +459,10 @@ export class ExamPracticeService {
       throw new ExamAttemptError('History id is required', 400);
     }
 
-    const set = await loadHistoryQuestionSet(userId, normalizedHistoryId);
+    const [set, timeLimitSeconds] = await Promise.all([
+      loadHistoryQuestionSet(userId, normalizedHistoryId),
+      loadHistoryTimeLimit(userId, normalizedHistoryId),
+    ]);
 
     if (set.available.length === 0) {
       return emptyResult(
@@ -478,8 +481,6 @@ export class ExamPracticeService {
         'confirm_partial'
       );
     }
-
-    const timeLimitSeconds = await loadHistoryTimeLimit(userId, normalizedHistoryId);
 
     return insertPracticeAttempt({
       userId,
@@ -612,7 +613,16 @@ export class ExamPracticeService {
     if (!normalizedOptionId) throw new ExamAttemptError('Selected option is required', 400);
 
     return withPracticeLock(`answer:${normalizedAttemptId}`, async () => {
-      const attempt = await ExamAttemptService.getAttempt(userId, normalizedAttemptId);
+      // The attempt and the question are independent reads; overlap them so
+      // answering waits for one round trip instead of two.
+      const [attempt, questionResult] = await Promise.all([
+        ExamAttemptService.getAttempt(userId, normalizedAttemptId),
+        supabase
+          .from('questions')
+          .select('id, options, explanation, is_active, status, deleted_at')
+          .eq('id', normalizedQuestionId)
+          .maybeSingle(),
+      ]);
 
       if (!attempt) throw new ExamAttemptError('Attempt not found', 404);
       if (attempt.status !== ATTEMPT_STATUS.IN_PROGRESS) {
@@ -645,11 +655,7 @@ export class ExamPracticeService {
         throw new ExamAttemptError('This question has already been answered', 409);
       }
 
-      const { data: question, error } = await supabase
-        .from('questions')
-        .select('id, options, explanation, is_active, status, deleted_at')
-        .eq('id', normalizedQuestionId)
-        .maybeSingle();
+      const { data: question, error } = questionResult;
 
       if (error) throw new Error(error.message);
 

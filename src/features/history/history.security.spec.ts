@@ -35,6 +35,7 @@ const createBuilder = (table: string) => {
       return builder;
     },
     eq: () => builder,
+    in: () => builder,
     order: () => builder,
     limit: () => builder,
     is: () => builder,

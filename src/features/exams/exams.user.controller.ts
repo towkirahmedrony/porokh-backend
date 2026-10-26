@@ -224,14 +224,15 @@ export const submitExam = catchAsync(async (req: Request, res: Response) => {
   // failure must never turn a successful submission into a 500: it is logged
   // (without tokens or answer data) and the saved result is returned.
   if (!(result as any)?.duplicate) {
-    try {
-      await incrementStreakOnExamSubmit(userId);
-    } catch (streakError) {
+    // Streak/XP side effects are not part of the submission result. Run them
+    // after the response path so a first study session of the day (which may
+    // perform several writes) never delays the student's result.
+    void incrementStreakOnExamSubmit(userId).catch((streakError) => {
       console.error('[exam:streak] failed to update streak after a saved result', {
         userId,
         message: streakError instanceof Error ? streakError.message : 'unknown error',
       });
-    }
+    });
 
     // Mirror the exact XP that was saved into every active group. This is
     // fire-and-forget: group XP must never fail or delay an exam submission.
