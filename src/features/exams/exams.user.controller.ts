@@ -3,6 +3,7 @@ import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response';
 import { ExamUserService } from './exams.user.service';
 import { ExamAttemptError, ExamAttemptService } from './exam.attempt.service';
+import { ExamPracticeService } from './exam.practice.service';
 import { incrementStreakOnExamSubmit } from '../growth/streak.service';
 import { awardGroupXpToActiveGroups } from '../groups/groups.xp';
 
@@ -125,6 +126,69 @@ export const getAttemptQuestions = catchAsync(async (req: Request, res: Response
     statusCode: 200,
     success: true,
     message: 'Attempt questions fetched',
+    data: result,
+  });
+});
+
+/** Available unique wrong questions across the student's history. */
+export const getMistakePool = catchAsync(async (req: Request, res: Response) => {
+  const userId = getAuthUserId(req);
+  const result = await ExamPracticeService.getMistakePool(userId);
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: 'Mistake pool fetched',
+    data: result,
+  });
+});
+
+/** Starts/resumes a retake of one historical result. */
+export const startRetakePractice = catchAsync(async (req: Request, res: Response) => {
+  const userId = getAuthUserId(req);
+  const result = await ExamPracticeService.startRetake(
+    userId,
+    req.body?.history_id,
+    req.body?.confirm_partial === true
+  );
+
+  sendResponse(res, {
+    statusCode: result.started ? 201 : 200,
+    success: true,
+    message: result.started ? 'Retake started' : 'Retake preview',
+    data: result,
+  });
+});
+
+/** Starts/resumes practice of the wrong questions in one historical result. */
+export const startWrongPractice = catchAsync(async (req: Request, res: Response) => {
+  const userId = getAuthUserId(req);
+  const result = await ExamPracticeService.startWrongFromHistory(
+    userId,
+    req.body?.history_id
+  );
+
+  sendResponse(res, {
+    statusCode: result.started ? 201 : 200,
+    success: true,
+    message: result.started ? 'Wrong-question practice started' : 'Wrong-question preview',
+    data: result,
+  });
+});
+
+/** Starts/resumes global mistake practice from the student's unique mistake pool. */
+export const startMistakePractice = catchAsync(async (req: Request, res: Response) => {
+  const userId = getAuthUserId(req);
+  const result = await ExamPracticeService.startMistakePractice(
+    userId,
+    req.body?.count,
+    req.body?.confirm_reduced === true
+  );
+
+  sendResponse(res, {
+    statusCode: result.started ? 201 : 200,
+    success: true,
+    message: result.started ? 'Mistake practice started' : 'Mistake practice preview',
     data: result,
   });
 });

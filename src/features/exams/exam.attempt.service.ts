@@ -48,7 +48,7 @@ export const ATTEMPT_ERROR_CODES = {
 } as const;
 
 export const ATTEMPT_SELECT =
-  'id, user_id, exam_id, kind, status, started_at, deadline_at, submitted_at, answers_draft, current_question_index, time_remaining, last_updated_at, exam_history_id, question_ids';
+  'id, user_id, exam_id, kind, status, started_at, deadline_at, submitted_at, answers_draft, current_question_index, time_remaining, last_updated_at, exam_history_id, question_ids, practice_mode, source_history_id';
 
 const MAX_PRACTICE_QUESTIONS = 100;
 
@@ -79,9 +79,11 @@ export type AttemptDto = {
   answers_draft: AnyObject;
   current_question_index: number;
   question_ids: string[];
+  practice_mode: string | null;
+  source_history_id: string | null;
 };
 
-const toAttemptDto = (row: AnyObject, nowMs = Date.now()): AttemptDto => ({
+export const toAttemptDto = (row: AnyObject, nowMs = Date.now()): AttemptDto => ({
   id: row.id,
   exam_id: row.exam_id ?? null,
   kind: row.kind ?? ATTEMPT_KIND.EXAM,
@@ -97,6 +99,8 @@ const toAttemptDto = (row: AnyObject, nowMs = Date.now()): AttemptDto => ({
       : {},
   current_question_index: Number(row.current_question_index ?? 0),
   question_ids: Array.isArray(row.question_ids) ? row.question_ids.map(normalizeId).filter(Boolean) : [],
+  practice_mode: row.practice_mode ?? null,
+  source_history_id: row.source_history_id ?? null,
 });
 
 const loadExamPaper = async (examId: string) => {
@@ -167,7 +171,7 @@ const loadPublishedQuestionIds = async (questionIds: string[]): Promise<string[]
   return (data || []).map((row: AnyObject) => normalizeId(row.id)).filter(Boolean);
 };
 
-const loadPracticeDurationMinutes = async (): Promise<number | null> => {
+export const loadPracticeDurationMinutes = async (): Promise<number | null> => {
   const { data, error } = await supabase
     .from('app_configs')
     .select('value')
