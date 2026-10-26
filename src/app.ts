@@ -2,6 +2,7 @@ import express, { Application, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
+import { createCorsOptions } from './config/cors';
 
 // রাউট ইম্পোর্ট
 import authRoutes from './features/auth/auth.routes';
@@ -54,58 +55,14 @@ const app: Application = express();
 // left-most X-Forwarded-For entry and defeat IP rate limiting.
 app.set('trust proxy', 1);
 
-/**
- * Browsers serialise `Origin` without a path or trailing slash. Operators,
- * however, routinely paste `https://example.com/` into CLIENT_URL. Comparing
- * the two raw strings rejected the production origin and turned every
- * preflight into a 500, so both sides are normalised before comparison.
- */
-const normalizeOrigin = (value: string): string =>
-  value.trim().replace(/\/+$/, '').toLowerCase();
-
-const envClientUrls = (process.env.CLIENT_URL ?? '')
-  .split(',')
-  .map(normalizeOrigin)
-  .filter(Boolean);
-
-// Deployed origins come from the two Firebase Hosting projects in the client
-// repositories: the user app (.firebaserc project `parapothexam`, default site)
-// and the admin panel (hosting target `admin` -> site `parapoth-studio`).
-// Firebase serves every site on both `<site>.web.app` and
-// `<project>.firebaseapp.com`, so both spellings of the user app are allowed.
-// Any additional deployment (for example a Vercel preview) must be added to
-// CLIENT_URL instead of widening this list.
-const defaultOrigins = [
-  'https://parapothexam.web.app',
-  'https://parapothexam.firebaseapp.com',
-  'https://parapoth-studio.web.app',
-];
-
-// Local development origins must never widen the production allowlist.
-if (process.env.NODE_ENV !== 'production') {
-  defaultOrigins.push(
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://127.0.0.1:5174'
-  );
-}
-
-const allowedOrigins = [...envClientUrls, ...defaultOrigins].map(normalizeOrigin);
-
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(normalizeOrigin(origin))) {
-      callback(null, true);
-    } else {
-      // A rejected origin is a client error, not an internal failure. Returning
-      // 403 keeps monitoring meaningful and makes the cause greppable.
-      const error = new Error('Origin not allowed by CORS') as CustomError;
-      error.status = 403;
-      callback(error);
-    }
-  },
-  credentials: true
-}));
+app.use(
+  cors(
+    createCorsOptions({
+      clientUrl: process.env.CLIENT_URL,
+      nodeEnv: process.env.NODE_ENV,
+    })
+  )
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
