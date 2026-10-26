@@ -11,6 +11,10 @@ import {
   getAttemptState,
   saveAttemptAnswers,
   getAttemptQuestions,
+  getMistakePool,
+  startRetakePractice,
+  startWrongPractice,
+  startMistakePractice,
 } from './exams.user.controller';
 import { requireAuth } from '../../middlewares/requireAuth';
 import { rateLimit } from '../../middlewares/rateLimit';
@@ -32,6 +36,14 @@ router.get('/arena', requireAuth, questionReadLimit, getArena);
 // server-side deadline of an existing in-progress attempt.
 router.post('/attempts/start', requireAuth, submissionLimit, startAttempt);
 router.post('/attempts/practice', requireAuth, submissionLimit, startPracticeAttempt);
+
+// Practice modes build their question set server-side from the student's own
+// history. The source id is always scoped by requireAuth + the database RPC's
+// p_user_id, never by a client-supplied user.
+router.get('/practice/mistakes', requireAuth, questionReadLimit, getMistakePool);
+router.post('/practice/retake', requireAuth, submissionLimit, startRetakePractice);
+router.post('/practice/wrong', requireAuth, submissionLimit, startWrongPractice);
+router.post('/practice/mistakes', requireAuth, submissionLimit, startMistakePractice);
 router.get('/attempts/:id', requireAuth, getAttemptState);
 router.get('/attempts/:id/questions', requireAuth, questionReadLimit, getAttemptQuestions);
 router.patch('/attempts/:id/answers', requireAuth, answerSaveLimit, saveAttemptAnswers);

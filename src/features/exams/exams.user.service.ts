@@ -1101,6 +1101,14 @@ export class ExamUserService {
     // whose attempt_id is null anyway.
     if (attempt) resultPayload.attempt_id = attempt.id;
 
+    // Practice attempts carry provenance so history can label the result and
+    // offer the same mode again. These columns only exist once the practice
+    // mode migration is applied; normal exam/legacy submissions omit them.
+    if (attempt?.practice_mode) resultPayload.practice_mode = attempt.practice_mode;
+    if (attempt?.source_history_id) {
+      resultPayload.source_history_id = attempt.source_history_id;
+    }
+
     // The history row id is fixed at claim time (attempts) or derived from the
     // submission key (practice) so a duplicate can only observe one record.
     if (historyId) resultPayload.id = historyId;
@@ -1185,6 +1193,7 @@ export class ExamUserService {
     const xpEligible =
       Boolean(attempt) &&
       attempt?.kind === 'exam' &&
+      !attempt?.practice_mode &&
       answeredCount > 0;
 
     const earnedXP = xpEligible ? await calculateExamXP(correct, totalQuestions) : 0;
@@ -1227,6 +1236,8 @@ export class ExamUserService {
       time_taken: Number(result.time_taken ?? timeTakenSeconds),
       submitted_at: result.submitted_at ?? submittedAt,
       created_at: result.created_at ?? null,
+      practice_mode: attempt?.practice_mode ?? null,
+      source_history_id: attempt?.source_history_id ?? null,
       details_json: detailsJson,
       earned_xp: earnedXP > 0 && xpAwarded ? earnedXP : 0,
       duplicate: false,
@@ -1281,6 +1292,8 @@ export class ExamUserService {
       time_taken: 0,
       submitted_at: null,
       created_at: null,
+      practice_mode: null,
+      source_history_id: null,
       details_json: null,
       earned_xp: 0,
       duplicate: true,
@@ -1478,6 +1491,8 @@ export class ExamUserService {
       submitted_at: record.submitted_at ?? null,
       created_at: record.created_at ?? null,
       status: record.status ?? null,
+      practice_mode: record.practice_mode ?? null,
+      source_history_id: record.source_history_id ?? null,
       details_json: buildStudentFacingDetailsJson(detailsJson, {
         answers,
         details,

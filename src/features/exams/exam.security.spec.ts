@@ -414,6 +414,32 @@ test('B5: a practice attempt never earns XP', async () => {
   assert.equal(state.xpAwards.length, 0);
 });
 
+test('practice submissions store the practice mode and source without awarding XP', async () => {
+  const attempt = seedAttempt({
+    exam_id: null,
+    kind: 'practice',
+    practice_mode: 'retake',
+    source_history_id: 'source-history-1',
+  });
+
+  const result = await ExamUserService.submitExamResult({
+    attempt_id: attempt.id,
+    user_id: 'user-1',
+    answers: { [uuid('1')]: uuid('b') },
+    question_ids: [uuid('1')],
+  });
+
+  assert.equal(result.practice_mode, 'retake');
+  assert.equal(result.source_history_id, 'source-history-1');
+  assert.equal(result.earned_xp, 0);
+  assert.equal(state.xpAwards.length, 0);
+
+  const stored = state.history[0];
+  assert.equal(stored.practice_mode, 'retake');
+  assert.equal(stored.source_history_id, 'source-history-1');
+  assert.equal(stored.exam_id, null);
+});
+
 test('H-02: a legitimate attempt awards the server-calculated XP exactly once', async () => {
   const attempt = seedAttempt();
 
