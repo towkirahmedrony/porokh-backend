@@ -25,6 +25,7 @@ import { GROUP_ERROR_CODES } from './features/groups/groups.errors';
 // এক্সাম, সিস্টেম, ফাইন্যান্স, নোটিফিকেশন এবং হিস্ট্রি রাউট ইম্পোর্ট
 import { ExamUserRoutes } from './features/exams/exams.user.routes';
 import { ExamAdminRoutes } from './features/exams/exams.admin.routes';
+import examBookmarkRoutes from './features/exams/exam.bookmark.routes';
 import systemRoutes from './features/system/system.routes'; 
 import { financeRoutes } from './features/finance/finance.routes';
 import notificationRoutes from './features/notifications/notifications.routes';
@@ -110,6 +111,8 @@ app.use('/internal', groupInternalRoutes);
 // এক্সাম মডিউট রাউট
 app.use('/api/v1/exams/user', ExamUserRoutes);
 app.use('/api/v1/exams/admin', ExamAdminRoutes);
+// Existing clients call POST /api/v1/exams/bookmark; keep that path stable.
+app.use('/api/v1/exams/bookmark', examBookmarkRoutes);
 
 // সিস্টেম, ফাইন্যান্স এবং অন্যান্য রাউট
 app.use('/api/v1/system', systemRoutes); 
