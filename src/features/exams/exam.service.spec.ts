@@ -759,6 +759,29 @@ test('a practice submission persists without referencing attempt_id', async () =
   assert.equal(inserted.score, 1);
 });
 
+test('an untracked practice submission reveals its answer key on submit and review', async () => {
+  const result = await ExamUserService.submitExamResult(
+    practicePayload({ question_ids: [uuid('1'), uuid('2')] })
+  );
+
+  assert.equal(result.attempt_id, null);
+  assert.equal(result.details_json.correct_answers_revealed, true);
+  assert.equal(hasCorrectFlag(result.details_json.questions[0].options), true);
+  assert.equal(result.details_json.details[0].correct_option_id, uuid('b'));
+  assert.equal(result.details_json.details[0].correct_option_text, 'খ');
+
+  const skippedDetail = result.details_json.details.find(
+    (detail: Row) => detail.question_id === uuid('2')
+  );
+  assert.equal(skippedDetail.status, 'skipped');
+  assert.equal(skippedDetail.correct_option_id, uuid('c'));
+
+  const review = await ExamUserService.getExamResult('user-1', result.id);
+  assert.equal(review.details_json.correct_answers_revealed, true);
+  assert.equal(hasCorrectFlag(review.details_json.questions[1].options), true);
+  assert.equal(review.details_json.questions[0].explanation.en, 'Explanation one');
+});
+
 test('the reported duration is preserved for practice submissions', async () => {
   await ExamUserService.submitExamResult(practicePayload({ time_taken: 123 }));
 

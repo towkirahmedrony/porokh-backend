@@ -1,5 +1,113 @@
 import { supabase } from '../../config/supabase';
 
+type AnyObject = Record<string, any>;
+
+type SubjectLabel = {
+  id: string;
+  name_en: string | null;
+  name_bn: string | null;
+};
+
+const normalizeId = (value: unknown): string => String(value ?? '').trim();
+
+const asArray = (value: unknown): AnyObject[] =>
+  Array.isArray(value) ? (value as AnyObject[]) : [];
+
+const asRecord = (value: unknown): AnyObject | null =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as AnyObject)
+    : null;
+
+const parseJsonValue = (value: unknown): unknown => {
+  if (typeof value !== 'string') return value;
+
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return value;
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+};
+
+const isMissingRelationError = (error: unknown): boolean => {
+  const candidate = (error ?? {}) as AnyObject;
+  return (
+    candidate.code === '42P01' ||
+    candidate.code === 'PGRST205' ||
+    /relation .* does not exist|could not find the table/i.test(
+      String(candidate.message ?? '')
+    )
+  );
+};
+
+const loadHistorySubjects = async (
+  historyIds: string[]
+): Promise<Map<string, SubjectLabel[]>> => {
+  const result = new Map<string, SubjectLabel[]>();
+  if (historyIds.length === 0) return result;
+
+  const { data, error } = await supabase
+    .from('exam_history_details')
+    .select('exam_history_id, question_id, questions ( subject_id )')
+    .in('exam_history_id', historyIds);
+
+  if (error) return result;
+
+  const subjectIdsByHistory = new Map<string, Set<string>>();
+  const subjectIds = new Set<string>();
+
+  for (const row of asArray(data)) {
+    const historyId = normalizeId(row.exam_history_id);
+    const question = Array.isArray(row.questions) ? row.questions[0] : row.questions;
+    const subjectId = normalizeId(question?.subject_id);
+    if (!historyId || !subjectId) continue;
+
+    const current = subjectIdsByHistory.get(historyId) ?? new Set<string>();
+    current.add(subjectId);
+    subjectIdsByHistory.set(historyId, current);
+    subjectIds.add(subjectId);
+  }
+
+  if (subjectIds.size === 0) return result;
+
+  const { data: subjects, error: subjectsError } = await supabase
+    .from('subjects')
+    .select('id, name_en, name_bn')
+    .in('id', Array.from(subjectIds));
+
+  if (subjectsError) return result;
+
+  const subjectsById = new Map<string, SubjectLabel>();
+  for (const subject of asArray(subjects)) {
+    const id = normalizeId(subject.id);
+    if (!id) continue;
+    subjectsById.set(id, {
+      id,
+      name_en: subject.name_en ?? null,
+      name_bn: subject.name_bn ?? null,
+    });
+  }
+
+  subjectIdsByHistory.forEach((ids, historyId) => {
+    result.set(
+      historyId,
+      Array.from(ids)
+        .map((id) => subjectsById.get(id))
+        .filter((subject): subject is SubjectLabel => Boolean(subject))
+    );
+  });
+
+  return result;
+};
+
+const historyTimestamp = (row: AnyObject): number => {
+  const raw = row.submitted_at || row.created_at || row.taken_at || '';
+  const parsed = Date.parse(String(raw));
+  return Number.isNaN(parsed) ? 0 : parsed;
+};
+
 export const getUserExamHistory = async (userId: string) => {
   // The history list only needs attempt summaries. details_json is intentionally
   // omitted: it can contain answer-key snapshots that must go through the
@@ -14,122 +122,483 @@ export const getUserExamHistory = async (userId: string) => {
 
   if (error) throw error;
 
-  const rows = data ?? [];
+  const rows = asArray(data);
 
-  // Resolve presentation metadata in one backend query. The mobile client used
-  // to issue two extra Supabase requests (exam papers, then subjects) after
-  // every history load.
+  // Resolve presentation metadata in batched backend queries. The mobile client
+  // used to issue extra Supabase requests after every history load.
   const examIds = [
     ...new Set(
       rows
-        .map((row: any) => (row.exam_id ? String(row.exam_id) : null))
+        .map((row) => (row.exam_id ? normalizeId(row.exam_id) : null))
         .filter((id): id is string => Boolean(id))
     ),
   ];
 
-  const examMetadata = new Map<
-    string,
-    { title: string | null; subjectNameEn: string | null; subjectNameBn: string | null }
-  >();
+  const historyIds = rows
+    .map((row) => normalizeId(row.id))
+    .filter(Boolean);
 
-  if (examIds.length > 0) {
-    const { data: exams, error: examsError } = await supabase
-      .from('exam_papers')
-      .select('id, title, subject_id, subjects ( name_en, name_bn )')
-      .in('id', examIds);
+  const [examMetadata, subjectsByHistory] = await Promise.all([
+    (async () => {
+      const metadata = new Map<
+        string,
+        {
+          title: string | null;
+          subjectNameEn: string | null;
+          subjectNameBn: string | null;
+          subject: SubjectLabel | null;
+        }
+      >();
 
-    if (!examsError) {
-      for (const exam of (exams ?? []) as any[]) {
+      if (examIds.length === 0) return metadata;
+
+      const { data: exams, error: examsError } = await supabase
+        .from('exam_papers')
+        .select('id, title, subject_id, subjects ( name_en, name_bn )')
+        .in('id', examIds);
+
+      if (examsError) return metadata;
+
+      for (const exam of asArray(exams)) {
         const subject = Array.isArray(exam.subjects) ? exam.subjects[0] : exam.subjects;
+        const subjectId = normalizeId(subject?.id ?? exam.subject_id);
 
-        examMetadata.set(String(exam.id), {
+        metadata.set(normalizeId(exam.id), {
           title: exam.title ?? null,
           subjectNameEn: subject?.name_en ?? null,
           subjectNameBn: subject?.name_bn ?? null,
+          subject: subjectId
+            ? {
+                id: subjectId,
+                name_en: subject?.name_en ?? null,
+                name_bn: subject?.name_bn ?? null,
+              }
+            : null,
         });
       }
-    }
-  }
 
-  // Row counters are enough to decide whether the action is worth offering.
-  // Exact availability is checked when the student starts the mode, so the
-  // history list no longer runs two RPCs per row.
-  return rows.map((row: any) => {
+      return metadata;
+    })(),
+    loadHistorySubjects(historyIds),
+  ]);
+
+  // A stable, human-meaningful attempt number: oldest attempt is #1.
+  const chronological = [...rows].sort((a, b) => {
+    const diff = historyTimestamp(a) - historyTimestamp(b);
+    return diff !== 0 ? diff : normalizeId(a.id).localeCompare(normalizeId(b.id));
+  });
+  const sequenceById = new Map<string, number>();
+  chronological.forEach((row, index) => {
+    sequenceById.set(normalizeId(row.id), index + 1);
+  });
+
+  return rows.map((row) => {
+    const id = normalizeId(row.id);
     const correct = Math.max(0, Number(row.correct_count ?? 0));
     const wrong = Math.max(0, Number(row.wrong_count ?? 0));
     const skipped = Math.max(0, Number(row.skipped_count ?? 0));
-    const metadata = row.exam_id ? examMetadata.get(String(row.exam_id)) : undefined;
+    const metadata = row.exam_id ? examMetadata.get(normalizeId(row.exam_id)) : undefined;
+    const derivedSubjects = subjectsByHistory.get(id) ?? [];
+    const subjects = metadata?.subject ? [metadata.subject] : derivedSubjects;
+    const primarySubject = metadata?.subject ?? derivedSubjects[0] ?? null;
+    const countedQuestions = correct + wrong + skipped;
 
     return {
       ...row,
       exam_title: metadata?.title ?? null,
-      subject_name_en: metadata?.subjectNameEn ?? null,
-      subject_name_bn: metadata?.subjectNameBn ?? null,
+      subject_name_en: metadata?.subjectNameEn ?? primarySubject?.name_en ?? null,
+      subject_name_bn: metadata?.subjectNameBn ?? primarySubject?.name_bn ?? null,
+      subjects,
+      exam_sequence: sequenceById.get(id) ?? null,
+      question_count:
+        countedQuestions > 0
+          ? countedQuestions
+          : Math.max(0, Number(row.total_marks ?? 0)),
+      completion_status:
+        row.status ?? (row.submitted_at ? 'completed' : 'in_progress'),
       retake_available_count: correct + wrong + skipped,
       wrong_available_count: wrong + skipped,
     };
   });
 };
 
-const sanitizeQuestionOptions = (options: unknown): unknown[] => {
-  if (!Array.isArray(options)) return [];
+const REVIEW_QUESTION_SELECT =
+  'id, subject_id, type, body, options, explanation, media_id, media_library!questions_media_id_fkey(file_url)';
 
-  return options.map((option: any) => ({
-    id: option?.id,
-    text_bn: option?.text_bn,
-    text_en: option?.text_en,
-    image_url: option?.image_url ?? null,
-  }));
+/**
+ * Questions that belong to a live, non-practice exam paper must not expose an
+ * answer key through a secondary list. The review endpoint applies the same
+ * rule; this helper keeps bookmarks and mistakes from becoming a bypass.
+ */
+const loadAnswerRestrictedQuestionIds = async (
+  questionIds: string[]
+): Promise<Set<string>> => {
+  if (questionIds.length === 0) return new Set();
+
+  const { data, error } = await supabase
+    .from('exam_paper_questions')
+    .select(
+      'question_id, exam_papers!inner(exam_type, end_time, result_publish_time)'
+    )
+    .in('question_id', questionIds);
+
+  // Fail closed: if the restriction check cannot run, do not reveal keys.
+  if (error) return new Set(questionIds);
+
+  const now = Date.now();
+  const restricted = new Set<string>();
+
+  for (const row of asArray(data)) {
+    const paper = Array.isArray(row.exam_papers)
+      ? row.exam_papers[0]
+      : row.exam_papers;
+    if (!paper || paper.exam_type === 'practice') continue;
+
+    const endTime = paper.end_time ? Date.parse(String(paper.end_time)) : NaN;
+    const publishTime = paper.result_publish_time
+      ? Date.parse(String(paper.result_publish_time))
+      : NaN;
+
+    const isLive =
+      Number.isNaN(endTime) ||
+      endTime > now ||
+      (!Number.isNaN(publishTime) && publishTime > now);
+
+    if (isLive) restricted.add(normalizeId(row.question_id));
+  }
+
+  return restricted;
 };
 
-export const getUserMistakes = async (userId: string) => {
-  // Never expose explanations or correctness flags from this secondary list;
-  // authorised answer review happens through /exams/user/result/:id.
-  const { data, error } = await supabase
-    .from('wrong_answers')
-    .select('id, selected_option, question_id, questions ( id, body, options )')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false });
+const isOptionCorrect = (option: AnyObject): boolean =>
+  option?.isCorrect === true ||
+  option?.is_correct === true ||
+  option?.correct === true ||
+  String(option?.isCorrect).toLowerCase() === 'true' ||
+  String(option?.is_correct).toLowerCase() === 'true';
+
+const sanitizeReviewQuestion = (
+  question: AnyObject,
+  includeCorrectAnswers: boolean
+): AnyObject => {
+  const options = asArray(question.options).map((option) => {
+    const sanitized: AnyObject = {
+      id: option?.id ?? null,
+      text_bn: option?.text_bn ?? null,
+      text_en: option?.text_en ?? null,
+      image_url: option?.image_url ?? null,
+    };
+
+    if (includeCorrectAnswers) sanitized.isCorrect = isOptionCorrect(option);
+    return sanitized;
+  });
+
+  const media = Array.isArray(question.media_library)
+    ? question.media_library[0]
+    : question.media_library;
+  const body = parseJsonValue(question.body);
+  const bodyRecord = asRecord(body);
+
+  return {
+    id: normalizeId(question.id),
+    subject_id: question.subject_id ?? null,
+    type: question.type ?? null,
+    body,
+    options,
+    explanation: includeCorrectAnswers
+      ? parseJsonValue(question.explanation)
+      : null,
+    image_url: bodyRecord?.image_url ?? media?.file_url ?? null,
+  };
+};
+
+const loadReviewQuestions = async (
+  questionIds: string[]
+): Promise<Map<string, AnyObject>> => {
+  const result = new Map<string, AnyObject>();
+  if (questionIds.length === 0) return result;
+
+  const [{ data, error }, restrictedIds] = await Promise.all([
+    supabase
+      .from('questions')
+      .select(REVIEW_QUESTION_SELECT)
+      .in('id', questionIds),
+    loadAnswerRestrictedQuestionIds(questionIds),
+  ]);
 
   if (error) throw error;
 
-  return (data || []).map((row: any) => {
-    const question = Array.isArray(row.questions) ? row.questions[0] : row.questions;
+  for (const question of asArray(data)) {
+    const id = normalizeId(question.id);
+    if (!id) continue;
+    result.set(id, sanitizeReviewQuestion(question, !restrictedIds.has(id)));
+  }
 
-    return {
-      id: row.id,
-      selected_option: row.selected_option,
-      question_id: row.question_id,
-      questions: question
-        ? {
-            id: question.id,
-            body: question.body,
-            options: sanitizeQuestionOptions(question.options),
-          }
-        : null,
-    };
+  return result;
+};
+
+const DISMISSALS_SETTINGS_KEY = 'mistake_dismissals';
+
+const loadDismissalsFromSettings = async (
+  userId: string,
+  questionIds: string[]
+): Promise<Map<string, number>> => {
+  const result = new Map<string, number>();
+  const wanted = new Set(questionIds);
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('settings')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (error || !data) return result;
+
+  const settings = asRecord(data.settings);
+  const dismissals = asRecord(settings?.[DISMISSALS_SETTINGS_KEY]);
+  if (!dismissals) return result;
+
+  for (const [questionId, value] of Object.entries(dismissals)) {
+    if (!wanted.has(questionId)) continue;
+    const at = Date.parse(String(value ?? ''));
+    result.set(questionId, Number.isNaN(at) ? 0 : at);
+  }
+
+  return result;
+};
+
+const saveDismissalToSettings = async (
+  userId: string,
+  questionId: string,
+  createdAt: string
+): Promise<void> => {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('settings')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  const settings = asRecord(data?.settings) ?? {};
+  const dismissals = asRecord(settings[DISMISSALS_SETTINGS_KEY]) ?? {};
+  const nextSettings = {
+    ...settings,
+    [DISMISSALS_SETTINGS_KEY]: {
+      ...dismissals,
+      [questionId]: createdAt,
+    },
+  };
+
+  const { error: updateError } = await supabase
+    .from('profiles')
+    .update({ settings: nextSettings })
+    .eq('id', userId);
+
+  if (updateError) throw updateError;
+};
+
+const loadDismissals = async (
+  userId: string,
+  questionIds: string[]
+): Promise<Map<string, number>> => {
+  const result = new Map<string, number>();
+  if (questionIds.length === 0) return result;
+
+  const [{ data, error }, settingsDismissals] = await Promise.all([
+    supabase
+      .from('mistake_dismissals')
+      .select('question_id, created_at')
+      .eq('user_id', userId)
+      .in('question_id', questionIds),
+    loadDismissalsFromSettings(userId, questionIds),
+  ]);
+
+  // Settings are read as well as the table so dismissals made before the
+  // additive migration was applied are not lost when it is rolled out.
+  settingsDismissals.forEach((at, id) => result.set(id, at));
+
+  if (error) {
+    if (!isMissingRelationError(error)) {
+      console.error('[history] mistake dismissals could not be loaded');
+    }
+    return result;
+  }
+
+  for (const row of asArray(data)) {
+    const id = normalizeId(row.question_id);
+    const at = Date.parse(String(row.created_at ?? ''));
+    if (!id) continue;
+    result.set(id, Math.max(result.get(id) ?? 0, Number.isNaN(at) ? 0 : at));
+  }
+
+  return result;
+};
+
+type LatestMistake = {
+  detail: AnyObject;
+  occurredAt: number;
+};
+
+const loadLatestMistakes = async (
+  userId: string
+): Promise<Map<string, LatestMistake>> => {
+  const latest = new Map<string, LatestMistake>();
+
+  const { data, error } = await supabase
+    .from('exam_history')
+    .select(
+      'id, submitted_at, created_at, status, exam_history_details!inner(id, question_id, selected_option, is_correct, marks_awarded, created_at)'
+    )
+    .eq('user_id', userId)
+    .order('submitted_at', { ascending: false, nullsFirst: false })
+    .order('created_at', { ascending: false })
+    .order('created_at', {
+      referencedTable: 'exam_history_details',
+      ascending: false,
+    });
+
+  if (error) throw error;
+
+  for (const history of asArray(data)) {
+    if (history.status === 'fraud_detected') continue;
+
+    const historyAt = historyTimestamp(history);
+
+    for (const detail of asArray(history.exam_history_details)) {
+      const questionId = normalizeId(detail.question_id);
+      if (!questionId) continue;
+
+      const detailAt = Date.parse(String(detail.created_at ?? ''));
+      const occurredAt = Number.isNaN(detailAt) ? historyAt : detailAt;
+      const current = latest.get(questionId);
+      if (current && current.occurredAt > occurredAt) continue;
+
+      latest.set(questionId, { detail, occurredAt });
+    }
+  }
+
+  return latest;
+};
+
+export const getUserMistakes = async (userId: string) => {
+  const latest = await loadLatestMistakes(userId);
+
+  const wrong = Array.from(latest.entries()).filter(([, value]) => {
+    const isCorrect = value.detail?.is_correct;
+    return isCorrect === false;
   });
+
+  if (wrong.length === 0) return [];
+
+  const questionIds = wrong.map(([questionId]) => questionId);
+  const [questions, dismissals] = await Promise.all([
+    loadReviewQuestions(questionIds),
+    loadDismissals(userId, questionIds),
+  ]);
+
+  return wrong
+    .filter(([questionId, value]) => {
+      const dismissedAt = dismissals.get(questionId);
+      return dismissedAt === undefined || value.occurredAt > dismissedAt;
+    })
+    .map(([questionId, value]) => ({
+      // Question-level mistake collection: repeated wrong attempts do not create
+      // duplicate cards, while a later correct answer removes the card because
+      // only the latest response per question is considered.
+      id: questionId,
+      detail_id: normalizeId(value.detail.id),
+      question_id: questionId,
+      selected_option: value.detail.selected_option ?? null,
+      occurred_at: new Date(value.occurredAt).toISOString(),
+      questions: questions.get(questionId) ?? null,
+    }));
 };
 
 export const getUserBookmarks = async (userId: string) => {
   const { data, error } = await supabase
     .from('bookmarks')
-    .select('id, note, questions ( id, body )')
+    .select('id, note, question_id, created_at')
     .eq('user_id', userId)
     .order('created_at', { ascending: false });
 
   if (error) throw error;
-  return data;
+
+  const rows = asArray(data);
+  const questionIds = Array.from(
+    new Set(
+      rows
+        .map((row) => normalizeId(row.question_id))
+        .filter(Boolean)
+    )
+  );
+  const questions = await loadReviewQuestions(questionIds);
+
+  // Do not drop a bookmark when its question row is missing; the UI renders an
+  // explicit "question not available" state instead of silently losing it.
+  return rows.map((row) => {
+    const questionId = normalizeId(row.question_id);
+    return {
+      id: normalizeId(row.id),
+      note: row.note ?? null,
+      question_id: questionId,
+      created_at: row.created_at ?? null,
+      questions: questions.get(questionId) ?? null,
+    };
+  });
+};
+
+const resolveMistakeQuestionId = async (
+  mistakeId: string,
+  userId: string
+): Promise<string> => {
+  const { data, error } = await supabase
+    .from('wrong_answers')
+    .select('id, question_id')
+    .eq('user_id', userId)
+    .or(`id.eq.${mistakeId},question_id.eq.${mistakeId}`)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) return mistakeId;
+  return normalizeId(data?.question_id) || mistakeId;
 };
 
 export const deleteMistakeRecord = async (mistakeId: string, userId: string) => {
+  const normalizedId = normalizeId(mistakeId);
+  if (!normalizedId) return true;
+
+  const questionId = await resolveMistakeQuestionId(normalizedId, userId);
+
+  // Clear a legacy row as well as any id-based match.
   const { error } = await supabase
     .from('wrong_answers')
     .delete()
-    .eq('id', mistakeId)
-    .eq('user_id', userId); // Ensure the user owns the record
+    .eq('user_id', userId)
+    .or(`id.eq.${normalizedId},question_id.eq.${questionId}`);
 
-  if (error) throw error;
+  if (error && !isMissingRelationError(error)) throw error;
+
+  const createdAt = new Date().toISOString();
+  const { error: dismissError } = await supabase
+    .from('mistake_dismissals')
+    .upsert(
+      {
+        user_id: userId,
+        question_id: questionId,
+        created_at: createdAt,
+      },
+      { onConflict: 'user_id,question_id' }
+    );
+
+  if (dismissError) {
+    if (isMissingRelationError(dismissError)) {
+      await saveDismissalToSettings(userId, questionId, createdAt);
+    } else {
+      throw dismissError;
+    }
+  }
+
   return true;
 };
 

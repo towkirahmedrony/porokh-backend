@@ -980,8 +980,11 @@ export class ExamUserService {
       questionMap.set(normalizeId(q.id), q);
     });
 
+    // A submission without an exam paper is a practice/arena result, whether or
+    // not it was bound to a server-side attempt. There is no scheduled exam key
+    // to protect, and the untracked path already refuses exam-paper questions.
     const isPracticeAttempt =
-      Boolean(attempt) && (Boolean(attempt?.practice_mode) || examId === null);
+      examId === null || Boolean(attempt?.practice_mode);
     const includeCorrectAnswers =
       isPracticeAttempt || isAnswerDisclosureAllowed(examId, resultPublishTime);
 
@@ -1435,8 +1438,10 @@ export class ExamUserService {
       examId ? loadExamQuestionIds(examId) : Promise.resolve<string[] | null>(null),
     ]);
 
-    const isPracticeResult =
-      Boolean(record.practice_mode) || (examId === null && Boolean(record.attempt_id));
+    // Legacy/current arena submissions have no exam paper and therefore no
+    // scheduled result release. They are practice results owned by this user and
+    // must be reviewable even when the row predates attempt tracking.
+    const isPracticeResult = examId === null || Boolean(record.practice_mode);
     const includeCorrectAnswers =
       isPracticeResult || isAnswerDisclosureAllowed(examId, resultPublishTime);
 
