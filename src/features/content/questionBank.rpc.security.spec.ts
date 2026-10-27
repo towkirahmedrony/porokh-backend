@@ -15,6 +15,7 @@ import { join } from 'node:path';
 const MIGRATION_DIR = join(process.cwd(), 'supabase', 'migrations');
 const V1_FILE = join(MIGRATION_DIR, '20261022090200_student_question_bank_rpc.sql');
 const V2_FILE = join(MIGRATION_DIR, '20261025090000_student_question_bank_rpc_v2.sql');
+const V2_FIX_FILE = join(MIGRATION_DIR, '20261027130000_question_bank_filter_fixes.sql');
 const V2_SIGNATURE =
   'text, text, text, text, text, boolean, boolean, boolean, text, text, text, integer, integer';
 
@@ -93,4 +94,67 @@ test('v2 is additive: the v1 function definition is left untouched', () => {
     'v2 must not redefine the v1 signature'
   );
   assert.equal(sql.includes('drop function'), false);
+});
+
+/**
+ * The original v1/v2 files compared text parameters to uuid columns
+ * (`uuid = text`), which PostgreSQL rejects while parsing the query. The
+ * corrective migration must cast every id filter before it reaches a uuid
+ * column, otherwise the question bank cannot return rows at all.
+ */
+test('filter-fix migration casts id parameters before uuid comparisons', () => {
+  const sql = read(V2_FIX_FILE).replace(/--[^\n]*/g, '');
+
+  assert.match(
+    sql,
+    /v_subject_id uuid := nullif\(btrim\(coalesce\(p_subject_id, ''\)\), ''\)::uuid/
+  );
+  assert.match(
+    sql,
+    /v_chapter_id uuid := nullif\(btrim\(coalesce\(p_chapter_id, ''\)\), ''\)::uuid/
+  );
+  assert.match(
+    sql,
+    /v_topic_id uuid := nullif\(btrim\(coalesce\(p_topic_id, ''\)\), ''\)::uuid/
+  );
+
+  assert.match(sql, /v_subject_id is null or q\.subject_id = v_subject_id/);
+  assert.match(sql, /v_chapter_id is null or q\.chapter_id = v_chapter_id/);
+  assert.match(sql, /v_topic_id is null or q\.topic_id = v_topic_id/);
+  assert.equal(
+    /q\.subject_id = p_subject_id|q\.chapter_id = p_chapter_id|q\.topic_id = p_topic_id/.test(sql),
+    false,
+    'the uncast text/uuid comparisons must be gone'
+  );
+});
+
+test('filter-fix migration maps UI source kinds to stored source_type values', () => {
+  const sql = read(V2_FIX_FILE);
+
+  assert.match(sql, /when 'board' then 'board_exam'/);
+  assert.match(sql, /when 'college' then 'college_test'/);
+});
+
+test('filter-fix migration matches institutions by EIIN or canonical code', () => {
+  const sql = read(V2_FIX_FILE);
+
+  assert.match(sql, /ref ->> 'eiin' = v_institution_ref/);
+  assert.match(sql, /ref ->> 'code' = v_institution_ref/);
+});
+
+test('filter-fix migration keeps v2 authenticated-only', () => {
+  const sql = read(V2_FIX_FILE);
+  const signature = V2_SIGNATURE.replace(/\s+/g, ' ');
+
+  assert.ok(
+    sql.includes(
+      `revoke all on function public.get_student_question_bank_v2(\n  ${signature}\n) from public, anon`
+    )
+  );
+  assert.ok(
+    sql.includes(
+      `grant execute on function public.get_student_question_bank_v2(\n  ${signature}\n) to authenticated`
+    )
+  );
+  assert.equal(/grant execute[\s\S]{0,200}\bto anon\b/.test(sql), false);
 });
