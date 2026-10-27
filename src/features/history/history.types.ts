@@ -26,12 +26,16 @@ export interface ExamHistoryResponse {
   source_history_id: string | null;
 }
 
+/** A mistake is a wrong OR skipped response, unless the user dismissed it. */
+export type MistakeStatus = 'wrong' | 'skipped';
+
 export interface MistakeResponse {
   id: string;
-  detail_id: string;
+  detail_id: string | null;
   selected_option: string | null;
   question_id: string;
-  occurred_at: string;
+  status: MistakeStatus;
+  occurred_at: string | null;
   questions: Record<string, unknown> | null;
 }
 

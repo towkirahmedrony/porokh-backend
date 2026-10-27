@@ -138,7 +138,7 @@ export const getUserExamHistory = async (userId: string) => {
     .map((row) => normalizeId(row.id))
     .filter(Boolean);
 
-  const [examMetadata, subjectsByHistory] = await Promise.all([
+  const [examMetadata, subjectsByHistory, mistakeCounts] = await Promise.all([
     (async () => {
       const metadata = new Map<
         string,
@@ -180,6 +180,7 @@ export const getUserExamHistory = async (userId: string) => {
       return metadata;
     })(),
     loadHistorySubjects(historyIds),
+    loadMistakeCountsByHistory(userId),
   ]);
 
   // A stable, human-meaningful attempt number: oldest attempt is #1.
@@ -202,6 +203,12 @@ export const getUserExamHistory = async (userId: string) => {
     const subjects = metadata?.subject ? [metadata.subject] : derivedSubjects;
     const primarySubject = metadata?.subject ?? derivedSubjects[0] ?? null;
     const countedQuestions = correct + wrong + skipped;
+    // Same definition as the Mistakes tab: wrong or skipped, latest response
+    // per question, minus dismissals. The stored counters are only a fallback
+    // when the shared SQL definition cannot be read at all.
+    const canonicalMistakes = mistakeCounts
+      ? mistakeCounts.get(id) ?? 0
+      : wrong + skipped;
 
     return {
       ...row,
@@ -217,7 +224,7 @@ export const getUserExamHistory = async (userId: string) => {
       completion_status:
         row.status ?? (row.submitted_at ? 'completed' : 'in_progress'),
       retake_available_count: correct + wrong + skipped,
-      wrong_available_count: wrong + skipped,
+      wrong_available_count: canonicalMistakes,
     };
   });
 };
@@ -339,34 +346,12 @@ const loadReviewQuestions = async (
 
 const DISMISSALS_SETTINGS_KEY = 'mistake_dismissals';
 
-const loadDismissalsFromSettings = async (
-  userId: string,
-  questionIds: string[]
-): Promise<Map<string, number>> => {
-  const result = new Map<string, number>();
-  const wanted = new Set(questionIds);
-
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('settings')
-    .eq('id', userId)
-    .maybeSingle();
-
-  if (error || !data) return result;
-
-  const settings = asRecord(data.settings);
-  const dismissals = asRecord(settings?.[DISMISSALS_SETTINGS_KEY]);
-  if (!dismissals) return result;
-
-  for (const [questionId, value] of Object.entries(dismissals)) {
-    if (!wanted.has(questionId)) continue;
-    const at = Date.parse(String(value ?? ''));
-    result.set(questionId, Number.isNaN(at) ? 0 : at);
-  }
-
-  return result;
-};
-
+/**
+ * Fallback used only when the additive dismissal table is not deployed yet.
+ * The single mistake definition lives in SQL (public.user_mistake_questions);
+ * this keeps "delete mistake" working on a database that has not applied the
+ * dismissals migration.
+ */
 const saveDismissalToSettings = async (
   userId: string,
   questionId: string,
@@ -398,122 +383,103 @@ const saveDismissalToSettings = async (
   if (updateError) throw updateError;
 };
 
-const loadDismissals = async (
-  userId: string,
-  questionIds: string[]
-): Promise<Map<string, number>> => {
-  const result = new Map<string, number>();
-  if (questionIds.length === 0) return result;
-
-  const [{ data, error }, settingsDismissals] = await Promise.all([
-    supabase
-      .from('mistake_dismissals')
-      .select('question_id, created_at')
-      .eq('user_id', userId)
-      .in('question_id', questionIds),
-    loadDismissalsFromSettings(userId, questionIds),
-  ]);
-
-  // Settings are read as well as the table so dismissals made before the
-  // additive migration was applied are not lost when it is rolled out.
-  settingsDismissals.forEach((at, id) => result.set(id, at));
-
-  if (error) {
-    if (!isMissingRelationError(error)) {
-      console.error('[history] mistake dismissals could not be loaded');
-    }
-    return result;
-  }
-
-  for (const row of asArray(data)) {
-    const id = normalizeId(row.question_id);
-    const at = Date.parse(String(row.created_at ?? ''));
-    if (!id) continue;
-    result.set(id, Math.max(result.get(id) ?? 0, Number.isNaN(at) ? 0 : at));
-  }
-
-  return result;
+type MistakeRpcRow = {
+  question_id: string | null;
+  detail_id: string | null;
+  exam_history_id: string | null;
+  exam_id: string | null;
+  status: string | null;
+  selected_option: string | null;
+  occurred_at: string | null;
 };
 
-type LatestMistake = {
-  detail: AnyObject;
-  occurredAt: number;
+const normalizeMistakeStatus = (
+  value: unknown,
+  selectedOption: unknown
+): 'wrong' | 'skipped' => {
+  const status = String(value ?? '').trim().toLowerCase();
+  if (status === 'wrong' || status === 'skipped') return status;
+
+  // Defensive: an unlabelled row is a wrong answer when an option was chosen.
+  return normalizeId(selectedOption) ? 'wrong' : 'skipped';
 };
 
-const loadLatestMistakes = async (
-  userId: string
-): Promise<Map<string, LatestMistake>> => {
-  const latest = new Map<string, LatestMistake>();
+const toIsoOrNull = (value: unknown): string | null => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Date.parse(String(value));
+  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
+};
 
-  const { data, error } = await supabase
-    .from('exam_history')
-    .select(
-      'id, submitted_at, created_at, status, exam_history_details!inner(id, question_id, selected_option, is_correct, marks_awarded, created_at)'
-    )
-    .eq('user_id', userId)
-    .order('submitted_at', { ascending: false, nullsFirst: false })
-    .order('created_at', { ascending: false })
-    .order('created_at', {
-      referencedTable: 'exam_history_details',
-      ascending: false,
-    });
+/**
+ * The one mistake definition: wrong OR skipped, latest response per question,
+ * minus dismissals newer than that response. The SQL function is the single
+ * source of truth for the Mistakes tab, per-attempt practice counts, per-attempt
+ * practice and the cross-exam mistake pool.
+ */
+const loadMistakeRows = async (userId: string): Promise<MistakeRpcRow[]> => {
+  const { data, error } = await supabase.rpc('user_mistake_questions', {
+    p_user_id: userId,
+  });
 
   if (error) throw error;
 
-  for (const history of asArray(data)) {
-    if (history.status === 'fraud_detected') continue;
+  return asArray(data) as MistakeRpcRow[];
+};
 
-    const historyAt = historyTimestamp(history);
+/**
+ * Per-attempt mistake counts from the same definition. A failure here must not
+ * hide the history list, so it degrades to the stored attempt counters.
+ */
+const loadMistakeCountsByHistory = async (
+  userId: string
+): Promise<Map<string, number> | null> => {
+  const { data, error } = await supabase.rpc('get_user_mistake_counts', {
+    p_user_id: userId,
+  });
 
-    for (const detail of asArray(history.exam_history_details)) {
-      const questionId = normalizeId(detail.question_id);
-      if (!questionId) continue;
-
-      const detailAt = Date.parse(String(detail.created_at ?? ''));
-      const occurredAt = Number.isNaN(detailAt) ? historyAt : detailAt;
-      const current = latest.get(questionId);
-      if (current && current.occurredAt > occurredAt) continue;
-
-      latest.set(questionId, { detail, occurredAt });
-    }
+  if (error) {
+    console.error('[history] mistake counts unavailable, using attempt counters');
+    return null;
   }
 
-  return latest;
+  const counts = new Map<string, number>();
+  for (const row of asArray(data)) {
+    const historyId = normalizeId(row.exam_history_id);
+    if (!historyId) continue;
+    counts.set(historyId, Math.max(0, Number(row.mistake_count ?? 0)));
+  }
+
+  return counts;
 };
 
 export const getUserMistakes = async (userId: string) => {
-  const latest = await loadLatestMistakes(userId);
+  const rows = await loadMistakeRows(userId);
 
-  const wrong = Array.from(latest.entries()).filter(([, value]) => {
-    const isCorrect = value.detail?.is_correct;
-    return isCorrect === false;
-  });
+  const questionIds = Array.from(
+    new Set(rows.map((row) => normalizeId(row.question_id)).filter(Boolean))
+  );
+  const questions = await loadReviewQuestions(questionIds);
 
-  if (wrong.length === 0) return [];
+  return rows
+    .map((row) => {
+      const questionId = normalizeId(row.question_id);
+      if (!questionId) return null;
 
-  const questionIds = wrong.map(([questionId]) => questionId);
-  const [questions, dismissals] = await Promise.all([
-    loadReviewQuestions(questionIds),
-    loadDismissals(userId, questionIds),
-  ]);
-
-  return wrong
-    .filter(([questionId, value]) => {
-      const dismissedAt = dismissals.get(questionId);
-      return dismissedAt === undefined || value.occurredAt > dismissedAt;
+      return {
+        // Question-level collection: repeated wrong attempts do not create
+        // duplicate cards, while a later correct answer removes the card.
+        id: questionId,
+        detail_id: normalizeId(row.detail_id) || null,
+        question_id: questionId,
+        status: normalizeMistakeStatus(row.status, row.selected_option),
+        selected_option: row.selected_option ?? null,
+        occurred_at: toIsoOrNull(row.occurred_at),
+        questions: questions.get(questionId) ?? null,
+      };
     })
-    .map(([questionId, value]) => ({
-      // Question-level mistake collection: repeated wrong attempts do not create
-      // duplicate cards, while a later correct answer removes the card because
-      // only the latest response per question is considered.
-      id: questionId,
-      detail_id: normalizeId(value.detail.id),
-      question_id: questionId,
-      selected_option: value.detail.selected_option ?? null,
-      occurred_at: new Date(value.occurredAt).toISOString(),
-      questions: questions.get(questionId) ?? null,
-    }));
+    .filter((row): row is NonNullable<typeof row> => row !== null);
 };
+
 
 export const getUserBookmarks = async (userId: string) => {
   const { data, error } = await supabase

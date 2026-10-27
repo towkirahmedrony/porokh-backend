@@ -10,6 +10,7 @@ const state = {
   historySets: {} as Record<string, Row[]>,
   wrongSets: {} as Record<string, Row[]>,
   poolCount: 0,
+  mistakeCounts: [] as Row[],
   picked: [] as string[],
   quotaAllowed: true,
   quotaConsumptions: [] as Row[],
@@ -168,6 +169,10 @@ const rpc = async (name: string, args: Row) => {
     return { data: state.poolCount, error: null };
   }
 
+  if (name === 'get_user_mistake_counts') {
+    return { data: state.mistakeCounts, error: null };
+  }
+
   if (name === 'get_history_time_limit') {
     return { data: state.timeLimits[args.p_history_id] ?? null, error: null };
   }
@@ -239,6 +244,7 @@ beforeEach(() => {
   state.historySets = {};
   state.wrongSets = {};
   state.poolCount = 0;
+  state.mistakeCounts = [];
   state.picked = [];
   state.quotaAllowed = true;
   state.quotaConsumptions = [];
@@ -463,7 +469,7 @@ test('the mistake pool exposes the unique available question count', async () =>
   });
 });
 
-test('history summaries derive retake and wrong+skipped counts from the row', async () => {
+test('history summaries take the practice count from the shared mistake definition', async () => {
   state.history = [
     {
       id: 'history-1',
@@ -481,12 +487,15 @@ test('history summaries derive retake and wrong+skipped counts from the row', as
       details_json: { details: [], questions: [], answers: {} },
     },
   ];
+  // Wrong OR skipped, minus dismissals: two wrong and one skipped response,
+  // one of them dismissed -> 2.
+  state.mistakeCounts = [{ exam_history_id: 'history-1', mistake_count: 2 }];
 
   const rows = await getUserExamHistory('user-1');
 
   assert.equal(rows.length, 1);
   assert.equal(rows[0].retake_available_count, 5);
-  assert.equal(rows[0].wrong_available_count, 3);
+  assert.equal(rows[0].wrong_available_count, 2);
   assert.equal('details_json' in rows[0], false);
 });
 

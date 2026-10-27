@@ -17,6 +17,11 @@ type FakeState = {
   profiles: Row[];
   missingTables: string[];
   selects: string[];
+  // Rows returned by public.user_mistake_questions(); user_id is only used by
+  // the fake to scope the call the way the SQL function does.
+  mistake_rows: Row[];
+  rpcCalls: Array<{ name: string; args: Row }>;
+  rpcErrors: Record<string, Row>;
 };
 
 const state: FakeState = {
@@ -32,6 +37,9 @@ const state: FakeState = {
   profiles: [],
   missingTables: [],
   selects: [],
+  mistake_rows: [],
+  rpcCalls: [],
+  rpcErrors: {},
 };
 
 const resetState = () => {
@@ -47,6 +55,9 @@ const resetState = () => {
   state.profiles = [];
   state.missingTables = [];
   state.selects = [];
+  state.mistake_rows = [];
+  state.rpcCalls = [];
+  state.rpcErrors = {};
 };
 
 const project = (row: Row, columns: string): Row => {
@@ -195,6 +206,41 @@ const createBuilder = (table: keyof FakeState) => {
 
 const fakeSupabase = {
   from: (table: string) => createBuilder(table as keyof FakeState),
+  rpc: async (name: string, args: Row = {}) => {
+    state.rpcCalls.push({ name, args });
+
+    const error = state.rpcErrors[name];
+    if (error) return { data: null, error };
+
+    // The fake only reproduces the scoping and the grouping of the SQL
+    // functions; the mistake rule itself is covered by the SQL suite in
+    // supabase/tests/mistake_source_of_truth.sql.
+    const rows = state.mistake_rows.filter(
+      (row) => row.user_id === args.p_user_id
+    );
+
+    if (name === 'user_mistake_questions') {
+      return { data: rows, error: null };
+    }
+
+    if (name === 'get_user_mistake_counts') {
+      const counts = new Map<string, number>();
+      rows.forEach((row) => {
+        const key = String(row.exam_history_id);
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      });
+
+      return {
+        data: Array.from(counts.entries()).map(([exam_history_id, mistake_count]) => ({
+          exam_history_id,
+          mistake_count,
+        })),
+        error: null,
+      };
+    }
+
+    return { data: null, error: null };
+  },
 };
 
 const require = createRequire(__filename);
@@ -278,6 +324,13 @@ test('exam history listing derives subjects and sequence without details_json', 
     { id: 'subject-2', name_bn: 'গণিত', name_en: 'Math' },
   ];
 
+  // The practice count comes from the shared mistake definition, not from the
+  // stored attempt counters.
+  state.mistake_rows = [
+    makeMistakeRow('q2', { exam_history_id: 'history-1', status: 'wrong' }),
+    makeMistakeRow('q1', { exam_history_id: 'history-1', status: 'skipped', selected_option: null }),
+  ];
+
   const rows = await historyService.getUserExamHistory('user-1');
   const first = rows.find((row: Row) => row.id === 'history-1');
   const second = rows.find((row: Row) => row.id === 'history-2');
@@ -289,106 +342,183 @@ test('exam history listing derives subjects and sequence without details_json', 
   assert.equal(first.subject_name_en, 'Bangla');
   assert.equal(first.question_count, 3);
   assert.equal(first.wrong_available_count, 2);
+  assert.equal(second.wrong_available_count, 0);
   assert.equal(second.subject_name_en, 'Math');
   assert.equal(state.selects.some((select: string) => select.includes('details_json')), false);
   assert.equal(JSON.stringify(rows).includes('secret-answer'), false);
 });
 
-test('mistakes use the latest response per question and respect newer dismissals', async () => {
+const makeMistakeRow = (
+  questionId: string,
+  overrides: Row = {}
+): Row => ({
+  user_id: 'user-1',
+  question_id: questionId,
+  detail_id: `detail-${questionId}`,
+  exam_history_id: 'history-2',
+  exam_id: 'exam-1',
+  status: 'wrong',
+  selected_option: 'a',
+  occurred_at: '2026-10-18T10:00:00.000Z',
+  ...overrides,
+});
+
+test('the mistakes tab lists wrong AND skipped answers with a label for each', async () => {
+  resetState();
+  state.mistake_rows = [
+    makeMistakeRow('q1', { status: 'wrong', selected_option: 'a' }),
+    makeMistakeRow('q2', { status: 'skipped', selected_option: null }),
+    makeMistakeRow('q3', {
+      status: 'wrong',
+      selected_option: 'b',
+      occurred_at: '2026-10-18T11:00:00.000Z',
+    }),
+  ];
+  state.questions = ['q1', 'q2', 'q3'].map((id) => makeQuestion(id));
+
+  const rows = await historyService.getUserMistakes('user-1');
+
+  assert.equal(rows.length, 3);
+  assert.deepEqual(
+    rows.map((row: Row) => row.status).sort(),
+    ['skipped', 'wrong', 'wrong']
+  );
+
+  const skipped = rows.find((row: Row) => row.id === 'q2');
+  const wrong = rows.find((row: Row) => row.id === 'q1');
+  assert.equal(skipped.status, 'skipped');
+  assert.equal(skipped.selected_option, null);
+  assert.equal(wrong.status, 'wrong');
+  assert.equal(wrong.selected_option, 'a');
+  // Every card is hydrated with its question so the review preview renders.
+  rows.forEach((row: Row) => {
+    assert.ok(row.questions);
+    assert.match(row.questions.body.text_en, /Question /);
+  });
+});
+
+test('the mistakes tab never reads the legacy wrong_answers table', async () => {
+  resetState();
+  state.wrong_answers = [];
+  state.mistake_rows = [makeMistakeRow('q1')];
+  state.questions = [makeQuestion('q1')];
+
+  const rows = await historyService.getUserMistakes('user-1');
+
+  assert.equal(rows.length, 1);
+  assert.equal(
+    state.selects.some((select: string) => select.includes('wrong_answers')),
+    false
+  );
+});
+
+test('mistake reads are scoped to the verified session user', async () => {
+  resetState();
+  state.mistake_rows = [
+    makeMistakeRow('q1'),
+    makeMistakeRow('q2', { user_id: 'user-2' }),
+  ];
+  state.questions = [makeQuestion('q1'), makeQuestion('q2')];
+
+  const rows = await historyService.getUserMistakes('user-1');
+  const rpcCall = state.rpcCalls.find(
+    (call) => call.name === 'user_mistake_questions'
+  );
+
+  assert.deepEqual(rows.map((row: Row) => row.id), ['q1']);
+  assert.equal(rpcCall.args.p_user_id, 'user-1');
+});
+
+test('the practice count and the mistakes tab use the same rows', async () => {
   resetState();
   state.exam_history = [
     {
+      id: 'history-2',
+      user_id: 'user-1',
+      exam_id: 'exam-1',
+      score: 1,
+      total_marks: 30,
+      correct_count: 1,
+      wrong_count: 3,
+      skipped_count: 26,
+      status: 'completed',
+      submitted_at: '2026-10-18T12:00:00.000Z',
+      created_at: '2026-10-18T12:00:00.000Z',
+    },
+    {
       id: 'history-1',
       user_id: 'user-1',
+      exam_id: 'exam-1',
+      score: 0,
+      total_marks: 30,
+      correct_count: 0,
+      wrong_count: 1,
+      skipped_count: 0,
+      status: 'completed',
+      submitted_at: '2026-10-17T12:00:00.000Z',
+      created_at: '2026-10-17T12:00:00.000Z',
+    },
+  ];
+  state.exam_history_details = [];
+
+  // 3 wrong + 26 skipped = 29 canonical mistakes, one of them dismissed.
+  const canonical = Array.from({ length: 28 }, (_, index) =>
+    makeMistakeRow(`q${index + 1}`, {
+      status: index < 3 ? 'wrong' : 'skipped',
+      selected_option: index < 3 ? 'a' : null,
+    })
+  );
+  state.mistake_rows = canonical;
+  state.questions = canonical.map((row: Row) => makeQuestion(String(row.question_id)));
+
+  const history = await historyService.getUserExamHistory('user-1');
+  const mistakes = await historyService.getUserMistakes('user-1');
+  const attemptTwo = history.find((row: Row) => row.id === 'history-2');
+  const attemptOne = history.find((row: Row) => row.id === 'history-1');
+
+  assert.equal(attemptTwo.wrong_available_count, 28);
+  assert.equal(attemptTwo.wrong_available_count, mistakes.length);
+  assert.equal(attemptOne.wrong_available_count, 0);
+});
+
+test('a failing mistake query is an error, never an empty mistake list', async () => {
+  resetState();
+  state.rpcErrors.user_mistake_questions = {
+    code: '42P01',
+    message: 'relation "public.user_mistake_questions" does not exist',
+  };
+
+  await assert.rejects(
+    () => historyService.getUserMistakes('user-1'),
+    (error: Row) => error.code === '42P01'
+  );
+});
+
+test('a failing count query degrades to attempt counters instead of breaking history', async () => {
+  resetState();
+  state.exam_history = [
+    {
+      id: 'history-2',
+      user_id: 'user-1',
+      exam_id: 'exam-1',
+      score: 1,
+      total_marks: 30,
+      correct_count: 1,
+      wrong_count: 3,
+      skipped_count: 26,
       status: 'completed',
       submitted_at: '2026-10-18T12:00:00.000Z',
       created_at: '2026-10-18T12:00:00.000Z',
     },
   ];
-  state.exam_history_details = [
-    {
-      id: 'd1',
-      exam_history_id: 'history-1',
-      question_id: 'q1',
-      selected_option: 'a',
-      is_correct: false,
-      created_at: '2026-10-18T10:00:00.000Z',
-    },
-    {
-      id: 'd2',
-      exam_history_id: 'history-1',
-      question_id: 'q1',
-      selected_option: 'b',
-      is_correct: false,
-      created_at: '2026-10-18T10:10:00.000Z',
-    },
-    {
-      id: 'd3',
-      exam_history_id: 'history-1',
-      question_id: 'q2',
-      selected_option: 'a',
-      is_correct: true,
-      created_at: '2026-10-18T10:00:00.000Z',
-    },
-    {
-      id: 'd4',
-      exam_history_id: 'history-1',
-      question_id: 'q3',
-      selected_option: 'a',
-      is_correct: false,
-      created_at: '2026-10-18T10:00:00.000Z',
-    },
-    {
-      id: 'd5',
-      exam_history_id: 'history-1',
-      question_id: 'q3',
-      selected_option: 'b',
-      is_correct: true,
-      created_at: '2026-10-18T10:05:00.000Z',
-    },
-    {
-      id: 'd6',
-      exam_history_id: 'history-1',
-      question_id: 'q4',
-      selected_option: 'a',
-      is_correct: false,
-      created_at: '2026-10-18T10:00:00.000Z',
-    },
-    {
-      id: 'd7',
-      exam_history_id: 'history-1',
-      question_id: 'q5',
-      selected_option: 'a',
-      is_correct: false,
-      created_at: '2026-10-18T10:00:00.000Z',
-    },
-  ];
-  state.questions = ['q1', 'q2', 'q3', 'q4', 'q5'].map((id) => makeQuestion(id));
-  state.mistake_dismissals = [
-    {
-      user_id: 'user-1',
-      question_id: 'q4',
-      created_at: '2026-10-18T10:20:00.000Z',
-    },
-    {
-      user_id: 'user-1',
-      question_id: 'q5',
-      created_at: '2026-10-18T09:00:00.000Z',
-    },
-  ];
+  state.rpcErrors.get_user_mistake_counts = {
+    code: '42P01',
+    message: 'function does not exist',
+  };
 
-  const rows = await historyService.getUserMistakes('user-1');
-  const ids = rows.map((row: Row) => row.id).sort();
+  const history = await historyService.getUserExamHistory('user-1');
 
-  assert.deepEqual(ids, ['q1', 'q5']);
-  const q1 = rows.find((row: Row) => row.id === 'q1');
-  const q5 = rows.find((row: Row) => row.id === 'q5');
-  assert.equal(q1.selected_option, 'b');
-  assert.equal(q1.detail_id, 'd2');
-  assert.equal(q5.detail_id, 'd7');
-  const correctOption = q1.questions.options.find((option: Row) => option.isCorrect === true);
-  assert.ok(correctOption);
-  assert.match(q1.questions.explanation.en, /Explanation q1/);
+  assert.equal(history[0].wrong_available_count, 29);
 });
 
 test('bookmarks hydrate full question content and keep missing questions explicit', async () => {
@@ -439,54 +569,21 @@ test('bookmarks for a live exam paper never expose the answer key', async () => 
   });
 });
 
-test('without the dismissal table, profile settings keep the feature working', async () => {
+test('without the dismissal table, deleting a mistake still persists the dismissal', async () => {
   resetState();
   state.missingTables = ['mistake_dismissals'];
   state.profiles = [{ id: 'user-1', settings: { theme: 'dark' } }];
-  state.exam_history = [
-    {
-      id: 'history-1',
-      user_id: 'user-1',
-      status: 'completed',
-      submitted_at: '2026-10-18T12:00:00.000Z',
-      created_at: '2026-10-18T12:00:00.000Z',
-    },
-  ];
-  state.exam_history_details = [
-    {
-      id: 'd1',
-      exam_history_id: 'history-1',
-      question_id: 'q1',
-      selected_option: 'a',
-      is_correct: false,
-      created_at: '2026-10-18T10:00:00.000Z',
-    },
-    {
-      id: 'd2',
-      exam_history_id: 'history-1',
-      question_id: 'q2',
-      selected_option: 'a',
-      is_correct: false,
-      created_at: '2026-10-18T10:00:00.000Z',
-    },
-  ];
-  state.questions = [makeQuestion('q1'), makeQuestion('q2')];
+  state.mistake_rows = [makeMistakeRow('q1'), makeMistakeRow('q2')];
 
   await historyService.deleteMistakeRecord('q1', 'user-1');
   const settings = state.profiles[0].settings;
   assert.equal(settings.theme, 'dark');
   assert.equal(typeof settings.mistake_dismissals.q1, 'string');
 
-  state.profiles[0].settings = {
-    ...settings,
-    mistake_dismissals: {
-      ...settings.mistake_dismissals,
-      q2: '2026-10-18T10:20:00.000Z',
-    },
-  };
-
+  // The shared SQL definition is the only filter; dismissing q1 hides it.
+  state.mistake_rows = [makeMistakeRow('q2')];
   const rows = await historyService.getUserMistakes('user-1');
-  assert.deepEqual(rows, []);
+  assert.deepEqual(rows.map((row: Row) => row.id), ['q2']);
 });
 
 test('deleting a mistake persists a question-level dismissal', async () => {
