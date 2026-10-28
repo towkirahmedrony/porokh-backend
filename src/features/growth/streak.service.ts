@@ -1,6 +1,6 @@
 import { supabase } from '../../config/supabase';
 import { supabaseAdmin } from '../../config/supabaseAdmin';
-import { sendRewardNotification } from '../notifications/notifications.service';
+import { notifyXpAndProgression } from '../notifications/notifications.service';
 import { localizeRecord, parseLanguage } from '../../lib/utils/language';
 
 export const getStreakStats = async (userId: string) => {
@@ -80,7 +80,14 @@ export const incrementStreakOnExamSubmit = async (userId: string) => {
       }
 
       await supabaseAdmin.rpc('update_user_progress', { p_user_id: userId, p_coins: 0, p_xp: xpReward });
-      await sendRewardNotification(userId, notifTitle, notifBody, 0, xpReward);
+      await notifyXpAndProgression(userId, {
+        xp: xpReward,
+        reason: 'streak_reward',
+        title: notifTitle,
+        body: notifBody,
+        actionLink: '/dashboard/streak',
+        dedupeKey: `streak_reward:${userId}:${today}`,
+      });
 
       if (activity) {
         await supabaseAdmin.from('user_daily_activities').update({ exams_taken: 1 }).eq('id', activity.id);

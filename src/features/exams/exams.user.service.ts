@@ -3,6 +3,7 @@ import { supabase } from '../../config/supabase';
 import { GenerateExamDTO, SubmitHistoryDTO } from './exams.types';
 import { ATTEMPT_STATUS, isAttemptExpiredForAttempt } from './exam.timing';
 import { ExamAttemptError, ExamAttemptService, loadUserAccess } from './exam.attempt.service';
+import { notify, notifyXpAndProgression } from '../notifications/notifications.service';
 import {
   findOptionById,
   isAnswerCorrect,
@@ -936,11 +937,12 @@ export class ExamUserService {
     let defaultNegativeMarks = 0.25;
     let examTotalMarks: number | null = null;
     let resultPublishTime: string | null = null;
+    let examTitle = 'Exam';
 
     if (examId) {
       const { data: examData, error: examError } = await supabase
         .from('exam_papers')
-        .select('id, default_negative_marks, total_marks, result_publish_time, is_published')
+        .select('id, title, title_en, default_negative_marks, total_marks, result_publish_time, is_published')
         .eq('id', examId)
         .maybeSingle();
 
@@ -960,6 +962,7 @@ export class ExamUserService {
       defaultNegativeMarks = Number(examData.default_negative_marks ?? 0.25);
       examTotalMarks = Number(examData.total_marks ?? 0);
       resultPublishTime = examData.result_publish_time ?? null;
+      examTitle = String(examData.title_en || examData.title || 'Exam');
     }
 
     const { data: questions, error: questionsError } = await supabase
@@ -1245,6 +1248,37 @@ export class ExamUserService {
       // Record only XP that was actually persisted, so the audit column never
       // claims a reward the user did not receive.
       await ExamAttemptService.finalizeAttempt(attempt.id, historyId, xpAwarded ? earnedXP : 0);
+    }
+
+    if (xpAwarded && earnedXP > 0) {
+      void notifyXpAndProgression(user_id, {
+        xp: earnedXP,
+        reason: 'exam_xp',
+        actionLink: '/history',
+        dedupeKey: `exam_xp:${user_id}:${normalizeId(result.id)}`,
+      });
+    }
+
+    const resultVisible =
+      !resultPublishTime || new Date(resultPublishTime).getTime() <= Date.now();
+    const isTrackedExam = Boolean(attempt) && attempt?.kind === 'exam' && Boolean(examId);
+
+    if (isTrackedExam && resultVisible) {
+      void notify({
+        userIds: user_id,
+        type: 'exam',
+        eventCode: 'exam_result',
+        templateCode: 'exam_result',
+        variables: {
+          exam_title: examTitle,
+          score: Math.round(Number(result.score ?? finalScore)),
+          rank: result.rank ? `#${result.rank}` : '-',
+        },
+        channels: ['in_app'],
+        actionLink: `/exam/analysis/${result.id}`,
+        dedupeKey: `exam_result:${examId}:${user_id}`,
+        metaData: { exam_id: examId, history_id: result.id },
+      });
     }
 
     // Explicit response DTO: never spread the database row (which may contain
@@ -1717,6 +1751,22 @@ export class ExamUserService {
 
       throw new Error(battleError.message);
     }
+
+    void notify({
+      userIds: normalizedOpponentId,
+      type: 'social',
+      eventCode: 'exam_challenge_invite',
+      templateCode: 'exam_challenge_invite',
+      variables: {
+        challenger: challenger?.full_name || 'A student',
+        exam_title: request?.title || 'a group battle',
+      },
+      channels: ['in_app', 'push'],
+      priority: 'high',
+      actionLink: groupId ? `/groups/${groupId}/battles/${battle.id}` : '/groups',
+      dedupeKey: `exam_challenge:${battle.id}:${normalizedOpponentId}`,
+      metaData: { battle_id: battle.id, exam_id: examId },
+    });
 
     return {
       ...battle,

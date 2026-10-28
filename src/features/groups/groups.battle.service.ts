@@ -456,7 +456,8 @@ export const finalizeBattle = async (
     await notifyBattleFinished(
       normalizeId(battle.group_id),
       String(group?.name ?? battle.title ?? 'Porokh'),
-      winnerId
+      winnerId,
+      battleId
     );
   }
 

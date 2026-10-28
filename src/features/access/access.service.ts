@@ -2,6 +2,7 @@ import { supabase } from '../../config/supabase';
 import { startOfDhakaDayIso } from '../../lib/utils/time';
 import { SearchInputError, normalizeSearchTerm } from '../../lib/utils/search';
 
+import { notifyPremiumGranted } from '../notifications/notifications.service';
 /**
  * Validation / state error for the access feature. `status` drives the HTTP
  * code and `code` is forwarded to the client when it is on the exposed list
@@ -207,6 +208,10 @@ export const createGrant = async (payload: any, adminId: string) => {
       throw new AccessError('User not found', 400);
     }
     throw new Error(error.message);
+  }
+
+  if (scope === 'user' && userId) {
+    void notifyPremiumGranted(String(userId), grantType as 'premium' | 'unlimited_quota');
   }
 
   return data;

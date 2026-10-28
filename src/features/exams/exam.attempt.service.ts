@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { supabase } from '../../config/supabase';
+import { notifyQuotaExhausted } from '../notifications/notifications.service';
 import {
   ATTEMPT_KIND,
   ATTEMPT_STATUS,
@@ -295,6 +296,7 @@ export class ExamAttemptService {
 
       if (quotaError) throw new Error(quotaError.message);
       if (!quota.allowed) {
+        void notifyQuotaExhausted(userId, 'exam_start');
         throw new ExamAttemptError(
           'Daily free exam limit reached.',
           403,
@@ -346,6 +348,7 @@ export class ExamAttemptService {
 
     if (quotaError) throw new Error(quotaError.message);
     if (!quota.allowed) {
+      void notifyQuotaExhausted(userId, 'exam_start');
       throw new ExamAttemptError(
         'Daily free exam limit reached.',
         403,

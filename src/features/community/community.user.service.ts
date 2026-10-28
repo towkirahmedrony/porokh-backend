@@ -1,5 +1,6 @@
 import { supabase } from '../../config/supabase';
 import { findOptionById, isAnswerCorrect } from '../exams/exam.grading';
+import { notify } from '../notifications/notifications.service';
 
 export const getLobbyDashboard = async (userId: string) => {
   const { data: profile, error: profileErr } = await supabase.from('profiles').select('current_group_id').eq('id', userId).single();
@@ -36,8 +37,22 @@ export const initiateBattle = async (userId: string) => {
 };
 
 export const sendBuzz = async (senderId: string, targetUserId: string) => {
-  const { error } = await supabase.from('notifications').insert({ target_user_id: targetUserId, title_en: 'Buzz! 🔔', body_en: 'Your teammate just buzzed you to join the lobby/study session!', type: 'buzz', channel: 'in_app' });
-  if (error) throw new Error('Failed to send buzz notification');
+  if (!targetUserId || targetUserId === senderId) return true;
+
+  await notify({
+    userIds: targetUserId,
+    type: 'social',
+    eventCode: 'community_buzz',
+    title: { bn: 'বাজ! 🔔', en: 'Buzz! 🔔' },
+    body: {
+      bn: 'আপনার গ্রুপের কেউ লবি বা স্টাডি সেশনে যোগ দেওয়ার জন্য ডাক দিয়েছে!',
+      en: 'Your teammate just buzzed you to join the lobby/study session!',
+    },
+    channels: ['in_app'],
+    actionLink: '/groups',
+    dedupeKey: `buzz:${senderId}:${targetUserId}:${new Date().toISOString().slice(0, 13)}`,
+  });
+
   return true;
 };
 

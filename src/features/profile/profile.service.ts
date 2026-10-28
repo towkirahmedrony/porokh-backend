@@ -2,7 +2,7 @@ import { supabase } from '../../config/supabase';
 import { supabaseAdmin } from '../../config/supabaseAdmin';
 import { localizeRecord, parseLanguage } from '../../lib/utils/language';
 import { UserProfile } from './profile.types';
-import { sendRewardNotification } from '../notifications/notifications.service';
+import { notifyXpAndProgression } from '../notifications/notifications.service';
 import {
   buildProfileUpdatePayload,
   parseThemePreference,
@@ -58,13 +58,17 @@ export class ProfileService {
         const { error: xpErr } = await supabaseAdmin.rpc('update_user_progress', { p_user_id: userId, p_coins: 0, p_xp: xpReward });
         if (!xpErr) {
           // নোটিফিকেশন পাঠানোর ক্ষেত্রে error catch করা হলো যেন মেইন ফ্লো না ভাঙ্গে
-          sendRewardNotification(
-            userId,
-            { bn: 'প্রোফাইল সম্পন্ন হয়েছে! 🎉', en: 'Profile completed! 🎉' },
-            { bn: `আপনার প্রোফাইলে প্রয়োজনীয় তথ্য যুক্ত করার জন্য আপনি পেয়েছেন ${xpReward} XP!`, en: `You earned ${xpReward} XP for completing your profile.` },
-            0,
-            xpReward
-          ).catch(console.error);
+          void notifyXpAndProgression(userId, {
+            xp: xpReward,
+            reason: 'profile_completion',
+            title: { bn: 'প্রোফাইল সম্পন্ন হয়েছে! 🎉', en: 'Profile completed! 🎉' },
+            body: {
+              bn: `আপনার প্রোফাইলে প্রয়োজনীয় তথ্য যুক্ত করার জন্য আপনি পেয়েছেন ${xpReward} XP!`,
+              en: `You earned ${xpReward} XP for completing your profile.`,
+            },
+            actionLink: '/profile',
+            dedupeKey: `profile_completion:${userId}`,
+          });
         }
       }
     }

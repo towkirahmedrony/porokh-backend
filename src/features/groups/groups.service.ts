@@ -999,7 +999,8 @@ export const notifyBattleCreated = async (group: AnyObject, creatorId: string) =
 export const notifyBattleFinished = async (
   groupId: string,
   groupName: string,
-  winnerId: string | null
+  winnerId: string | null,
+  battleId?: string | null
 ) => {
   const memberIds = await getActiveGroupMemberIds(groupId);
   let winnerName = '';
@@ -1021,6 +1022,30 @@ export const notifyBattleFinished = async (
       ? `${winnerName} won the battle in "${groupName}".`
       : `The battle in "${groupName}" has finished.`,
     actionLink: `/groups/${groupId}?tab=battles`,
+    dedupeKey: battleId
+      ? (userId: string) => `group_battle_finished:${battleId}:${userId}`
+      : null,
+    metaData: battleId ? { battle_id: battleId } : undefined,
   });
+};
+
+/** Notifies members about a battle finalized outside a request (cron). */
+export const notifyBattleFinishedById = async (battleId: string): Promise<void> => {
+  const { data: battle } = await supabaseAdmin
+    .from('group_battles')
+    .select('id, group_id, winner_id')
+    .eq('id', battleId)
+    .maybeSingle();
+
+  if (!battle?.group_id) return;
+
+  const group = await getGroupRow(supabaseAdmin, battle.group_id).catch(() => null);
+
+  await notifyBattleFinished(
+    normalizeId(battle.group_id),
+    String(group?.name ?? 'Porokh'),
+    normalizeId(battle.winner_id) || null,
+    battleId
+  );
 };
 

@@ -1,4 +1,5 @@
-import { supabaseAdmin } from '../../config/supabaseAdmin';
+import { notify } from '../notifications/notifications.service';
+import { NotifyInput } from '../notifications/notifications.types';
 
 type GroupNotification = {
   type: string;
@@ -7,13 +8,14 @@ type GroupNotification = {
   bodyBn: string;
   bodyEn: string;
   actionLink?: string;
+  dedupeKey?: NotifyInput['dedupeKey'];
+  metaData?: Record<string, unknown>;
 };
 
-const MAX_RECIPIENTS_PER_INSERT = 200;
-
 /**
- * Best-effort in-app notification. Groups must work even when the notification
- * table is unavailable, so failures are logged and swallowed.
+ * Best-effort notification for group events. Groups must keep working when
+ * notifications fail, so every failure is logged inside `notify` and never
+ * propagated to the caller.
  */
 export const notifyGroupUsers = async (
   userIds: Array<string | null | undefined>,
@@ -23,50 +25,17 @@ export const notifyGroupUsers = async (
 
   if (recipients.length === 0) return;
 
-  const rows = recipients.slice(0, MAX_RECIPIENTS_PER_INSERT).map((userId) => ({
-    target_user_id: userId,
-    title_bn: notification.titleBn,
-    title_en: notification.titleEn,
-    body_bn: notification.bodyBn,
-    body_en: notification.bodyEn,
-    type: notification.type,
-    channel: 'in_app',
-    action_link: notification.actionLink ?? '/groups',
-  }));
-
-  try {
-    const { error } = await supabaseAdmin.from('notifications').insert(rows);
-    if (error) {
-      console.error('[groups:notification] insert failed:', error.message);
-    }
-  } catch (error) {
-    console.error(
-      '[groups:notification] insert threw:',
-      error instanceof Error ? error.message : 'unknown error'
-    );
-  }
-
-  // Push is best-effort and capped so a group-wide event cannot fan out into
-  // hundreds of blocking FCM calls. A missing Firebase credential must never
-  // fail the group action, so the module is loaded lazily inside try/catch.
-  const pushRecipients = recipients.slice(0, 50);
-  try {
-    const { sendPushNotification } = await import('../notifications/notifications.service');
-    void Promise.allSettled(
-      pushRecipients.map((userId) =>
-        sendPushNotification(
-          userId,
-          { bn: notification.titleBn, en: notification.titleEn },
-          { bn: notification.bodyBn, en: notification.bodyEn },
-          undefined,
-          notification.actionLink ?? '/groups'
-        )
-      )
-    );
-  } catch (error) {
-    console.error(
-      '[groups:notification] push skipped:',
-      error instanceof Error ? error.message : 'unknown error'
-    );
-  }
+  await notify({
+    userIds: recipients,
+    type: 'social',
+    eventCode: notification.type,
+    title: { bn: notification.titleBn, en: notification.titleEn },
+    body: { bn: notification.bodyBn, en: notification.bodyEn },
+    actionLink: notification.actionLink ?? '/groups',
+    channels: ['in_app', 'push'],
+    // Group events can fan out to a whole squad; keep FCM work bounded.
+    pushLimit: 50,
+    dedupeKey: notification.dedupeKey ?? null,
+    metaData: notification.metaData,
+  });
 };

@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { supabase } from '../../config/supabase';
+import { notifyQuotaExhausted } from '../notifications/notifications.service';
 import {
   ATTEMPT_KIND,
   ATTEMPT_STATUS,
@@ -189,6 +190,7 @@ const consumePracticeQuota = async (
   if (error) throw new Error(error.message);
 
   if (!data?.allowed) {
+    void notifyQuotaExhausted(userId, feature);
     throw new ExamAttemptError(
       'Daily practice limit reached.',
       403,

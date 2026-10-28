@@ -1,4 +1,5 @@
 import { supabase } from '../../config/supabase';
+import { notify } from '../notifications/notifications.service';
 
 // টাইপ ইন্টারফেস ডিফাইন করা হলো
 export interface AutoBanDictData {
@@ -75,12 +76,18 @@ export const executeModeration = async (messageId: string, action: string, admin
   if (fetchErr || !message) throw new Error('Message not found');
 
   if (action === 'warn') {
-    await supabase.from('notifications').insert({
-      target_user_id: message.sender_id,
-      title_en: 'Community Warning',
-      body_en: 'Your recent message in the study group violated community guidelines. Please adhere to the rules.',
-      type: 'system',
-      channel: 'in_app'
+    await notify({
+      userIds: message.sender_id,
+      type: 'security',
+      eventCode: 'community_warning',
+      title: { bn: 'কমিউনিটি সতর্কতা', en: 'Community Warning' },
+      body: {
+        bn: 'স্টাডি গ্রুপে আপনার সাম্প্রতিক বার্তা কমিউনিটি নির্দেশনা লঙ্ঘন করেছে। অনুগ্রহ করে নিয়ম মেনে চলুন।',
+        en: 'Your recent message in the study group violated community guidelines. Please adhere to the rules.',
+      },
+      channels: ['in_app'],
+      actionLink: '/groups',
+      metaData: { message_id: messageId },
     });
     await supabase.from('user_reports').update({ status: 'resolved', admin_reply: 'User warned' }).eq('target_message_id', messageId);
   } 

@@ -1,5 +1,11 @@
 import { supabase } from '../../config/supabase';
 import { Language, parseLanguage } from '../../lib/utils/language';
+import { MANDATORY_NOTIFICATION_TYPES, NotificationType } from './notifications.types';
+import {
+  markNotificationAsRead as markRead,
+  getUnreadNotificationCount,
+  normalizePreferences,
+} from './notifications.service';
 
 const notificationText = (language: Language, bn?: string | null, en?: string | null): string => {
   const preferred = language === 'en' ? en : bn;
@@ -7,31 +13,73 @@ const notificationText = (language: Language, bn?: string | null, en?: string | 
   return preferred?.trim() || fallback?.trim() || '';
 };
 
+const isExpired = (expiresAt: string | null | undefined): boolean =>
+  Boolean(expiresAt && new Date(expiresAt).getTime() < Date.now());
+
+const matchesTargetRules = (rules: unknown, classLevel: string, subStatus: string): boolean => {
+  if (!rules || typeof rules !== 'object') return true;
+  const target = rules as Record<string, any>;
+
+  if (
+    target.subscription_status &&
+    target.subscription_status !== 'all' &&
+    target.subscription_status !== subStatus
+  ) {
+    return false;
+  }
+
+  if (Array.isArray(target.class_level) && target.class_level.length > 0) {
+    if (!target.class_level.includes('all') && !target.class_level.includes(classLevel)) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
 export const getUserNotifications = async (userId: string) => {
-  // 1. ইউজারের প্রোফাইল ইনফরমেশন নিয়ে আসা
   const { data: profile } = await supabase
     .from('profiles')
-    .select('class_level, subscription_status, language_preference')
+    .select('class_level, subscription_status, language_preference, settings')
     .eq('id', userId)
     .single();
 
   const classLevel = profile?.class_level || 'all';
   const subStatus = profile?.subscription_status === 'active' ? 'premium' : 'free';
   const language = parseLanguage(profile?.language_preference);
+  const preferences = normalizePreferences(
+    (profile?.settings as Record<string, any> | null)?.notification_preferences
+  );
 
-  // 2. সেন্ট (sent) হওয়া সাধারণ নোটিফিকেশনগুলো ফেচ করা
   const { data: notifications, error: notifError } = await supabase
     .from('notifications')
-    .select(`
-      *,
-      notification_reads (is_read, is_clicked)
-    `)
+    .select('*')
     .eq('status', 'sent')
+    .or(`target_user_id.eq.${userId},target_user_id.is.null`)
     .order('created_at', { ascending: false });
 
   if (notifError) throw new Error(notifError.message);
 
-  // 3. নতুন notices টেবিল থেকে গ্লোবাল নোটিশ ফেচ করা
+  // Read state is fetched separately for this user: the service-role client
+  // bypasses RLS, so an embedded select would leak every user's read state.
+  const notificationIds = (notifications ?? []).map((row) => String(row.id));
+  const readByNotification = new Map<string, { is_read: boolean; is_clicked: boolean }>();
+
+  if (notificationIds.length > 0) {
+    const { data: reads } = await supabase
+      .from('notification_reads')
+      .select('notification_id, is_read, is_clicked')
+      .eq('user_id', userId)
+      .in('notification_id', notificationIds);
+
+    (reads ?? []).forEach((read) => {
+      readByNotification.set(String(read.notification_id), {
+        is_read: Boolean(read.is_read),
+        is_clicked: Boolean(read.is_clicked),
+      });
+    });
+  }
+
   const { data: notices, error: noticeError } = await supabase
     .from('notices')
     .select('*')
@@ -41,45 +89,43 @@ export const getUserNotifications = async (userId: string) => {
 
   if (noticeError) throw new Error(noticeError.message);
 
-  // 4. টার্গেট রুলস অনুযায়ী সাধারণ নোটিফিকেশন ফিল্টার করা
-  const filteredNotifications = notifications.filter(notif => {
-    if (notif.target_user_id && notif.target_user_id !== userId) return false;
-    
-    if (notif.target_rules) {
-      const rules = notif.target_rules as any;
-      if (rules.subscription_status && rules.subscription_status !== 'all' && rules.subscription_status !== subStatus) return false;
-      if (rules.class_level && Array.isArray(rules.class_level) && rules.class_level.length > 0) {
-        if (!rules.class_level.includes('all') && !rules.class_level.includes(classLevel)) return false;
-      }
-    }
+  const filteredNotifications = (notifications ?? []).filter((notification) => {
+    if (isExpired(notification.expires_at)) return false;
+    if (notification.target_user_id && notification.target_user_id !== userId) return false;
+    if (!matchesTargetRules(notification.target_rules, classLevel, subStatus)) return false;
+
+    const type = notification.type as NotificationType;
+    const mandatory = MANDATORY_NOTIFICATION_TYPES.includes(type);
+    if (!mandatory && preferences.types[type] === false) return false;
+    if (!mandatory && !preferences.in_app) return false;
+    if (!mandatory && notification.channel === 'push') return false;
+
     return true;
   });
 
-  // 5. টার্গেট রুলস অনুযায়ী নোটিশ ফিল্টার এবং ম্যাপ (Map) করা
-  const mappedNotices = notices.filter(notice => {
-    // Expiry চেক
-    if (notice.expires_at && new Date(notice.expires_at) < new Date()) return false;
+  const mappedNotices = (notices ?? [])
+    .filter((notice) => {
+      if (isExpired(notice.expires_at)) return false;
+      return matchesTargetRules(notice.target_rules, classLevel, subStatus);
+    })
+    .map((notice) => ({
+      ...notice,
+      type: 'global_notice',
+      created_at: notice.published_at || notice.created_at,
+      notification_reads: [{ is_read: true, is_clicked: true }],
+    }));
 
-    if (notice.target_rules) {
-      const rules = notice.target_rules as any;
-      if (rules.subscription_status && rules.subscription_status !== 'all' && rules.subscription_status !== subStatus) return false;
-      if (rules.class_level && Array.isArray(rules.class_level) && rules.class_level.length > 0) {
-        if (!rules.class_level.includes('all') && !rules.class_level.includes(classLevel)) return false;
-      }
-    }
-    return true;
-  }).map(notice => ({
-    ...notice,
-    type: 'global_notice', // ফ্রন্টএন্ডের ট্যাবের জন্য ফোর্স টাইপ
-    created_at: notice.published_at || notice.created_at, // সর্টিংয়ের জন্য
-    // নোটিশের জন্য ডামি রিড স্ট্যাটাস, যাতে ফ্রন্টএন্ডে এটি unread হিসেবে শো না করে
-    notification_reads: [{ is_read: true, is_clicked: true }] 
-  }));
-
-  // 6. দুটি অ্যারে একত্রে মার্জ করে সময় অনুযায়ী সর্ট করা
-  const combined = [...filteredNotifications, ...mappedNotices].sort((a, b) => {
-    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+  const withReadState = filteredNotifications.map((notification) => {
+    const read = readByNotification.get(String(notification.id));
+    return {
+      ...notification,
+      notification_reads: read ? [read] : [],
+    };
   });
+
+  const combined = [...withReadState, ...mappedNotices].sort(
+    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  );
 
   return combined.map((notification) => ({
     ...notification,
@@ -88,19 +134,13 @@ export const getUserNotifications = async (userId: string) => {
   }));
 };
 
-export const markNotificationAsRead = async (userId: string, notificationId: string, isClicked: boolean) => {
-  const { data, error } = await supabase
-    .from('notification_reads')
-    .upsert({
-      notification_id: notificationId,
-      user_id: userId,
-      is_read: true,
-      is_clicked: isClicked,
-      read_at: new Date().toISOString(),
-      ...(isClicked && { clicked_at: new Date().toISOString() })
-    }, { onConflict: 'notification_id, user_id' })
-    .select();
+export const getUnreadCount = async (userId: string): Promise<number> =>
+  getUnreadNotificationCount(userId);
 
-  if (error) throw new Error(error.message);
-  return data;
+export const markNotificationAsRead = async (
+  userId: string,
+  notificationId: string,
+  isClicked = false
+) => {
+  await markRead(userId, notificationId, isClicked);
 };

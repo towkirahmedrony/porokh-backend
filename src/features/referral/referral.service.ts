@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../../config/supabaseAdmin';
+import { notifyReferralBonus } from '../notifications/notifications.service';
 
 export class ReferralService {
   static async getStats(userId: string) {
@@ -81,7 +82,38 @@ export class ReferralService {
       throw new Error(error.message || "Failed to apply referral code.");
     }
 
+    await ReferralService.notifyReferrer(userId);
+
     return { success: true, message: "Referral applied successfully!" };
+  }
+
+  private static async notifyReferrer(referredUserId: string) {
+    try {
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('referred_by')
+        .eq('id', referredUserId)
+        .maybeSingle();
+
+      const referrerId = profile?.referred_by as string | null;
+      if (!referrerId) return;
+
+      const { data: configData } = await supabaseAdmin
+        .from('app_configs')
+        .select('value')
+        .eq('key', 'xp_rules')
+        .maybeSingle();
+
+      const rules = (configData?.value as Record<string, any> | null) ?? {};
+      const amount = Number(rules.referral_bonus_referrer ?? 200) || 200;
+
+      await notifyReferralBonus(referrerId, amount, referredUserId);
+    } catch (error) {
+      console.error(
+        '[referral] referrer notification failed:',
+        error instanceof Error ? error.message : 'unknown error'
+      );
+    }
   }
 
   // নতুন ফাংশন: অটোমেটিক রেফারেল প্রসেস করার জন্য
@@ -113,6 +145,8 @@ export class ReferralService {
       await supabaseAdmin.auth.admin.updateUserById(userId, {
         user_metadata: { referred_by_code: null }
       });
+
+      await ReferralService.notifyReferrer(userId);
 
       return { success: true };
     } catch (error) {
