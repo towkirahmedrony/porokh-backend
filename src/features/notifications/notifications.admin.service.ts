@@ -124,24 +124,3 @@ export const deleteCampaign = async (id: string) => {
   const { data, error } = await supabase.from('notifications').delete().eq('id', id).select().single();
   if (error) throw new Error(error.message); return data;
 };
-
-// --- GLOBAL NOTICES ---
-export const createNotice = async (noticeData: any, adminId: string) => {
-  const { data, error } = await supabase.from('notices').insert({ ...noticeData, created_by: adminId }).select().single();
-  if (error) throw new Error(error.message); return data;
-};
-
-export const getNotices = async () => {
-  const { data, error } = await supabase.from('notices').select('*').order('created_at', { ascending: false });
-  if (error) throw new Error(error.message); return data;
-};
-
-export const updateNotice = async (id: string, payload: any) => {
-  const { data, error } = await supabase.from('notices').update(payload).eq('id', id).select().single();
-  if (error) throw new Error(error.message); return data;
-};
-
-export const deleteNotice = async (id: string) => {
-  const { data, error } = await supabase.from('notices').delete().eq('id', id).select().single();
-  if (error) throw new Error(error.message); return data;
-};

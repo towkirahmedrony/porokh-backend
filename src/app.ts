@@ -30,6 +30,8 @@ import systemRoutes from './features/system/system.routes';
 import { financeRoutes } from './features/finance/finance.routes';
 import notificationRoutes from './features/notifications/notifications.routes';
 import notificationsAdminRoutes from './features/notifications/notifications.admin.routes'; 
+import noticeAdminRoutes from './features/notices/notices.admin.routes';
+import noticeUserRoutes from './features/notices/notices.user.routes';
 import historyRoutes from './features/history/history.routes'; 
 
 // মনিটাইজেশন, প্রগ্রেস, এআই, গ্রোথ, কন্টাক্ট, রিপোর্ট এবং রেফারেল রাউট ইম্পোর্ট
@@ -118,6 +120,8 @@ app.use('/api/v1/exams/bookmark', examBookmarkRoutes);
 app.use('/api/v1/system', systemRoutes); 
 app.use('/api/v1/finance', financeRoutes); 
 app.use('/api/v1/notifications/admin', notificationsAdminRoutes); 
+app.use('/api/v1/notices/admin', noticeAdminRoutes);
+app.use('/api/v1/notices', noticeUserRoutes);
 app.use('/api/v1/notifications', notificationRoutes); 
 app.use('/api/v1/monetization', monetizationRoutes); 
 app.use('/api/v1/marketplace', marketplaceRoutes);

@@ -28,24 +28,3 @@ export const deleteCampaign = catchAsync(async (req: Request, res: Response) => 
   const campaign = await NotificationAdminService.deleteCampaign(id);
   sendResponse(res, { statusCode: 200, success: true, message: 'Campaign deleted successfully', data: campaign });
 });
-
-// --- Notices ---
-export const createNotice = catchAsync(async (req: Request, res: Response) => {
-  const adminId = req.user!.id;
-  const notice = await NotificationAdminService.createNotice(req.body, adminId);
-  sendResponse(res, { statusCode: 201, success: true, message: 'Notice created successfully', data: notice });
-});
-export const getNotices = catchAsync(async (req: Request, res: Response) => {
-  const notices = await NotificationAdminService.getNotices();
-  sendResponse(res, { statusCode: 200, success: true, message: 'Notices fetched successfully', data: notices });
-});
-export const updateNotice = catchAsync(async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const notice = await NotificationAdminService.updateNotice(id, req.body);
-  sendResponse(res, { statusCode: 200, success: true, message: 'Notice updated successfully', data: notice });
-});
-export const deleteNotice = catchAsync(async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const notice = await NotificationAdminService.deleteNotice(id);
-  sendResponse(res, { statusCode: 200, success: true, message: 'Notice deleted successfully', data: notice });
-});

@@ -80,15 +80,6 @@ export const getUserNotifications = async (userId: string) => {
     });
   }
 
-  const { data: notices, error: noticeError } = await supabase
-    .from('notices')
-    .select('*')
-    .eq('is_active', true)
-    .lte('published_at', new Date().toISOString())
-    .order('published_at', { ascending: false });
-
-  if (noticeError) throw new Error(noticeError.message);
-
   const filteredNotifications = (notifications ?? []).filter((notification) => {
     if (isExpired(notification.expires_at)) return false;
     if (notification.target_user_id && notification.target_user_id !== userId) return false;
@@ -103,18 +94,6 @@ export const getUserNotifications = async (userId: string) => {
     return true;
   });
 
-  const mappedNotices = (notices ?? [])
-    .filter((notice) => {
-      if (isExpired(notice.expires_at)) return false;
-      return matchesTargetRules(notice.target_rules, classLevel, subStatus);
-    })
-    .map((notice) => ({
-      ...notice,
-      type: 'global_notice',
-      created_at: notice.published_at || notice.created_at,
-      notification_reads: [{ is_read: true, is_clicked: true }],
-    }));
-
   const withReadState = filteredNotifications.map((notification) => {
     const read = readByNotification.get(String(notification.id));
     return {
@@ -123,7 +102,7 @@ export const getUserNotifications = async (userId: string) => {
     };
   });
 
-  const combined = [...withReadState, ...mappedNotices].sort(
+  const combined = [...withReadState].sort(
     (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
   );
 

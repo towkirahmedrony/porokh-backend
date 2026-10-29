@@ -15,10 +15,4 @@ router.put('/campaigns/:id', NotificationAdminController.updateCampaign); // NEW
 router.patch('/campaigns/:id/cancel', NotificationAdminController.cancelCampaign);
 router.delete('/campaigns/:id', NotificationAdminController.deleteCampaign); // NEW: Delete
 
-// Notices
-router.post('/notices', NotificationAdminController.createNotice);
-router.get('/notices', NotificationAdminController.getNotices);
-router.put('/notices/:id', NotificationAdminController.updateNotice); // NEW: Edit
-router.delete('/notices/:id', NotificationAdminController.deleteNotice); // DELETE
-
 export default router;
