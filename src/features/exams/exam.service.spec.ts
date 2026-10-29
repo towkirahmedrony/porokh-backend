@@ -451,6 +451,48 @@ test('wrong answers are graded against the option identity, not numeric coercion
   assert.equal(result.details_json.details[0].is_correct, false);
 });
 
+test('per-question marks and negative marks override paper defaults', async () => {
+  state.examPaperQuestions = [
+    {
+      id: 'eq-1',
+      exam_id: 'exam-1',
+      question_id: uuid('1'),
+      sequence: 1,
+      marks: 2,
+      negative_marks: 0.5,
+    },
+    {
+      id: 'eq-2',
+      exam_id: 'exam-1',
+      question_id: uuid('2'),
+      sequence: 2,
+      marks: 3,
+      negative_marks: 1,
+    },
+  ];
+
+  const attempt = seedAttempt();
+
+  const result = await ExamUserService.submitExamResult({
+    exam_id: 'exam-1',
+    attempt_id: attempt.id,
+    user_id: 'user-1',
+    answers: {
+      [uuid('1')]: uuid('b'),
+      [uuid('2')]: uuid('a'),
+    },
+    question_ids: [uuid('1'), uuid('2')],
+    time_taken: 30,
+  });
+
+  assert.equal(result.correct_count, 1);
+  assert.equal(result.wrong_count, 1);
+  assert.equal(result.score, 1);
+  assert.equal(result.total_marks, 5);
+  assert.equal(result.details_json.details[0].marks_awarded, 2);
+  assert.equal(result.details_json.details[1].marks_awarded, -1);
+});
+
 test('result review is owner-scoped and resolves question text for stored attempts', async () => {
   const attempt = seedAttempt({ question_ids: [uuid('1')] });
 

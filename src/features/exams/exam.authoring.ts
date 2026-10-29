@@ -27,6 +27,9 @@ export class ExamAuthoringError extends Error {
 /** Categories an administrator may author through this endpoint. */
 export const EXAM_AUTHORING_CATEGORIES = ['model_test', 'board_exam', 'admission'] as const;
 
+/** Tracks a model-test paper may target. */
+export const MODEL_TEST_TRACKS = ['hsc', 'medical', 'engineering', 'varsity'] as const;
+
 export const MAX_EXAM_QUESTIONS = 200;
 export const MIN_EXAM_DURATION_MIN = 1;
 export const MAX_EXAM_DURATION_MIN = 600;
@@ -37,6 +40,7 @@ const CREATE_FIELDS = [
   'title_en',
   'subject_id',
   'category',
+  'track',
   'exam_type',
   'duration_min',
   'start_time',
@@ -71,6 +75,7 @@ export type ExamAuthoringFields = {
   title_en: string | null;
   subject_id: string;
   category: string;
+  track: string | null;
   exam_type: string | null;
   duration_min: number;
   start_time: string;
@@ -301,6 +306,50 @@ const readCategory = (source: AnyObject): string | null => {
 };
 
 /**
+ * Reads `track`, preserving the difference between "not supplied" (undefined)
+ * and an explicit clear (`null`). Only model-test papers may carry a track.
+ */
+const readTrack = (source: AnyObject): string | null | undefined => {
+  if (!('track' in source)) return undefined;
+
+  const raw = source.track;
+
+  if (raw === undefined || raw === null) return null;
+
+  if (typeof raw !== 'string') {
+    throw new ExamAuthoringError('track must be a string or null');
+  }
+
+  const value = raw.trim();
+
+  if (!value) return null;
+
+  if (!(MODEL_TEST_TRACKS as readonly string[]).includes(value)) {
+    throw new ExamAuthoringError(`track must be one of: ${MODEL_TEST_TRACKS.join(', ')}`);
+  }
+
+  return value;
+};
+
+/**
+ * Enforces the category/track pairing on the effective paper state. Model tests
+ * must target a track; board and admission papers must not.
+ */
+export const assertValidExamTrack = (
+  category: string | null | undefined,
+  track: string | null | undefined
+): void => {
+  if (category === 'model_test') {
+    if (!track) throw new ExamAuthoringError('track is required for model_test');
+    return;
+  }
+
+  if (track) {
+    throw new ExamAuthoringError('track must be empty unless category is model_test');
+  }
+};
+
+/**
  * Parses a create payload into fully-normalised fields.
  *
  * All required fields must be present; window consistency is enforced here so
@@ -333,11 +382,17 @@ export const parseExamCreatePayload = (input: unknown): ExamAuthoringFields => {
     throw new ExamAuthoringError('Select at least one question');
   }
 
+  const category = readCategory(input) ?? 'model_test';
+  const track = readTrack(input) ?? null;
+
+  assertValidExamTrack(category, track);
+
   return {
     title: readString(input, 'title', { max: 200, required: true }) as string,
     title_en: readString(input, 'title_en', { max: 200, required: false }),
     subject_id: readString(input, 'subject_id', { max: 64, required: true }) as string,
-    category: readCategory(input) ?? 'model_test',
+    category,
+    track,
     exam_type: readString(input, 'exam_type', { max: 64, required: false }),
     duration_min: readInteger(input, 'duration_min', {
       min: MIN_EXAM_DURATION_MIN,
@@ -390,6 +445,10 @@ export const parseExamUpdatePayload = (input: unknown): ExamAuthoringPatch => {
   if ('category' in input) {
     const category = readCategory(input);
     if (category) patch.category = category;
+  }
+
+  if ('track' in input) {
+    patch.track = readTrack(input) ?? null;
   }
 
   if ('exam_type' in input) {

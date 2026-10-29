@@ -275,6 +275,7 @@ const validPayload = (overrides: Row = {}) => ({
   title: 'Model Test 1',
   subject_id: 'subject-1',
   category: 'model_test',
+  track: 'hsc',
   duration_min: 30,
   start_time: '2026-11-01T04:00:00.000Z',
   end_time: '2026-11-01T06:00:00.000Z',
@@ -414,6 +415,36 @@ test('missing required fields and unsupported server-managed fields are rejected
   );
 });
 
+test('model tests require a supported track and other categories reject one', () => {
+  const withoutTrack = validPayload();
+  delete (withoutTrack as Row).track;
+
+  assert.throws(
+    () => parseExamCreatePayload(withoutTrack),
+    (error: any) => error.status === 400 && /track is required/.test(error.message)
+  );
+
+  assert.throws(
+    () => parseExamCreatePayload(validPayload({ track: 'olympiad' })),
+    (error: any) => error.status === 400 && /track must be one of/.test(error.message)
+  );
+
+  assert.throws(
+    () => parseExamCreatePayload(validPayload({ category: 'board_exam' })),
+    (error: any) => error.status === 400 && /track must be empty/.test(error.message)
+  );
+
+  const board = parseExamCreatePayload(
+    validPayload({ category: 'board_exam', track: null })
+  );
+  assert.equal(board.track, null);
+
+  const admission = parseExamCreatePayload(
+    validPayload({ category: 'admission', track: null })
+  );
+  assert.equal(admission.track, null);
+});
+
 test('duplicate question ids are rejected', () => {
   assert.throws(
     () => parseExamCreatePayload(validPayload({ question_ids: ['q-1', 'q-1'] })),
@@ -484,6 +515,7 @@ test('a valid request creates the paper, links questions and publishes last', as
   assert.equal(paper.total_marks, 2);
   assert.equal(paper.is_published, true);
   assert.equal(paper.title, 'Model Test 1');
+  assert.equal(paper.track, 'hsc');
   assert.ok(paper.id, 'the server assigns the paper id');
 
   const insertedPaper = state.inserts.find((entry) => entry.table === 'exam_papers')?.rows[0];
@@ -547,7 +579,7 @@ test('updating metadata does not touch the question set or duplicate the paper',
 
 test('publishing an exam without questions is refused', async () => {
   state.examPapers = [
-    { id: 'exam-empty', title: 'Empty', duration_min: 30, is_published: false, total_marks: 0 },
+    { id: 'exam-empty', title: 'Empty', category: 'board_exam', track: null, duration_min: 30, is_published: false, total_marks: 0 },
   ];
 
   await assert.rejects(
@@ -560,7 +592,7 @@ test('publishing an exam without questions is refused', async () => {
 
 test('publishing an exam without a valid duration is refused', async () => {
   state.examPapers = [
-    { id: 'exam-no-duration', title: 'No duration', duration_min: 0, is_published: false, total_marks: 1 },
+    { id: 'exam-no-duration', title: 'No duration', category: 'board_exam', track: null, duration_min: 0, is_published: false, total_marks: 1 },
   ];
   state.examPaperQuestions = [{ exam_id: 'exam-no-duration', question_id: 'q-1', sequence: 1 }];
 
@@ -620,6 +652,7 @@ test('authoring options expose only active subjects and the accepted categories'
     ['subject-1', 'subject-2']
   );
   assert.deepEqual(options.categories, ['model_test', 'board_exam', 'admission']);
+  assert.deepEqual(options.tracks, ['hsc', 'medical', 'engineering', 'varsity']);
 });
 
 test('eligible questions are limited to the subject and to published, active rows', async () => {

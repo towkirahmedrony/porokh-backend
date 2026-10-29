@@ -6,7 +6,9 @@ import { AutoFetchDTO, PunishUserDTO } from './exams.types';
 import { ATTEMPT_STATUS, MINUTE_MS } from './exam.timing';
 import {
   EXAM_AUTHORING_CATEGORIES,
+  MODEL_TEST_TRACKS,
   ExamAuthoringError,
+  assertValidExamTrack,
   assertValidExamWindow,
   parseExamCreatePayload,
   parseExamUpdatePayload,
@@ -60,6 +62,7 @@ const PAPER_AUTHORED_COLUMNS = [
   'title_en',
   'subject_id',
   'category',
+  'track',
   'exam_type',
   'duration_min',
   'start_time',
@@ -242,6 +245,7 @@ export class ExamAdminService {
         is_premium: row.is_premium ?? false,
       })),
       categories: [...EXAM_AUTHORING_CATEGORIES],
+      tracks: [...MODEL_TEST_TRACKS],
     };
   }
 
@@ -318,6 +322,7 @@ export class ExamAdminService {
       title_en: parsed.title_en,
       subject_id: parsed.subject_id,
       category: parsed.category,
+      track: parsed.track,
       exam_type: parsed.exam_type,
       duration_min: parsed.duration_min,
       start_time: parsed.start_time,
@@ -425,6 +430,10 @@ export class ExamAdminService {
 
     if (readError) throw new Error(readError.message);
     if (!existing) throw new ExamAdminError('Exam not found', 404);
+
+    const nextCategory = patch.category ?? existing.category ?? 'model_test';
+    const nextTrack = 'track' in patch ? patch.track ?? null : existing.track ?? null;
+    assertValidExamTrack(nextCategory, nextTrack);
 
     if (patch.subject_id && patch.subject_id !== existing.subject_id) {
       await assertSubjectExists(patch.subject_id);

@@ -287,6 +287,10 @@ export const sanitizeQuestionForClient = (
     : null,
 
   category: q.category ?? undefined,
+
+  marks: q.marks ?? undefined,
+  negative_marks: q.negative_marks ?? undefined,
+  sequence: q.sequence ?? undefined,
 });
 
 export const sanitizeQuestionsForClient = (questions: AnyObject[] = []) => {
@@ -337,6 +341,23 @@ const buildQuestionIds = (
   const fromAnswers = Object.keys(answers || {}).map(normalizeId);
 
   return Array.from(new Set([...fromPayload, ...fromAnswers])).filter(Boolean);
+};
+
+type QuestionMarkConfig = {
+  marks: number | null;
+  negative_marks: number | null;
+};
+
+const resolveQuestionMarks = (value: unknown): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+};
+
+const resolveQuestionNegativeMarks = (value: unknown, fallback: number): number => {
+  if (value === null || value === undefined || value === '') return fallback;
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
 const buildQuestionSnapshot = (question: AnyObject, includeCorrectAnswers: boolean) => ({
@@ -965,6 +986,29 @@ export class ExamUserService {
       examTitle = String(examData.title_en || examData.title || 'Exam');
     }
 
+    const questionConfig = new Map<string, QuestionMarkConfig>();
+
+    if (examId) {
+      const { data: configRows, error: configError } = await supabase
+        .from('exam_paper_questions')
+        .select('question_id, marks, negative_marks')
+        .eq('exam_id', examId);
+
+      if (configError) {
+        if (attempt && historyId) await ExamAttemptService.releaseClaim(attempt.id);
+        throw new Error(configError.message);
+      }
+
+      (configRows || []).forEach((row: AnyObject) => {
+        const questionId = normalizeId(row.question_id);
+        if (!questionId) return;
+        questionConfig.set(questionId, {
+          marks: row.marks ?? null,
+          negative_marks: row.negative_marks ?? null,
+        });
+      });
+    }
+
     const { data: questions, error: questionsError } = await supabase
       .from('questions')
       .select(EXAM_REVIEW_QUESTION_SELECT_QUERY)
@@ -1005,10 +1049,22 @@ export class ExamUserService {
     let skipped = 0;
     let totalScore = 0;
 
+    const computedTotalMarks = questionIds.reduce(
+      (sum, questionId) =>
+        sum + resolveQuestionMarks(questionConfig.get(questionId)?.marks),
+      0
+    );
+
     const details = questionIds.map((questionId) => {
       const q = questionMap.get(questionId);
       const selectedOptionId = answers[questionId];
       const selectedId = isEmptyAnswer(selectedOptionId) ? null : normalizeOptionId(selectedOptionId);
+      const config = questionConfig.get(questionId);
+      const questionMarks = resolveQuestionMarks(config?.marks);
+      const questionNegativeMarks = resolveQuestionNegativeMarks(
+        config?.negative_marks,
+        defaultNegativeMarks
+      );
 
       if (!q) {
         skipped++;
@@ -1049,10 +1105,10 @@ export class ExamUserService {
 
       if (isCorrect) {
         correct++;
-        totalScore += 1;
+        totalScore += questionMarks;
       } else {
         wrong++;
-        totalScore -= defaultNegativeMarks;
+        totalScore -= questionNegativeMarks;
       }
 
       return sanitizeDetailForClient(
@@ -1061,7 +1117,7 @@ export class ExamUserService {
           selected_option: selectedId,
           selected_option_text: optionDisplayText(selectedOption),
           is_correct: isCorrect,
-          marks_awarded: isCorrect ? 1 : -defaultNegativeMarks,
+          marks_awarded: isCorrect ? questionMarks : -questionNegativeMarks,
           status: isCorrect ? 'correct' : 'wrong',
         },
         q,
@@ -1109,11 +1165,13 @@ export class ExamUserService {
       : clampTimeTaken(payload.time_taken);
 
     const submittedAt = new Date(nowMs).toISOString();
+    const authoritativeTotalMarks =
+      questionConfig.size > 0 ? computedTotalMarks : examTotalMarks || totalQuestions;
     const resultPayload: AnyObject = {
       exam_id: examId,
       user_id,
       score: finalScore,
-      total_marks: examTotalMarks || totalQuestions,
+      total_marks: authoritativeTotalMarks,
       correct_count: correct,
       wrong_count: wrong,
       skipped_count: skipped,
@@ -1406,10 +1464,36 @@ export class ExamUserService {
     const byId = new Map<string, AnyObject>();
     (data || []).forEach((question: AnyObject) => byId.set(normalizeId(question.id), question));
 
+    const questionConfig = new Map<string, QuestionMarkConfig>();
+
+    if (attempt.exam_id) {
+      const { data: configRows, error: configError } = await supabase
+        .from('exam_paper_questions')
+        .select('question_id, marks, negative_marks')
+        .eq('exam_id', attempt.exam_id);
+
+      if (configError) throw new Error(configError.message);
+
+      (configRows || []).forEach((row: AnyObject) => {
+        const questionId = normalizeId(row.question_id);
+        if (!questionId) return;
+        questionConfig.set(questionId, {
+          marks: row.marks ?? null,
+          negative_marks: row.negative_marks ?? null,
+        });
+      });
+    }
+
     // Preserve the frozen attempt order and drop anything that is no longer
     // available rather than leaking an unpublished question.
     const ordered = questionIds
-      .map((questionId) => byId.get(questionId))
+      .map((questionId) => {
+        const question = byId.get(questionId);
+        if (!question) return undefined;
+
+        const config = questionConfig.get(questionId);
+        return config ? { ...question, ...config } : question;
+      })
       .filter((question): question is AnyObject => Boolean(question));
 
     return {
