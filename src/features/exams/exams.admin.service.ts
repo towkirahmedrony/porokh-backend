@@ -8,6 +8,7 @@ import {
   EXAM_AUTHORING_CATEGORIES,
   MODEL_TEST_TRACKS,
   ExamAuthoringError,
+  assertValidExamSubject,
   assertValidExamTrack,
   assertValidExamWindow,
   parseExamCreatePayload,
@@ -140,11 +141,59 @@ const countExamQuestions = async (examId: string): Promise<number> => {
   return count ?? 0;
 };
 
+/**
+ * True when at least one student has started or completed this paper. The
+ * admin UI uses this only to warn before replacing a question set; it never
+ * blocks the edit.
+ */
+const examHasAttempts = async (examId: string): Promise<boolean> => {
+  const { count: attemptCount, error: attemptError } = await supabase
+    .from('exam_progress')
+    .select('id', { count: 'exact', head: true })
+    .eq('exam_id', examId);
+
+  if (attemptError) throw new Error(attemptError.message);
+  if ((attemptCount ?? 0) > 0) return true;
+
+  const { count: historyCount, error: historyError } = await supabase
+    .from('exam_history')
+    .select('id', { count: 'exact', head: true })
+    .eq('exam_id', examId);
+
+  if (historyError) throw new Error(historyError.message);
+
+  return (historyCount ?? 0) > 0;
+};
+
 export class ExamAdminService {
   static async getAllExams() {
     const { data, error } = await supabase.from('exam_papers').select('*').order('created_at', { ascending: false });
     if (error) throw new Error(error.message);
-    return data;
+
+    const papers = data || [];
+    const counts = new Map<string, number>();
+
+    if (papers.length > 0) {
+      const { data: links, error: linkError } = await supabase
+        .from('exam_paper_questions')
+        .select('exam_id')
+        .in(
+          'exam_id',
+          papers.map((paper: AnyObject) => String(paper.id))
+        );
+
+      if (linkError) throw new Error(linkError.message);
+
+      (links || []).forEach((link: AnyObject) => {
+        const examId = String(link.exam_id);
+        counts.set(examId, (counts.get(examId) ?? 0) + 1);
+      });
+    }
+
+    return papers.map((paper: AnyObject) => ({
+      ...paper,
+      question_count: counts.get(String(paper.id)) ?? 0,
+    }));
   }
 
   static async getExamDetails(id: string) {
@@ -155,7 +204,12 @@ export class ExamAdminService {
       .maybeSingle();
     if (error) throw new Error(error.message);
     if (!data) throw new Error('Exam not found');
-    return data;
+
+    return {
+      ...data,
+      question_count: await countExamQuestions(id),
+      has_attempts: await examHasAttempts(id),
+    };
   }
 
   static async deleteExam(id: string, adminId?: string) {
@@ -193,7 +247,11 @@ export class ExamAdminService {
       if (countError) throw new Error(countError.message);
 
       if (!count) {
-        throw new Error('Cannot publish an exam without questions');
+        throw new ExamAuthoringError(
+          'Cannot publish an exam without questions',
+          400,
+          'EXAM_HAS_NO_QUESTIONS'
+        );
       }
     }
 
@@ -263,23 +321,22 @@ export class ExamAdminService {
   }) {
     const subjectId = typeof params?.subjectId === 'string' ? params.subjectId.trim() : '';
 
-    if (!subjectId) {
-      throw new ExamAdminError('subject_id is required', 400);
-    }
-
     const requestedLimit = Number(params?.limit);
     const limit =
-      Number.isInteger(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 100) : 50;
+      Number.isInteger(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 500) : 100;
 
     let query = supabase
       .from('questions')
-      .select('id, body, difficulty_level, type, topic_id, chapter_id')
-      .eq('subject_id', subjectId)
+      .select('id, body, difficulty_level, type, topic_id, chapter_id, subject_id')
       .eq('is_active', true)
       .eq('status', 'published')
       .is('deleted_at', null)
       .order('created_at', { ascending: false })
       .limit(limit);
+
+    // A full model test spans subjects, so the filter is optional: no
+    // `subject_id` means "all subjects the admin may pick from".
+    if (subjectId) query = query.eq('subject_id', subjectId);
 
     const chapterId = typeof params?.chapterId === 'string' ? params.chapterId.trim() : '';
 
@@ -296,6 +353,7 @@ export class ExamAdminService {
       type: row.type ?? null,
       topic_id: row.topic_id ?? null,
       chapter_id: row.chapter_id ?? null,
+      subject_id: row.subject_id ?? null,
     }));
   }
 
@@ -311,7 +369,7 @@ export class ExamAdminService {
   static async createExam(payload: unknown, adminId?: string) {
     const parsed: ExamAuthoringFields = parseExamCreatePayload(payload);
 
-    await assertSubjectExists(parsed.subject_id);
+    if (parsed.subject_id) await assertSubjectExists(parsed.subject_id);
 
     const questionIds = await requireEligibleQuestions(parsed.question_ids);
     const paperId = randomUUID();
@@ -433,10 +491,14 @@ export class ExamAdminService {
 
     const nextCategory = patch.category ?? existing.category ?? 'model_test';
     const nextTrack = 'track' in patch ? patch.track ?? null : existing.track ?? null;
-    assertValidExamTrack(nextCategory, nextTrack);
+    const nextSubjectId =
+      'subject_id' in patch ? patch.subject_id ?? null : existing.subject_id ?? null;
 
-    if (patch.subject_id && patch.subject_id !== existing.subject_id) {
-      await assertSubjectExists(patch.subject_id);
+    assertValidExamTrack(nextCategory, nextTrack);
+    assertValidExamSubject(nextCategory, nextSubjectId);
+
+    if (nextSubjectId && nextSubjectId !== existing.subject_id) {
+      await assertSubjectExists(nextSubjectId);
     }
 
     assertValidExamWindow(
@@ -465,7 +527,11 @@ export class ExamAdminService {
       }
 
       if (finalCount === 0) {
-        throw new ExamAdminError('Cannot publish an exam without questions', 400);
+        throw new ExamAuthoringError(
+          'Cannot publish an exam without questions',
+          400,
+          'EXAM_HAS_NO_QUESTIONS'
+        );
       }
     }
 
@@ -566,6 +632,7 @@ export class ExamAdminService {
     return {
       ...updated,
       question_count: nextQuestionIds ? nextQuestionIds.length : await countExamQuestions(id),
+      has_attempts: await examHasAttempts(id),
     };
   }
 

@@ -16,6 +16,8 @@ const state: {
   questions: Row[];
   subjects: Row[];
   userRoles: Row[];
+  examProgress: Row[];
+  examHistory: Row[];
   ops: string[];
   inserts: { table: string; rows: Row[] }[];
   failOn: { table: string; op: string } | null;
@@ -25,6 +27,8 @@ const state: {
   questions: [],
   subjects: [],
   userRoles: [],
+  examProgress: [],
+  examHistory: [],
   ops: [],
   inserts: [],
   failOn: null,
@@ -39,6 +43,8 @@ const TABLE_KEYS: Record<string, keyof typeof state> = {
   questions: 'questions',
   subjects: 'subjects',
   user_roles: 'userRoles',
+  exam_progress: 'examProgress',
+  exam_history: 'examHistory',
 };
 
 const createBuilder = (table: string) => {
@@ -302,6 +308,8 @@ beforeEach(() => {
   state.ops = [];
   state.inserts = [];
   state.failOn = null;
+  state.examProgress = [];
+  state.examHistory = [];
   state.questions = [
     { id: 'q-1', status: 'published', is_active: true, deleted_at: null, subject_id: 'subject-1', body: { text_bn: 'প্রশ্ন ১' }, difficulty_level: 'easy', type: 'MCQ' },
     { id: 'q-2', status: 'published', is_active: true, deleted_at: null, subject_id: 'subject-1', body: { text_bn: 'প্রশ্ন ২' }, difficulty_level: 'medium', type: 'MCQ' },
@@ -445,6 +453,56 @@ test('model tests require a supported track and other categories reject one', ()
   assert.equal(admission.track, null);
 });
 
+test('a null subject is allowed only for model tests', async () => {
+  const full = parseExamCreatePayload(
+    validPayload({ subject_id: null, category: 'model_test', track: 'hsc' })
+  );
+
+  assert.equal(full.subject_id, null);
+
+  assert.throws(
+    () => parseExamCreatePayload(validPayload({ subject_id: null, category: 'board_exam', track: null })),
+    (error: any) => error.status === 400 && /subject_id is required/.test(error.message)
+  );
+
+  assert.throws(
+    () => parseExamCreatePayload(validPayload({ subject_id: null, category: 'admission', track: null })),
+    (error: any) => error.status === 400 && /subject_id is required/.test(error.message)
+  );
+
+  // A full paper never touches the subject table and is created normally.
+  const result = await ExamAdminService.createExam(
+    validPayload({ subject_id: null, category: 'model_test', track: 'hsc' }),
+    'admin-1'
+  );
+
+  assert.equal(result.question_count, 2);
+  assert.equal(state.examPapers[0].subject_id, null);
+  assert.equal(state.examPapers[0].total_marks, 2);
+  assert.ok(!state.ops.includes('subjects:select'), 'full papers do not resolve a subject');
+});
+
+test('changing a full model test to board exam without a subject is rejected', async () => {
+  await ExamAdminService.createExam(
+    validPayload({ subject_id: null, category: 'model_test', track: 'hsc', is_published: false }),
+    'admin-1'
+  );
+
+  const examId = state.examPapers[0].id;
+
+  await assert.rejects(
+    () =>
+      ExamAdminService.updateExam(
+        examId,
+        { category: 'board_exam', track: null, subject_id: null },
+        'admin-1'
+      ),
+    (error: any) => error.status === 400 && /subject_id is required/.test(error.message)
+  );
+
+  assert.equal(state.examPapers[0].category, 'model_test');
+});
+
 test('duplicate question ids are rejected', () => {
   assert.throws(
     () => parseExamCreatePayload(validPayload({ question_ids: ['q-1', 'q-1'] })),
@@ -536,6 +594,38 @@ test('a valid request creates the paper, links questions and publishes last', as
   );
 });
 
+test('start and end time are optional for an always-open paper', async () => {
+  const payload = validPayload();
+  delete (payload as Row).start_time;
+  delete (payload as Row).end_time;
+
+  const result = await ExamAdminService.createExam(payload, 'admin-1');
+
+  assert.equal(result.is_published, true);
+  assert.equal(state.examPapers[0].start_time, null);
+  assert.equal(state.examPapers[0].end_time, null);
+
+  state.ops = [];
+  await ExamAdminService.updateExam(
+    state.examPapers[0].id,
+    { start_time: '2026-11-01T04:00:00.000Z', end_time: '2026-11-01T06:00:00.000Z' },
+    'admin-1'
+  );
+
+  const scheduled = state.examPapers[0];
+  assert.equal(scheduled.start_time, '2026-11-01T04:00:00.000Z');
+  assert.equal(scheduled.end_time, '2026-11-01T06:00:00.000Z');
+
+  await ExamAdminService.updateExam(
+    state.examPapers[0].id,
+    { start_time: null, end_time: null },
+    'admin-1'
+  );
+
+  assert.equal(state.examPapers[0].start_time, null);
+  assert.equal(state.examPapers[0].end_time, null);
+});
+
 test('a draft request leaves is_published false and still links questions', async () => {
   const result = await ExamAdminService.createExam(validPayload({ is_published: false }), 'admin-1');
 
@@ -577,14 +667,38 @@ test('updating metadata does not touch the question set or duplicate the paper',
   assert.ok(!state.ops.includes('exam_paper_questions:delete'), 'metadata-only update keeps questions');
 });
 
+test('an update reports has_attempts without blocking the edit', async () => {
+  await ExamAdminService.createExam(validPayload({ is_published: false }), 'admin-1');
+
+  const examId = state.examPapers[0].id;
+
+  state.examProgress = [
+    { id: 'attempt-1', exam_id: examId, user_id: 'student-1', status: 'submitted' },
+  ];
+
+  const updated = await ExamAdminService.updateExam(
+    examId,
+    { title: 'Renamed after attempts', question_ids: ['q-1'] },
+    'admin-1'
+  );
+
+  assert.equal(updated.has_attempts, true);
+  assert.equal(updated.title, 'Renamed after attempts');
+  assert.equal(updated.question_count, 1);
+  assert.equal(state.examPaperQuestions.length, 1);
+});
+
 test('publishing an exam without questions is refused', async () => {
   state.examPapers = [
-    { id: 'exam-empty', title: 'Empty', category: 'board_exam', track: null, duration_min: 30, is_published: false, total_marks: 0 },
+    { id: 'exam-empty', title: 'Empty', category: 'board_exam', track: null, subject_id: 'subject-1', duration_min: 30, is_published: false, total_marks: 0 },
   ];
 
   await assert.rejects(
     () => ExamAdminService.updateExam('exam-empty', { is_published: true }, 'admin-1'),
-    (error: any) => error.status === 400 && /questions/i.test(error.message)
+    (error: any) =>
+      error.status === 400 &&
+      error.code === 'EXAM_HAS_NO_QUESTIONS' &&
+      /questions/i.test(error.message)
   );
 
   assert.equal(state.examPapers[0].is_published, false);
@@ -592,7 +706,7 @@ test('publishing an exam without questions is refused', async () => {
 
 test('publishing an exam without a valid duration is refused', async () => {
   state.examPapers = [
-    { id: 'exam-no-duration', title: 'No duration', category: 'board_exam', track: null, duration_min: 0, is_published: false, total_marks: 1 },
+    { id: 'exam-no-duration', title: 'No duration', category: 'board_exam', track: null, subject_id: 'subject-1', duration_min: 0, is_published: false, total_marks: 1 },
   ];
   state.examPaperQuestions = [{ exam_id: 'exam-no-duration', question_id: 'q-1', sequence: 1 }];
 
@@ -668,10 +782,20 @@ test('eligible questions are limited to the subject and to published, active row
   assert.deepEqual(rows.map((row: Row) => row.id).sort(), ['q-1', 'q-2']);
 });
 
-test('eligible questions require a subject', async () => {
-  await assert.rejects(
-    () => ExamAdminService.listEligibleQuestions({}),
-    (error: any) => error.status === 400
+test('eligible questions may span all subjects for a full paper', async () => {
+  state.questions = [
+    { id: 'q-1', status: 'published', is_active: true, deleted_at: null, subject_id: 'subject-1' },
+    { id: 'q-2', status: 'published', is_active: true, deleted_at: null, subject_id: 'subject-1' },
+    { id: 'q-draft', status: 'pending', is_active: true, deleted_at: null, subject_id: 'subject-1' },
+    { id: 'q-other', status: 'published', is_active: true, deleted_at: null, subject_id: 'subject-2' },
+  ];
+
+  const rows = await ExamAdminService.listEligibleQuestions({});
+
+  assert.deepEqual(rows.map((row: Row) => row.id).sort(), ['q-1', 'q-2', 'q-other']);
+  assert.deepEqual(
+    rows.map((row: Row) => row.subject_id).sort(),
+    ['subject-1', 'subject-1', 'subject-2']
   );
 });
 

@@ -6,6 +6,7 @@ import { ExamAttemptError, ExamAttemptService } from './exam.attempt.service';
 import { ExamPracticeService } from './exam.practice.service';
 import { incrementStreakOnExamSubmit } from '../growth/streak.service';
 import { awardGroupXpToActiveGroups } from '../groups/groups.xp';
+import logger from '../../lib/utils/logger';
 
 const getAuthUserId = (req: Request): string => {
   const userId = (req as any).user?.id;
@@ -17,8 +18,15 @@ const getAuthUserId = (req: Request): string => {
   return userId;
 };
 
+/**
+ * @deprecated The generated Arena flow is kept for the legacy /exam/live page.
+ * Preset model tests are served through POST /exams/user/attempts/start.
+ */
 export const generateExam = catchAsync(async (req: Request, res: Response) => {
   const userId = getAuthUserId(req);
+  logger.warn('[exam] deprecated endpoint POST /exams/user/generate', { userId });
+  res.setHeader('Deprecation', 'true');
+  res.setHeader('Warning', '299 - "Deprecated endpoint; use preset model tests"');
   const result = await ExamUserService.generateExam(userId, req.body);
 
   sendResponse(res, {
@@ -29,8 +37,15 @@ export const generateExam = catchAsync(async (req: Request, res: Response) => {
   });
 });
 
+/**
+ * @deprecated Adaptive Arena questions are kept for the legacy /exam/live page.
+ * Preset model tests are served through POST /exams/user/attempts/start.
+ */
 export const getArena = catchAsync(async (req: Request, res: Response) => {
   const userId = getAuthUserId(req);
+  logger.warn('[exam] deprecated endpoint GET /exams/user/arena', { userId });
+  res.setHeader('Deprecation', 'true');
+  res.setHeader('Warning', '299 - "Deprecated endpoint; use preset model tests"');
   const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 10, 1), 100);
   const subjectSlug = req.query.subjectSlug as string | undefined;
 

@@ -63,23 +63,20 @@ type CreateField = (typeof CREATE_FIELDS)[number];
 /** Fields that are required when creating a paper. */
 const REQUIRED_ON_CREATE: CreateField[] = [
   'title',
-  'subject_id',
   'duration_min',
-  'start_time',
-  'end_time',
   'question_ids',
 ];
 
 export type ExamAuthoringFields = {
   title: string;
   title_en: string | null;
-  subject_id: string;
+  subject_id: string | null;
   category: string;
   track: string | null;
   exam_type: string | null;
   duration_min: number;
-  start_time: string;
-  end_time: string;
+  start_time: string | null;
+  end_time: string | null;
   result_publish_time: string | null;
   instructions: string | null;
   instructions_en: string | null;
@@ -306,6 +303,51 @@ const readCategory = (source: AnyObject): string | null => {
 };
 
 /**
+ * Reads `subject_id`, treating a missing/blank value as "no subject". Only a
+ * model test may omit it (a full paper); that pairing is enforced separately by
+ * `assertValidExamSubject`.
+ */
+const readSubjectId = (source: AnyObject): string | null => {
+  const raw = source.subject_id;
+
+  if (raw === undefined || raw === null) return null;
+
+  if (typeof raw !== 'string') {
+    throw new ExamAuthoringError('subject_id must be a string or null');
+  }
+
+  const value = raw.trim();
+
+  if (!value) return null;
+
+  if (value.length > 64) {
+    throw new ExamAuthoringError('subject_id must be at most 64 characters');
+  }
+
+  return value;
+};
+
+/**
+ * Enforces the category/subject pairing on the effective paper state. A model
+ * test may be full (`subject_id = NULL`); board and admission papers always
+ * target one subject.
+ */
+export const assertValidExamSubject = (
+  category: string | null | undefined,
+  subjectId: string | null | undefined
+): void => {
+  if (category === 'model_test') return;
+
+  if (!subjectId) {
+    throw new ExamAuthoringError(
+      `subject_id is required for ${category || 'this category'}`,
+      400,
+      'VALIDATION_FAILED'
+    );
+  }
+};
+
+/**
  * Reads `track`, preserving the difference between "not supplied" (undefined)
  * and an explicit clear (`null`). Only model-test papers may carry a track.
  */
@@ -370,8 +412,8 @@ export const parseExamCreatePayload = (input: unknown): ExamAuthoringFields => {
     });
   }
 
-  const startMs = readTimestamp(input, 'start_time', { required: true });
-  const endMs = readTimestamp(input, 'end_time', { required: true });
+  const startMs = readTimestamp(input, 'start_time', { required: false });
+  const endMs = readTimestamp(input, 'end_time', { required: false });
   const publishMs = readTimestamp(input, 'result_publish_time', { required: false });
 
   validateWindow(startMs, endMs, publishMs);
@@ -384,13 +426,15 @@ export const parseExamCreatePayload = (input: unknown): ExamAuthoringFields => {
 
   const category = readCategory(input) ?? 'model_test';
   const track = readTrack(input) ?? null;
+  const subjectId = readSubjectId(input);
 
   assertValidExamTrack(category, track);
+  assertValidExamSubject(category, subjectId);
 
   return {
     title: readString(input, 'title', { max: 200, required: true }) as string,
     title_en: readString(input, 'title_en', { max: 200, required: false }),
-    subject_id: readString(input, 'subject_id', { max: 64, required: true }) as string,
+    subject_id: subjectId,
     category,
     track,
     exam_type: readString(input, 'exam_type', { max: 64, required: false }),
@@ -399,8 +443,8 @@ export const parseExamCreatePayload = (input: unknown): ExamAuthoringFields => {
       max: MAX_EXAM_DURATION_MIN,
       required: true,
     }) as number,
-    start_time: new Date(startMs as number).toISOString(),
-    end_time: new Date(endMs as number).toISOString(),
+    start_time: startMs === null ? null : new Date(startMs).toISOString(),
+    end_time: endMs === null ? null : new Date(endMs).toISOString(),
     result_publish_time: publishMs === null ? null : new Date(publishMs).toISOString(),
     instructions: readString(input, 'instructions', { max: 5000, required: false }),
     instructions_en: readString(input, 'instructions_en', { max: 5000, required: false }),
@@ -439,7 +483,7 @@ export const parseExamUpdatePayload = (input: unknown): ExamAuthoringPatch => {
   if ('title_en' in input) patch.title_en = readString(input, 'title_en', { max: 200, required: false });
 
   if ('subject_id' in input) {
-    patch.subject_id = readString(input, 'subject_id', { max: 64, required: true }) as string;
+    patch.subject_id = readSubjectId(input);
   }
 
   if ('category' in input) {
@@ -464,11 +508,13 @@ export const parseExamUpdatePayload = (input: unknown): ExamAuthoringPatch => {
   }
 
   if ('start_time' in input) {
-    patch.start_time = new Date(readTimestamp(input, 'start_time', { required: true }) as number).toISOString();
+    const startMs = readTimestamp(input, 'start_time', { required: false });
+    patch.start_time = startMs === null ? null : new Date(startMs).toISOString();
   }
 
   if ('end_time' in input) {
-    patch.end_time = new Date(readTimestamp(input, 'end_time', { required: true }) as number).toISOString();
+    const endMs = readTimestamp(input, 'end_time', { required: false });
+    patch.end_time = endMs === null ? null : new Date(endMs).toISOString();
   }
 
   if ('result_publish_time' in input) {

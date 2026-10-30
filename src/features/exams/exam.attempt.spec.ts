@@ -251,6 +251,24 @@ test('the server derives the authoritative deadline from exam configuration', as
   assert.ok(attempt.seconds_remaining > 29 * 60);
 });
 
+test('a full model test with no subject freezes question ids in sequence order', async () => {
+  state.examPapers = [baseExam({ subject_id: null, category: 'model_test', track: 'hsc' })];
+  state.examPaperQuestions = [
+    { exam_id: 'exam-1', question_id: 'q-2', sequence: 2 },
+    { exam_id: 'exam-1', question_id: 'q-1', sequence: 1 },
+    { exam_id: 'exam-1', question_id: 'q-3', sequence: 3 },
+  ];
+  state.questions = [
+    { id: 'q-1', is_active: true, status: 'published', deleted_at: null, subject_id: 'subject-1' },
+    { id: 'q-2', is_active: true, status: 'published', deleted_at: null, subject_id: 'subject-2' },
+    { id: 'q-3', is_active: true, status: 'published', deleted_at: null, subject_id: 'subject-3' },
+  ];
+
+  const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
+
+  assert.deepEqual(attempt.question_ids, ['q-1', 'q-2', 'q-3']);
+});
+
 test('a client-supplied deadline or start time is never used', () => {
   const clientDeadline = Date.now() + 10 * 60 * MINUTE;
   const exam = { duration_min: 30, end_time: null, started_at: clientDeadline, deadline_at: clientDeadline };

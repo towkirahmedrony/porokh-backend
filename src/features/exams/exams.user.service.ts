@@ -846,7 +846,9 @@ export class ExamUserService {
         if (!attempt) {
           throw new ExamAttemptError(
             'An exam attempt must be started before submitting',
-            409
+            409,
+            { code: 'EXAM_ATTEMPT_REQUIRED' },
+            'EXAM_ATTEMPT_REQUIRED'
           );
         }
       }
@@ -880,7 +882,12 @@ export class ExamUserService {
 
     if (untrackedPractice) {
       if (normalizedExamId) {
-        throw new ExamAttemptError('An exam attempt must be started before submitting', 409);
+        throw new ExamAttemptError(
+          'An exam attempt must be started before submitting',
+          409,
+          { code: 'EXAM_ATTEMPT_REQUIRED' },
+          'EXAM_ATTEMPT_REQUIRED'
+        );
       }
       if (requestedQuestionIds.length === 0) {
         throw new ExamAttemptError('No questions submitted', 400);
@@ -976,7 +983,9 @@ export class ExamUserService {
         if (attempt && historyId) await ExamAttemptService.releaseClaim(attempt.id);
         throw new ExamAttemptError(
           examData ? 'Exam is not available' : 'Exam not found',
-          examData ? 403 : 404
+          examData ? 403 : 404,
+          { code: examData ? 'EXAM_NOT_AVAILABLE' : 'EXAM_NOT_FOUND' },
+          examData ? 'EXAM_NOT_AVAILABLE' : 'EXAM_NOT_FOUND'
         );
       }
 
