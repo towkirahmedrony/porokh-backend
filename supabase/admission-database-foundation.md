@@ -1,6 +1,6 @@
 # Phase 1 — Admission database foundation
 
-**Status:** migration prepared for review; not executed or applied.
+**Status:** applied to the connected live project on 2026-10-30 after explicit approval. GitHub commit: `5c6f47a`.
 **Target project inspected:** ParaPoth / Supabase project `pbswsbfcmztmbcqnuqny` (ap-south-1), schema read 2026-10-30.
 **Migration:** `supabase/migrations/20261030102000_admission_database_foundation.sql`
 
@@ -110,27 +110,23 @@ The service-role credential must remain server-only as in the existing backend. 
 
 ## Validation checklist
 
-**Verified without applying the migration:** actual parent/target ID types, existing timestamps and trigger helper, existing admin helper, absence of the target table/column, nullable-column compatibility by design, and no changes to the question-association table in the migration text.
+**Verified before applying:** actual parent/target ID types, existing timestamps and trigger helper, existing admin helper, absence of the target table/column, and no changes to the question-association table in the migration text.
 
-**Encoded by migration constraints/policies, but not executed in a database because the migration was not applied:**
+**Verified after applying (read-only catalog checks):**
 
-- Multiple units may share one institution; duplicate codes within that institution are rejected case-insensitively.
-- Different institutions may reuse a unit code.
-- An exam paper can reference an existing unit; an unknown unit is rejected by the FK.
-- Existing exam papers may keep a null unit reference.
-- Existing question assignments remain unaffected because the join table is unchanged.
-- HSC papers and questions remain valid because no HSC data or question fields are changed.
-- Active units are readable by students; only active admins/super-admins can manage rows through authenticated RLS.
+- The new table, nullable paper column, both foreign keys, code check, unique expression index, listing indexes, trigger and RLS policies exist.
+- `anon` has SELECT but no INSERT grant; `authenticated` has the required table grants, with row management constrained by the admin policy.
+- `exam_papers` remains at 3 rows and `exam_paper_questions` at 45 rows, matching the pre-migration snapshot; all 3 existing papers have `admission_unit_id IS NULL` and `admission_units` is empty.
+- Existing question assignments and papers were not rewritten; the migration does not alter HSC fields or the question-association table.
 
-No live writes, migration apply, reset, or production validation transaction were run. A local Supabase/Postgres runtime was not available in the audit sandbox. Run functional constraint/RLS tests against an isolated development project before approving production execution.
+Functional insert tests for per-institution code uniqueness, cross-institution code reuse, FK rejection, and role-session RLS behavior were not run. No application data was inserted or updated, and no reset was performed. A local Supabase/Postgres runtime was not available in the audit sandbox.
 
-## Migration execution (not performed)
+## Migration execution record
 
-1. Review the migration and verify the target database has the same `institutions.id`, `exam_papers.id`, helper-function and RLS conventions.
-2. Apply it first to a disposable/local Supabase environment, then run catalog, FK, code-uniqueness, null-compatibility, and RLS tests with two fixture institutions and a fixture paper.
-3. Review the SQL diff and obtain explicit approval before applying to production.
-4. Apply the migration through the team's approved Supabase migration process (for example, `supabase db push` from the backend project after linking the intended project), never reset the database. This task did not run `db push`, `apply_migration`, or any production DDL.
-5. Confirm the migration history and `admission_units`/`admission_unit_id` catalog state after a separately approved execution.
+1. Reviewed the migration against the connected production schema and received explicit approval.
+2. Committed and pushed the migration and design note to `towkirahmedrony/porokh-backend` branch `main` as commit `5c6f47a`.
+3. Applied migration `20261030102000_admission_database_foundation` to Supabase project `pbswsbfcmztmbcqnuqny`; the apply operation returned success.
+4. Ran read-only catalog, grants/policy, and row-count checks afterward. Do not reapply or reset the database; run the remaining functional tests against an isolated development project.
 
 ## Remaining limitations
 
