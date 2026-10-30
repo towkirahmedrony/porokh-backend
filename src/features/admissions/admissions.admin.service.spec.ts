@@ -41,6 +41,9 @@ class FakeQuery {
   private wantCount = false;
   private singleMode: 'none' | 'single' | 'maybeSingle' = 'none';
   private returning = false;
+  private rangeStart: number | null = null;
+  private rangeEnd: number | null = null;
+  private forcedError: string | null = null;
 
   constructor(private tables: Tables, private table: string) {
     if (!this.tables[this.table]) this.tables[this.table] = [];
@@ -84,6 +87,17 @@ class FakeQuery {
 
   order(column: string, options?: { ascending?: boolean }) {
     this.orders.push({ column, ascending: options?.ascending ?? true });
+    return this;
+  }
+
+  range(from: number, to: number) {
+    this.rangeStart = from;
+    this.rangeEnd = to;
+    return this;
+  }
+
+  failNext(code: string) {
+    this.forcedError = code;
     return this;
   }
 
@@ -138,9 +152,21 @@ class FakeQuery {
   private execute() {
     const rows = this.tables[this.table];
 
+    if (this.forcedError) {
+      return {
+        data: null,
+        error: { code: this.forcedError, message: 'forced database error' },
+        count: null,
+      };
+    }
+
     if (this.mode === 'select') {
       const matched = this.sort(rows.filter((row) => this.matches(row)));
-      return this.result(matched);
+      const ranged =
+        this.rangeStart === null || this.rangeEnd === null
+          ? matched
+          : matched.slice(this.rangeStart, this.rangeEnd + 1);
+      return this.result(ranged);
     }
 
     if (this.mode === 'insert') {
@@ -224,6 +250,32 @@ const unit = (overrides: Row = {}): Row => ({
 });
 
 const db = () => ({ from: (table: string) => new FakeQuery(tables, table) }) as any;
+
+const dbWithAdmissionWriteError = (
+  operation: 'insert' | 'delete',
+  code: string
+) =>
+  ({
+    from: (table: string) => {
+      const query: any = new FakeQuery(tables, table);
+
+      if (table === 'admission_units' && operation === 'insert') {
+        query.insert = () => {
+          query.failNext(code);
+          return query;
+        };
+      }
+
+      if (table === 'admission_units' && operation === 'delete') {
+        query.delete = () => {
+          query.failNext(code);
+          return query;
+        };
+      }
+
+      return query;
+    },
+  }) as any;
 
 const rejection = (promise: Promise<unknown>) =>
   promise.then(
@@ -410,4 +462,69 @@ test('returns 404 for missing units on update, status and delete', async () => {
     assert.equal(error.status, 404);
     assert.equal(error.errorCode, 'ADMISSION_UNIT_NOT_FOUND');
   }
+});
+
+test('aggregates unit totals across PostgREST pages', async () => {
+  for (let index = 0; index < 1005; index += 1) {
+    tables.admission_units.push(
+      unit({
+        id: randomUUID(),
+        code: `U${index}`,
+        is_active: index % 2 === 0,
+      })
+    );
+  }
+
+  const result = await AdmissionAdminService.listUniversities(db());
+
+  assert.equal(result[0].unit_count, 1005);
+  assert.equal(result[0].active_unit_count, 503);
+});
+
+test('counts paper references across PostgREST pages before blocking delete', async () => {
+  tables.admission_units.push(unit());
+
+  for (let index = 0; index < 1005; index += 1) {
+    tables.exam_papers.push({
+      id: `paper-${index}`,
+      admission_unit_id: UNIT_ID,
+    });
+  }
+
+  const error = await rejection(
+    AdmissionAdminService.deleteUnit(UNIT_ID, undefined, db())
+  );
+
+  assert.equal(error.status, 409);
+  assert.equal(error.errorCode, 'ADMISSION_UNIT_IN_USE');
+  assert.equal(error.details.paper_count, 1005);
+});
+
+test('maps a database unique violation to the duplicate-code contract', async () => {
+  const error = await rejection(
+    AdmissionAdminService.createUnit(
+      UNIVERSITY_ID,
+      parseCreateAdmissionUnit({ name_bn: 'ক', code: 'A' }),
+      undefined,
+      dbWithAdmissionWriteError('insert', '23505')
+    )
+  );
+
+  assert.equal(error.status, 409);
+  assert.equal(error.errorCode, 'ADMISSION_UNIT_CODE_TAKEN');
+});
+
+test('maps a database foreign-key violation on delete to the in-use contract', async () => {
+  tables.admission_units.push(unit());
+
+  const error = await rejection(
+    AdmissionAdminService.deleteUnit(
+      UNIT_ID,
+      undefined,
+      dbWithAdmissionWriteError('delete', '23503')
+    )
+  );
+
+  assert.equal(error.status, 409);
+  assert.equal(error.errorCode, 'ADMISSION_UNIT_IN_USE');
 });

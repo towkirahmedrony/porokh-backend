@@ -21,6 +21,7 @@ import groupAdminRoutes from './features/groups/groups.admin.routes';
 import groupBattleRoutes from './features/groups/groupBattles.routes';
 import groupInternalRoutes from './features/groups/groups.internal.routes';
 import { GROUP_ERROR_CODES } from './features/groups/groups.errors';
+import { ADMISSION_ERROR_CODES } from './features/admissions/admissions.errors';
 
 // এক্সাম, সিস্টেম, ফাইন্যান্স, নোটিফিকেশন এবং হিস্ট্রি রাউট ইম্পোর্ট
 import { ExamUserRoutes } from './features/exams/exams.user.routes';
@@ -173,17 +174,13 @@ interface CustomError extends Error {
  * Machine-readable codes that clients are allowed to receive. Anything else
  * (for example a PostgREST code such as `23505` or `PGRST116`) stays internal.
  */
-const EXPOSED_ERROR_CODES = new Set([
+export const EXPOSED_ERROR_CODES = new Set([
   'FREE_LIMIT_REACHED',
   'PREMIUM_REQUIRED',
   'ALREADY_ATTEMPTED',
   'PAYMENT_NOT_PENDING',
   'VALIDATION_FAILED',
-  'UNIVERSITY_NOT_FOUND',
-  'UNIVERSITY_INVALID_TYPE',
-  'ADMISSION_UNIT_NOT_FOUND',
-  'ADMISSION_UNIT_CODE_TAKEN',
-  'ADMISSION_UNIT_IN_USE',
+  ...Object.values(ADMISSION_ERROR_CODES),
   ...GROUP_ERROR_CODES,
 ]);
 

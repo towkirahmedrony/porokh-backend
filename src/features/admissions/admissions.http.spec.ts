@@ -1,9 +1,7 @@
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import express from 'express';
 import { once } from 'node:events';
-import type { Server } from 'node:http';
 
 type Row = Record<string, any>;
 
@@ -87,26 +85,20 @@ const stubModule = (relativePath: string, exports: unknown) => {
 };
 
 stubModule('../../config/supabase', { supabase: fakeSupabase });
+stubModule('../../config/supabaseAdmin', { supabaseAdmin: fakeSupabase });
+stubModule('../../config/supabaseAuth', { supabaseAuth: fakeSupabase });
 stubModule('../../config/userSupabase', {
   createUserSupabaseClient: () => fakeUserClient,
 });
+stubModule('../../config/firebaseAdmin', {
+  messaging: { sendEachForMulticast: async () => ({ successCount: 0, failureCount: 0 }) },
+});
 stubModule('../../lib/utils/adminAudit', { recordAdminAudit: async () => undefined });
 
-const { AdmissionAdminRoutes } = require('./admissions.admin.routes');
+const { default: app, EXPOSED_ERROR_CODES } = require('../../app');
+const { ADMISSION_ERROR_CODES } = require('./admissions.errors');
 
-const app = express();
-app.use(express.json());
-app.use('/api/v1/admin/admissions', AdmissionAdminRoutes);
-app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  res.status(err?.status || 500).json({
-    success: false,
-    message: err?.message || 'error',
-    data: null,
-    ...(err?.errorCode ? { code: err.errorCode } : {}),
-  });
-});
-
-let server: Server;
+let server: any;
 let baseUrl = '';
 
 const request = (
@@ -139,6 +131,15 @@ after(() => {
 
 beforeEach(() => {
   state.permissionGranted = true;
+});
+
+test('every admission error code is exposed to clients', () => {
+  for (const code of Object.values(ADMISSION_ERROR_CODES)) {
+    assert.ok(
+      EXPOSED_ERROR_CODES.has(code),
+      `expected ${code} to be in EXPOSED_ERROR_CODES`
+    );
+  }
 });
 
 test('anonymous callers cannot list universities or create units', async () => {

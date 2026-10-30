@@ -17,13 +17,17 @@ const UNIVERSITY_COLUMNS =
   'id, name_bn, name_en, code, type, is_active, display_order';
 const UNIT_COLUMNS =
   'id, institution_id, name_bn, name_en, code, description, is_active, display_order, created_at, updated_at';
+const PAGE_SIZE = 1000;
 
 interface DbError {
   code?: string;
   message?: string;
 }
 
-const databaseError = (error: DbError): Error => {
+const databaseError = (
+  error: DbError,
+  operation: 'write' | 'delete' = 'write'
+): Error => {
   if (error.code === '23505') {
     return new AdmissionError(
       'A unit with this code already exists for this university',
@@ -32,7 +36,7 @@ const databaseError = (error: DbError): Error => {
     );
   }
 
-  if (error.code === '23503') {
+  if (error.code === '23503' && operation === 'delete') {
     return new AdmissionError(
       'This unit is referenced by existing exam papers. Deactivate it instead of deleting.',
       409,
@@ -41,6 +45,41 @@ const databaseError = (error: DbError): Error => {
   }
 
   return new Error(error.message || 'Admission unit operation failed');
+};
+
+/**
+ * PostgREST caps unpaginated reads, so aggregate by walking pages instead of
+ * assuming a single response contains every row.
+ */
+const fetchAll = async (
+  db: AdmissionDb,
+  table: 'admission_units' | 'exam_papers',
+  columns: string,
+  applyFilters?: (query: any) => any
+): Promise<AnyObject[]> => {
+  const rows: AnyObject[] = [];
+  let offset = 0;
+
+  while (true) {
+    let query = (db.from as any)(table)
+      .select(columns)
+      .order('id', { ascending: true })
+      .range(offset, offset + PAGE_SIZE - 1);
+
+    if (applyFilters) query = applyFilters(query);
+
+    const { data, error } = await query;
+
+    if (error) throw new Error(error.message);
+
+    const page = (data || []) as AnyObject[];
+    rows.push(...page);
+
+    if (page.length === 0) break;
+    offset += page.length;
+  }
+
+  return rows;
 };
 
 const assertUniversity = async (
@@ -131,14 +170,14 @@ const paperCounts = async (
 
   if (unitIds.length === 0) return counts;
 
-  const { data, error } = await db
-    .from('exam_papers')
-    .select('admission_unit_id')
-    .in('admission_unit_id', unitIds);
+  const rows = await fetchAll(
+    db,
+    'exam_papers',
+    'id, admission_unit_id',
+    (query) => query.in('admission_unit_id', unitIds)
+  );
 
-  if (error) throw new Error(error.message);
-
-  (data || []).forEach((row: AnyObject) => {
+  rows.forEach((row: AnyObject) => {
     const unitId = String(row.admission_unit_id);
     counts.set(unitId, (counts.get(unitId) ?? 0) + 1);
   });
@@ -165,17 +204,15 @@ export class AdmissionAdminService {
     const rows = (universities || []) as AnyObject[];
     if (rows.length === 0) return [];
 
-    const universityIds = rows.map((row) => String(row.id));
-    const { data: units, error: unitError } = await db
-      .from('admission_units')
-      .select('institution_id, is_active')
-      .in('institution_id', universityIds);
-
-    if (unitError) throw new Error(unitError.message);
+    const units = await fetchAll(
+      db,
+      'admission_units',
+      'id, institution_id, is_active'
+    );
 
     const totals = new Map<string, { unit_count: number; active_unit_count: number }>();
 
-    (units || []).forEach((unit: AnyObject) => {
+    units.forEach((unit: AnyObject) => {
       const institutionId = String(unit.institution_id);
       const current = totals.get(institutionId) ?? {
         unit_count: 0,
@@ -273,6 +310,14 @@ export class AdmissionAdminService {
 
     if (error) throw databaseError(error);
 
+    if (!data) {
+      throw new AdmissionError(
+        'Admission unit not found',
+        404,
+        ADMISSION_ERROR_CODES.UNIT_NOT_FOUND
+      );
+    }
+
     const counts = await paperCounts([unitId], db);
 
     await recordAdminAudit(
@@ -302,6 +347,14 @@ export class AdmissionAdminService {
       .single();
 
     if (error) throw databaseError(error);
+
+    if (!data) {
+      throw new AdmissionError(
+        'Admission unit not found',
+        404,
+        ADMISSION_ERROR_CODES.UNIT_NOT_FOUND
+      );
+    }
 
     const counts = await paperCounts([unitId], db);
 
@@ -348,7 +401,15 @@ export class AdmissionAdminService {
       .select(UNIT_COLUMNS)
       .single();
 
-    if (error) throw databaseError(error);
+    if (error) throw databaseError(error, 'delete');
+
+    if (!data) {
+      throw new AdmissionError(
+        'Admission unit not found',
+        404,
+        ADMISSION_ERROR_CODES.UNIT_NOT_FOUND
+      );
+    }
 
     await recordAdminAudit(
       actorId,
