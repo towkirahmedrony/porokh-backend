@@ -47,10 +47,13 @@ const PUBLIC_SYSTEM_CONFIG_KEYS = [
   'xp_rules',
 ] as const;
 
+const PUBLIC_SYSTEM_CONFIG_COLUMNS =
+  'key, value, maintenance_mode, maintenance_message, maintenance_message_en, is_force_update_required, min_app_version, update_redirect_url';
+
 export const getGlobalConfigs = async () => {
   const { data, error } = await supabase
     .from('app_configs')
-    .select('key, value')
+    .select(PUBLIC_SYSTEM_CONFIG_COLUMNS)
     .in('key', [...PUBLIC_SYSTEM_CONFIG_KEYS]);
   if (error) throw error;
   return data;
@@ -64,7 +67,7 @@ export const getAppConfigByKey = async (key: string) => {
 
   const { data, error } = await supabase
     .from('app_configs')
-    .select('key, value')
+    .select(PUBLIC_SYSTEM_CONFIG_COLUMNS)
     .eq('key', key)
     .maybeSingle();
   if (error) throw error;

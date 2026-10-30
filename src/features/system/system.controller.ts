@@ -77,7 +77,8 @@ export const getAppConfigs = catchAsync(async (req: Request, res: Response) => {
 
 export const updateAppConfig = catchAsync(async (req: Request, res: Response) => {
   const key = req.params.key || req.body.key;
-  const valuePayload = req.body.value ? { value: req.body.value } : req.body;
+  const valuePayload = { ...req.body };
+  delete valuePayload.key;
   
   if (!key) return sendResponse(res, { statusCode: 400, success: false, message: 'Config key is required' });
 
