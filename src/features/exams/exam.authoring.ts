@@ -30,9 +30,16 @@ export const EXAM_AUTHORING_CATEGORIES = ['model_test', 'board_exam', 'admission
 /** Tracks a model-test paper may target. */
 export const MODEL_TEST_TRACKS = ['hsc', 'medical', 'engineering', 'varsity'] as const;
 
+/** Admission-specific paper modes. Stored in `exam_papers.meta_data.exam_mode`. */
+export const ADMISSION_EXAM_MODES = ['past_exam', 'subject_practice', 'model_test'] as const;
+
+export type AdmissionExamMode = (typeof ADMISSION_EXAM_MODES)[number];
+
 export const MAX_EXAM_QUESTIONS = 200;
 export const MIN_EXAM_DURATION_MIN = 1;
 export const MAX_EXAM_DURATION_MIN = 600;
+export const MIN_QUESTION_MARKS = 0.25;
+export const MAX_QUESTION_MARKS = 100;
 
 /** Fields the client may send. Anything else is rejected, not ignored. */
 const CREATE_FIELDS = [
@@ -56,6 +63,11 @@ const CREATE_FIELDS = [
   'is_premium',
   'is_published',
   'question_ids',
+  'question_marks',
+  'admission_unit_id',
+  'admission_university_id',
+  'exam_mode',
+  'admission_session',
 ] as const;
 
 type CreateField = (typeof CREATE_FIELDS)[number];
@@ -88,6 +100,12 @@ export type ExamAuthoringFields = {
   is_premium: boolean;
   is_published: boolean;
   question_ids: string[];
+  question_marks: Record<string, number> | null;
+  admission_unit_id: string | null;
+  /** Validation-only: never persisted, because the unit owns the university. */
+  admission_university_id: string | null;
+  exam_mode: AdmissionExamMode | null;
+  admission_session: string | null;
 };
 
 export type ExamAuthoringPatch = Partial<ExamAuthoringFields>;
@@ -234,6 +252,76 @@ const readQuestionIds = (source: AnyObject, { required }: { required: boolean })
   return ids;
 };
 
+/**
+ * Reads optional per-question marks. Missing marks default to 1 (the existing
+ * behaviour); every supplied key must belong to the submitted question list so
+ * a client cannot smuggle marks for a question it did not select.
+ */
+const readQuestionMarks = (
+  source: AnyObject,
+  questionIds: string[]
+): Record<string, number> | null => {
+  const raw = source.question_marks;
+
+  if (raw === undefined || raw === null) return null;
+
+  if (!isPlainObject(raw)) {
+    throw new ExamAuthoringError('question_marks must be an object of question id to marks');
+  }
+
+  const allowed = new Set(questionIds);
+  const marks: Record<string, number> = {};
+
+  for (const [questionId, value] of Object.entries(raw)) {
+    const id = questionId.trim();
+
+    if (!id || !allowed.has(id)) {
+      throw new ExamAuthoringError(
+        'question_marks contains a question that is not in question_ids',
+        400,
+        'VALIDATION_FAILED',
+        { unsupported_question_ids: [questionId] }
+      );
+    }
+
+    const numeric = typeof value === 'number' ? value : Number(String(value).trim());
+
+    if (!Number.isFinite(numeric) || numeric < MIN_QUESTION_MARKS || numeric > MAX_QUESTION_MARKS) {
+      throw new ExamAuthoringError(
+        `question_marks must be between ${MIN_QUESTION_MARKS} and ${MAX_QUESTION_MARKS}`,
+        400,
+        'VALIDATION_FAILED',
+        { invalid_question_ids: [questionId] }
+      );
+    }
+
+    marks[id] = numeric;
+  }
+
+  return marks;
+};
+
+const readExamMode = (source: AnyObject): AdmissionExamMode | null => {
+  const value = readString(source, 'exam_mode', { max: 32, required: false });
+
+  if (value === null) return null;
+
+  if (!(ADMISSION_EXAM_MODES as readonly string[]).includes(value)) {
+    throw new ExamAuthoringError(`exam_mode must be one of: ${ADMISSION_EXAM_MODES.join(', ')}`);
+  }
+
+  return value as AdmissionExamMode;
+};
+
+const readAdmissionUnitId = (source: AnyObject): string | null =>
+  readString(source, 'admission_unit_id', { max: 64, required: false });
+
+const readAdmissionUniversityId = (source: AnyObject): string | null =>
+  readString(source, 'admission_university_id', { max: 64, required: false });
+
+const readAdmissionSession = (source: AnyObject): string | null =>
+  readString(source, 'admission_session', { max: 64, required: false });
+
 const assertKnownFields = (source: AnyObject, allowed: readonly string[]): void => {
   const unknown = Object.keys(source).filter((key) => !allowed.includes(key));
 
@@ -328,21 +416,115 @@ const readSubjectId = (source: AnyObject): string | null => {
 };
 
 /**
- * Enforces the category/subject pairing on the effective paper state. A model
- * test may be full (`subject_id = NULL`); board and admission papers always
- * target one subject.
+ * Enforces the category/subject pairing on the effective paper state.
+ *
+ * A model test may be full (`subject_id = NULL`). Board exams always target one
+ * subject. Admission papers follow their mode: subject practice requires a
+ * subject, while past exams and unit model tests may span subjects.
  */
 export const assertValidExamSubject = (
   category: string | null | undefined,
-  subjectId: string | null | undefined
+  subjectId: string | null | undefined,
+  _examMode?: AdmissionExamMode | null
 ): void => {
   if (category === 'model_test') return;
+
+  if (category === 'admission') {
+    // Admission subject rules are mode-aware and enforced by
+    // assertValidAdmissionState, including legacy papers without a mode.
+    return;
+  }
 
   if (!subjectId) {
     throw new ExamAuthoringError(
       `subject_id is required for ${category || 'this category'}`,
       400,
       'VALIDATION_FAILED'
+    );
+  }
+};
+
+export interface AdmissionAuthoringState {
+  unitId: string | null | undefined;
+  universityId: string | null | undefined;
+  examMode: AdmissionExamMode | null | undefined;
+  admissionSession: string | null | undefined;
+  subjectId: string | null | undefined;
+}
+
+/**
+ * Validates the admission contract on the effective paper state.
+ *
+ * `enforce` is false for legacy admission papers being edited without touching
+ * admission fields, so a paper created before this feature (NULL unit, no
+ * exam_mode) can still have its title changed. Once an admission field is
+ * supplied, the full contract applies.
+ */
+export const assertValidAdmissionState = (
+  category: string | null | undefined,
+  state: AdmissionAuthoringState,
+  { enforce, requireMode }: { enforce: boolean; requireMode: boolean }
+): void => {
+  if (category !== 'admission') {
+    if (
+      state.unitId ||
+      state.universityId ||
+      state.examMode ||
+      state.admissionSession
+    ) {
+      throw new ExamAuthoringError(
+        'Admission fields are only allowed when category is admission'
+      );
+    }
+
+    return;
+  }
+
+  if (!enforce) {
+    if (state.examMode && state.examMode === 'past_exam' && !state.admissionSession) {
+      throw new ExamAuthoringError(
+        'admission_session is required for past exams',
+        400,
+        'ADMISSION_SESSION_REQUIRED'
+      );
+    }
+
+    return;
+  }
+
+  if (!state.unitId) {
+    throw new ExamAuthoringError(
+      'admission_unit_id is required for admission exams',
+      400,
+      'ADMISSION_UNIT_REQUIRED'
+    );
+  }
+
+  if (requireMode && !state.examMode) {
+    throw new ExamAuthoringError(
+      'exam_mode is required for admission exams',
+      400,
+      'ADMISSION_MODE_REQUIRED'
+    );
+  }
+
+  if (state.examMode && !(ADMISSION_EXAM_MODES as readonly string[]).includes(state.examMode)) {
+    throw new ExamAuthoringError(`exam_mode must be one of: ${ADMISSION_EXAM_MODES.join(', ')}`);
+  }
+
+  if (state.examMode === 'past_exam' && !state.admissionSession) {
+    throw new ExamAuthoringError(
+      'admission_session is required for past exams',
+      400,
+      'ADMISSION_SESSION_REQUIRED'
+    );
+  }
+
+  if (state.examMode === 'subject_practice' && !state.subjectId) {
+    throw new ExamAuthoringError(
+      'subject_id is required for subject practice admission exams',
+      400,
+      'ADMISSION_SUBJECT_REQUIRED'
     );
   }
 };
@@ -427,9 +609,25 @@ export const parseExamCreatePayload = (input: unknown): ExamAuthoringFields => {
   const category = readCategory(input) ?? 'model_test';
   const track = readTrack(input) ?? null;
   const subjectId = readSubjectId(input);
+  const questionMarks = readQuestionMarks(input, questionIds);
+  const admissionUnitId = readAdmissionUnitId(input);
+  const admissionUniversityId = readAdmissionUniversityId(input);
+  const examMode = readExamMode(input);
+  const admissionSession = readAdmissionSession(input);
 
   assertValidExamTrack(category, track);
-  assertValidExamSubject(category, subjectId);
+  assertValidExamSubject(category, subjectId, examMode);
+  assertValidAdmissionState(
+    category,
+    {
+      unitId: admissionUnitId,
+      universityId: admissionUniversityId,
+      examMode,
+      admissionSession,
+      subjectId,
+    },
+    { enforce: true, requireMode: true }
+  );
 
   return {
     title: readString(input, 'title', { max: 200, required: true }) as string,
@@ -457,6 +655,11 @@ export const parseExamCreatePayload = (input: unknown): ExamAuthoringFields => {
     is_premium: readBoolean(input, 'is_premium') ?? false,
     is_published: readBoolean(input, 'is_published') ?? false,
     question_ids: questionIds,
+    question_marks: questionMarks,
+    admission_unit_id: admissionUnitId,
+    admission_university_id: admissionUniversityId,
+    exam_mode: examMode,
+    admission_session: admissionSession,
   };
 };
 
@@ -484,6 +687,22 @@ export const parseExamUpdatePayload = (input: unknown): ExamAuthoringPatch => {
 
   if ('subject_id' in input) {
     patch.subject_id = readSubjectId(input);
+  }
+
+  if ('admission_unit_id' in input) {
+    patch.admission_unit_id = readAdmissionUnitId(input);
+  }
+
+  if ('admission_university_id' in input) {
+    patch.admission_university_id = readAdmissionUniversityId(input);
+  }
+
+  if ('exam_mode' in input) {
+    patch.exam_mode = readExamMode(input);
+  }
+
+  if ('admission_session' in input) {
+    patch.admission_session = readAdmissionSession(input);
   }
 
   if ('category' in input) {
@@ -561,6 +780,14 @@ export const parseExamUpdatePayload = (input: unknown): ExamAuthoringPatch => {
 
   if ('question_ids' in input) {
     patch.question_ids = readQuestionIds(input, { required: false }) ?? [];
+  }
+
+  if ('question_marks' in input) {
+    if (!Array.isArray(patch.question_ids)) {
+      throw new ExamAuthoringError('question_marks requires question_ids');
+    }
+
+    patch.question_marks = readQuestionMarks(input, patch.question_ids);
   }
 
   return patch;
