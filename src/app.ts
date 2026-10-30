@@ -27,6 +27,7 @@ import { ADMISSION_ERROR_CODES } from './features/admissions/admissions.errors';
 import { ExamUserRoutes } from './features/exams/exams.user.routes';
 import { ExamAdminRoutes } from './features/exams/exams.admin.routes';
 import { AdmissionAdminRoutes } from './features/admissions/admissions.admin.routes';
+import { AdmissionStudentRoutes } from './features/admissions/admissions.student.routes';
 import examBookmarkRoutes from './features/exams/exam.bookmark.routes';
 import systemRoutes from './features/system/system.routes'; 
 import { financeRoutes } from './features/finance/finance.routes';
@@ -118,6 +119,7 @@ app.use('/api/v1/exams/admin', ExamAdminRoutes);
 
 // University/admission unit management under the exam administration area.
 app.use('/api/v1/admin/admissions', AdmissionAdminRoutes);
+app.use('/api/v1/admissions', AdmissionStudentRoutes);
 // Existing clients call POST /api/v1/exams/bookmark; keep that path stable.
 app.use('/api/v1/exams/bookmark', examBookmarkRoutes);
 

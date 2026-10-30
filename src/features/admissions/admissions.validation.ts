@@ -3,6 +3,7 @@ import {
   ADMISSION_ERROR_CODES,
   AdmissionError,
 } from './admissions.errors';
+import { ADMISSION_PRACTICE_MAX_QUESTIONS } from './admissions.practice';
 
 const optionalText = (max: number) =>
   z.string().trim().max(max).nullable().optional();
@@ -30,6 +31,19 @@ const updateUnitSchema = z
 const unitStatusSchema = z
   .object({
     is_active: z.boolean(),
+  })
+  .strict();
+
+const practiceSchema = z
+  .object({
+    subject_id: z.string().trim().uuid('A valid subject id is required'),
+    chapter_id: z
+      .string()
+      .trim()
+      .uuid('A valid chapter id is required')
+      .nullable()
+      .optional(),
+    limit: z.number().int().min(1).max(ADMISSION_PRACTICE_MAX_QUESTIONS).optional(),
   })
   .strict();
 
@@ -125,3 +139,23 @@ export const parseUpdateAdmissionUnit = (input: unknown): UpdateAdmissionUnitInp
 
 export const parseAdmissionUnitStatus = (input: unknown): { is_active: boolean } =>
   parseOrThrow(unitStatusSchema, input, 'Invalid admission unit status');
+
+export interface AdmissionPracticeInput {
+  subject_id: string;
+  chapter_id: string | null;
+  limit?: number;
+}
+
+/**
+ * Student practice selection. Only a subject and an optional chapter are
+ * accepted; question ids are always resolved server-side from the unit pool.
+ */
+export const parseAdmissionPracticeInput = (input: unknown): AdmissionPracticeInput => {
+  const data = parseOrThrow(practiceSchema, input, 'Invalid admission practice request');
+
+  return {
+    subject_id: data.subject_id,
+    chapter_id: data.chapter_id ?? null,
+    ...(data.limit !== undefined ? { limit: data.limit } : {}),
+  };
+};
