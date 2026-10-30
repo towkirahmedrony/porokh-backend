@@ -3,12 +3,14 @@ import { ExamAttemptService } from '../exams/exam.attempt.service';
 import { ADMISSION_ERROR_CODES, AdmissionError } from './admissions.errors';
 import {
   buildUnitSubjectPool,
+  countEligibleQuestionsPerPaper,
   groupPastExams,
   resolveModelTestNo,
   resolvePaperMode,
   resolvePaperSession,
   selectModelTests,
   selectPracticeQuestionIds,
+  type AdmissionPaperQuestionLink,
   type AdmissionPaperRow,
   type AdmissionQuestionRow,
   type AdmissionSubjectPoolEntry,
@@ -109,8 +111,7 @@ const loadUnitPool = async (unitId: string): Promise<UnitPool> => {
     loadUnitPapers(unit.id),
   ]);
 
-  const questionCounts = new Map<string, number>();
-  let links: AnyObject[] = [];
+  let links: AdmissionPaperQuestionLink[] = [];
 
   if (papers.length > 0) {
     const { data, error } = await supabase
@@ -124,13 +125,6 @@ const loadUnitPool = async (unitId: string): Promise<UnitPool> => {
     if (error) throw new Error(error.message);
 
     links = data ?? [];
-  }
-
-  for (const link of links) {
-    const examId = normalizeId(link.exam_id);
-    if (!examId) continue;
-
-    questionCounts.set(examId, (questionCounts.get(examId) ?? 0) + 1);
   }
 
   const questionIds = unique(links.map((link) => link.question_id));
@@ -149,6 +143,14 @@ const loadUnitPool = async (unitId: string): Promise<UnitPool> => {
 
     questions = (data ?? []) as AdmissionQuestionRow[];
   }
+
+  // The advertised count has to be the set a started exam can serve. Question
+  // eligibility is decided by the filter used to load the rows above, so
+  // inactive, unpublished and deleted questions never inflate the number.
+  const questionCounts = countEligibleQuestionsPerPaper(
+    links,
+    questions.map((question) => question.id)
+  );
 
   const pool = buildUnitSubjectPool(questions);
   const subjectIds = [...pool.keys()];

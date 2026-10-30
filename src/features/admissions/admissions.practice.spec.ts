@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   ADMISSION_PRACTICE_MAX_QUESTIONS,
   buildUnitSubjectPool,
+  countEligibleQuestionsPerPaper,
   groupPastExams,
   resolvePaperMode,
   resolvePaperSession,
@@ -151,4 +152,21 @@ test('practice selection is capped by the request and by the hard maximum', () =
     }).length,
     3
   );
+});
+
+test('paper question counts include only questions a started exam can serve', () => {
+  const links = [
+    { exam_id: 'p1', question_id: 'q1' },
+    { exam_id: 'p1', question_id: 'q2' },
+    { exam_id: 'p1', question_id: 'q3' },
+    { exam_id: 'p1', question_id: 'q2' },
+    { exam_id: 'p2', question_id: 'q3' },
+    { exam_id: 'p2', question_id: null },
+  ];
+
+  const counts = countEligibleQuestionsPerPaper(links, ['q1', 'q2']);
+
+  assert.equal(counts.get('p1'), 2, 'ineligible links must not be counted');
+  assert.equal(counts.get('p2'), 0);
+  assert.equal(counts.has('missing'), false);
 });

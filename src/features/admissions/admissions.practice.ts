@@ -242,6 +242,55 @@ export const buildUnitSubjectPool = (
   return pool;
 };
 
+export interface AdmissionPaperQuestionLink {
+  exam_id: string | null;
+  question_id: string | null;
+}
+
+/**
+ * Eligible question count per paper.
+ *
+ * A paper's advertised count must describe the questions a started exam can
+ * actually serve. Links to questions that are inactive, unpublished or deleted
+ * (absent from `eligibleQuestionIds`) are not counted, and a question linked
+ * twice to one paper is counted once. Exam assignment and grading are
+ * unaffected: this only derives the number shown before an attempt starts.
+ */
+export const countEligibleQuestionsPerPaper = (
+  links: AdmissionPaperQuestionLink[],
+  eligibleQuestionIds: Iterable<string>
+): Map<string, number> => {
+  const eligible = new Set(
+    Array.from(eligibleQuestionIds, (id) => cleanString(id)).filter(
+      (id): id is string => Boolean(id)
+    )
+  );
+
+  const counts = new Map<string, number>();
+  const seen = new Map<string, Set<string>>();
+
+  for (const link of links) {
+    const examId = cleanString(link.exam_id);
+
+    if (!examId) continue;
+    if (!counts.has(examId)) counts.set(examId, 0);
+
+    const questionId = cleanString(link.question_id);
+
+    if (!questionId || !eligible.has(questionId)) continue;
+
+    const paperSeen = seen.get(examId) ?? new Set<string>();
+
+    if (paperSeen.has(questionId)) continue;
+
+    paperSeen.add(questionId);
+    seen.set(examId, paperSeen);
+    counts.set(examId, (counts.get(examId) ?? 0) + 1);
+  }
+
+  return counts;
+};
+
 const shuffle = <T>(items: T[]): T[] => {
   const copy = items.slice();
 

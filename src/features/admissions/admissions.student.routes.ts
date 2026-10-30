@@ -16,9 +16,18 @@ const practiceLimit = rateLimit({
   keyPrefix: 'admission-practice',
 });
 
+// Unit content is read-only and normally fetched once per navigation. A
+// generous per-user ceiling stops catalog scraping without interfering with
+// pull-to-refresh, retries or a few open tabs.
+const contentLimit = rateLimit({
+  windowMs: 60_000,
+  max: 120,
+  keyPrefix: 'admission-content',
+});
+
 router.use(requireAuth);
 
-router.get('/units/:unitId/content', getUnitContent);
+router.get('/units/:unitId/content', contentLimit, getUnitContent);
 router.post('/units/:unitId/practice', practiceLimit, startSubjectPractice);
 
 export const AdmissionStudentRoutes = router;
