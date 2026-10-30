@@ -2,6 +2,10 @@ import { Request, Response, NextFunction } from 'express';
 import { supabase } from '../config/supabase';
 import sendResponse from '../lib/utils/response';
 import jwt from 'jsonwebtoken';
+import {
+  beginSubmissionPhase,
+  measureSupabaseOperation,
+} from '../features/exams/examSubmissionPerformance';
 
 export interface AuthReq extends Request {
   user?: {
@@ -13,6 +17,7 @@ export interface AuthReq extends Request {
 
 // export default সরিয়ে export const করা হলো (Named Export)
 export const requireAuth = async (req: AuthReq, res: Response, next: NextFunction) => {
+  const endAuthenticationPhase = beginSubmissionPhase(req.submissionPerformance, 'authentication');
   try {
     const authHeader = req.headers.authorization;
 
@@ -22,17 +27,25 @@ export const requireAuth = async (req: AuthReq, res: Response, next: NextFunctio
 
     const token = authHeader.split(' ')[1];
 
-    const { data: { user }, error } = await supabase.auth.getUser(token);
+    const { data: { user }, error } = await measureSupabaseOperation(
+      req.submissionPerformance,
+      'auth.get_user',
+      () => supabase.auth.getUser(token)
+    );
 
     if (error || !user) {
       return sendResponse(res, { statusCode: 401, success: false, message: 'Unauthorized: Invalid or expired token' });
     }
 
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('account_status')
-      .eq('id', user.id)
-      .maybeSingle();
+    const { data: profile, error: profileError } = await measureSupabaseOperation(
+      req.submissionPerformance,
+      'profiles.read_account_status',
+      () => supabase
+        .from('profiles')
+        .select('account_status')
+        .eq('id', user.id)
+        .maybeSingle()
+    );
 
     if (profileError) {
       return sendResponse(res, { statusCode: 503, success: false, message: 'Account status could not be verified' });
@@ -56,9 +69,12 @@ export const requireAuth = async (req: AuthReq, res: Response, next: NextFunctio
       ? claims.session_id
       : undefined;
     
+    endAuthenticationPhase();
     next();
   } catch {
     console.error('Authentication verification failed');
     return sendResponse(res, { statusCode: 500, success: false, message: 'Internal Server Error during authentication' });
+  } finally {
+    endAuthenticationPhase();
   }
 };

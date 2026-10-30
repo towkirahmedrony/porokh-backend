@@ -19,6 +19,10 @@ import {
 } from './exams.user.controller';
 import { requireAuth } from '../../middlewares/requireAuth';
 import { rateLimit } from '../../middlewares/rateLimit';
+import {
+  submissionPerformanceMiddleware,
+  submissionRequestIdMiddleware,
+} from './examSubmissionPerformance';
 
 const router = Router();
 
@@ -57,8 +61,17 @@ router.get('/result/:id', requireAuth, getExamResult);
 // Retired legacy route: client-supplied scores are no longer accepted (410).
 router.post('/history', requireAuth, submissionLimit, submitHistory);
 
-// Main secure submit route (requires a server-issued attempt id / exam attempt)
-router.post('/submit', requireAuth, submissionLimit, submitExam);
+// Main secure submit route (requires a server-issued attempt id / exam attempt).
+// The ID/timing context is attached before auth; the original auth-before-limit
+// order is preserved. Detailed logging starts only after the limiter passes.
+router.post(
+  '/submit',
+  submissionRequestIdMiddleware,
+  requireAuth,
+  submissionLimit,
+  submissionPerformanceMiddleware,
+  submitExam
+);
 
 router.post('/group-battle', requireAuth, submissionLimit, createGroupBattle);
 

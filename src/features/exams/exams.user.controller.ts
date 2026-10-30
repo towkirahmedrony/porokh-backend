@@ -3,6 +3,7 @@ import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response';
 import { ExamUserService } from './exams.user.service';
 import { ExamAttemptError, ExamAttemptService } from './exam.attempt.service';
+import { measureSubmissionPhaseSync } from './examSubmissionPerformance';
 import { ExamPracticeService } from './exam.practice.service';
 import { incrementStreakOnExamSubmit } from '../growth/streak.service';
 import { awardGroupXpToActiveGroups } from '../groups/groups.xp';
@@ -232,7 +233,7 @@ export const submitExam = catchAsync(async (req: Request, res: Response) => {
   const result = await ExamUserService.submitExamResult({
     ...req.body,
     user_id: userId,
-  });
+  }, req.submissionPerformance);
 
   // A duplicate submission is not a new study event and must not extend the
   // user's streak. The result is already persisted at this point, so a streak
@@ -257,12 +258,14 @@ export const submitExam = catchAsync(async (req: Request, res: Response) => {
     }
   }
 
-  sendResponse(res, {
-    statusCode: 200,
-    success: true,
-    message: 'Exam submitted',
-    data: result,
-  });
+  measureSubmissionPhaseSync(req.submissionPerformance, 'final_response_generation', () =>
+    sendResponse(res, {
+      statusCode: 200,
+      success: true,
+      message: 'Exam submitted',
+      data: result,
+    })
+  );
 });
 
 export const getExamResult = catchAsync(async (req: Request, res: Response) => {

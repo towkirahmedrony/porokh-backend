@@ -12,6 +12,12 @@ import {
   normalizeOptionId,
   optionDisplayText,
 } from './exam.grading';
+import {
+  beginSubmissionPhase,
+  measureSubmissionPhase,
+  measureSupabaseOperation,
+  type SubmissionPerformanceTrace,
+} from './examSubmissionPerformance';
 
 type AnyObject = Record<string, any>;
 
@@ -28,16 +34,16 @@ type SubmitExamPayload = {
 const XP_RULES_CACHE_TTL_MS = 60_000;
 let xpRulesCache: { rules: AnyObject; expiresAt: number } | null = null;
 
-const loadXpRules = async (): Promise<AnyObject> => {
+const loadXpRules = async (trace?: SubmissionPerformanceTrace): Promise<AnyObject> => {
   if (xpRulesCache && xpRulesCache.expiresAt > Date.now()) {
     return xpRulesCache.rules;
   }
 
-  const { data } = await supabase
+  const { data } = await measureSupabaseOperation(trace, 'app_configs.load_xp_rules', () => supabase
     .from('app_configs')
     .select('value')
     .eq('key', 'xp_rules')
-    .maybeSingle();
+    .maybeSingle());
 
   const rules = (data?.value as AnyObject) || {};
   xpRulesCache = { rules, expiresAt: Date.now() + XP_RULES_CACHE_TTL_MS };
@@ -47,9 +53,10 @@ const loadXpRules = async (): Promise<AnyObject> => {
 
 export const calculateExamXP = async (
   correctCount: number,
-  totalQuestions: number
+  totalQuestions: number,
+  trace?: SubmissionPerformanceTrace
 ): Promise<number> => {
-  const rules = await loadXpRules();
+  const rules = await loadXpRules(trace);
 
   let xp = 20;
   const perCorrect = Number(rules.per_correct_answer || 5);
@@ -144,13 +151,20 @@ const clampQuestionLimit = (value: unknown, fallback = 10): number => {
  * Question ids that belong to an exam paper. Used to stop an untracked practice
  * submission from harvesting the answer key of live/upcoming exam questions.
  */
-const findExamPaperQuestionIds = async (questionIds: string[]): Promise<string[]> => {
+const findExamPaperQuestionIds = async (
+  questionIds: string[],
+  trace?: SubmissionPerformanceTrace
+): Promise<string[]> => {
   if (questionIds.length === 0) return [];
 
-  const { data, error } = await supabase
-    .from('exam_paper_questions')
-    .select('question_id')
-    .in('question_id', questionIds);
+  const { data, error } = await measureSupabaseOperation(
+    trace,
+    'exam_paper_questions.check_practice_submission',
+    () => supabase
+      .from('exam_paper_questions')
+      .select('question_id')
+      .in('question_id', questionIds)
+  );
 
   if (error) throw new Error(error.message);
 
@@ -818,7 +832,10 @@ export class ExamUserService {
     );
   }
 
-  static async submitExamResult(payload: SubmitExamPayload) {
+  static async submitExamResult(
+    payload: SubmitExamPayload,
+    trace?: SubmissionPerformanceTrace
+  ) {
     const { session_id, user_id, attempt_id } = payload;
 
     if (!user_id) throw new ExamAttemptError('Unauthorized', 401);
@@ -836,13 +853,14 @@ export class ExamUserService {
     // Resolve the authoritative attempt. An exam submission must reuse an
     // attempt the server already started; a server-issued attempt id wins.
     let attempt: AnyObject | null = null;
+    const endAttemptReadPhase = beginSubmissionPhase(trace, 'attempt_reads');
 
     try {
       if (normalizedAttemptId) {
-        attempt = await ExamAttemptService.getAttempt(user_id, normalizedAttemptId);
+        attempt = await ExamAttemptService.getAttempt(user_id, normalizedAttemptId, trace);
         if (!attempt) throw new ExamAttemptError('Attempt not found', 404);
       } else if (normalizedExamId) {
-        attempt = await ExamAttemptService.findActiveExamAttempt(user_id, normalizedExamId);
+        attempt = await ExamAttemptService.findActiveExamAttempt(user_id, normalizedExamId, trace);
         if (!attempt) {
           throw new ExamAttemptError(
             'An exam attempt must be started before submitting',
@@ -861,6 +879,8 @@ export class ExamUserService {
       }
 
       throw error;
+    } finally {
+      endAttemptReadPhase();
     }
 
     // Untracked practice submissions (no exam paper, no attempt) keep feedback
@@ -903,7 +923,7 @@ export class ExamUserService {
       // An untracked submission has no attempt-scoped question set, so it must
       // not be usable to grade (and therefore reveal the key of) questions that
       // belong to an exam paper. This runs before any grading or response.
-      const examQuestionIds = await findExamPaperQuestionIds(requestedQuestionIds);
+      const examQuestionIds = await findExamPaperQuestionIds(requestedQuestionIds, trace);
 
       if (examQuestionIds.length > 0) {
         throw new ExamAttemptError(
@@ -940,15 +960,19 @@ export class ExamUserService {
 
     if (attempt) {
       historyId = crypto.randomUUID();
+      const claimHistoryId = historyId;
 
       const claim = await ExamAttemptService.claimAttemptForSubmission(
         user_id,
         attempt.id,
-        historyId
+        claimHistoryId,
+        trace
       );
 
       if (!claim.claimed) {
-        const existing = await ExamAttemptService.findHistoryByAttempt(attempt.id);
+        const existing = await measureSupabaseOperation(trace, 'exam_history.find_by_attempt', () =>
+          ExamAttemptService.findHistoryByAttempt(attempt.id)
+        );
 
         if (existing) {
           return ExamUserService.buildDuplicateSubmissionResponse(user_id, attempt.id, existing.id);
@@ -968,19 +992,31 @@ export class ExamUserService {
     let examTitle = 'Exam';
 
     if (examId) {
-      const { data: examData, error: examError } = await supabase
-        .from('exam_papers')
-        .select('id, title, title_en, default_negative_marks, total_marks, result_publish_time, is_published')
-        .eq('id', examId)
-        .maybeSingle();
+      const { data: examData, error: examError } = await measureSubmissionPhase(
+        trace,
+        'exam_metadata_retrieval',
+        () => measureSupabaseOperation(trace, 'exam_papers.read_submission_metadata', () => supabase
+          .from('exam_papers')
+          .select('id, title, title_en, default_negative_marks, total_marks, result_publish_time, is_published')
+          .eq('id', examId)
+          .maybeSingle())
+      );
 
       if (examError) {
-        if (attempt && historyId) await ExamAttemptService.releaseClaim(attempt.id);
+        if (attempt && historyId) {
+          await measureSupabaseOperation(trace, 'exam_progress.release_claim', () =>
+            ExamAttemptService.releaseClaim(attempt.id)
+          );
+        }
         throw new Error(examError.message);
       }
 
       if (!examData || examData.is_published !== true) {
-        if (attempt && historyId) await ExamAttemptService.releaseClaim(attempt.id);
+        if (attempt && historyId) {
+          await measureSupabaseOperation(trace, 'exam_progress.release_claim', () =>
+            ExamAttemptService.releaseClaim(attempt.id)
+          );
+        }
         throw new ExamAttemptError(
           examData ? 'Exam is not available' : 'Exam not found',
           examData ? 403 : 404,
@@ -998,13 +1034,21 @@ export class ExamUserService {
     const questionConfig = new Map<string, QuestionMarkConfig>();
 
     if (examId) {
-      const { data: configRows, error: configError } = await supabase
-        .from('exam_paper_questions')
-        .select('question_id, marks, negative_marks')
-        .eq('exam_id', examId);
+      const { data: configRows, error: configError } = await measureSubmissionPhase(
+        trace,
+        'question_configuration_retrieval',
+        () => measureSupabaseOperation(trace, 'exam_paper_questions.read_marks', () => supabase
+          .from('exam_paper_questions')
+          .select('question_id, marks, negative_marks')
+          .eq('exam_id', examId))
+      );
 
       if (configError) {
-        if (attempt && historyId) await ExamAttemptService.releaseClaim(attempt.id);
+        if (attempt && historyId) {
+          await measureSupabaseOperation(trace, 'exam_progress.release_claim', () =>
+            ExamAttemptService.releaseClaim(attempt.id)
+          );
+        }
         throw new Error(configError.message);
       }
 
@@ -1018,19 +1062,28 @@ export class ExamUserService {
       });
     }
 
-    const { data: questions, error: questionsError } = await supabase
-      .from('questions')
-      .select(EXAM_REVIEW_QUESTION_SELECT_QUERY)
-      .in('id', questionIds)
-      .eq('is_active', true)
-      .eq('status', 'published')
-      .is('deleted_at', null);
+    const { data: questions, error: questionsError } = await measureSupabaseOperation(
+      trace,
+      'questions.read_for_submission',
+      () => supabase
+        .from('questions')
+        .select(EXAM_REVIEW_QUESTION_SELECT_QUERY)
+        .in('id', questionIds)
+        .eq('is_active', true)
+        .eq('status', 'published')
+        .is('deleted_at', null)
+    );
 
     if (questionsError) {
-      if (attempt && historyId) await ExamAttemptService.releaseClaim(attempt.id);
+      if (attempt && historyId) {
+        await measureSupabaseOperation(trace, 'exam_progress.release_claim', () =>
+          ExamAttemptService.releaseClaim(attempt.id)
+        );
+      }
       throw new Error(questionsError.message);
     }
 
+    const endAnswerEvaluation = beginSubmissionPhase(trace, 'answer_evaluation');
     const questionMap = new Map<string, AnyObject>();
     (questions || []).forEach((q: AnyObject) => {
       questionMap.set(normalizeId(q.id), q);
@@ -1163,6 +1216,7 @@ export class ExamUserService {
         includeCorrectAnswers: revealKeys,
       }
     );
+    endAnswerEvaluation();
 
     // Timing is derived from the persisted attempt when there is one. Practice
     // submissions have no server-side start, so the reported duration is used
@@ -1208,11 +1262,15 @@ export class ExamUserService {
     // submission key (practice) so a duplicate can only observe one record.
     if (historyId) resultPayload.id = historyId;
 
-    const { data: result, error: submitError } = await supabase
-      .from('exam_history')
-      .insert([resultPayload])
-      .select()
-      .single();
+    const { data: result, error: submitError } = await measureSubmissionPhase(
+      trace,
+      'database_history_insert',
+      () => measureSupabaseOperation(trace, 'exam_history.insert_result', () => supabase
+        .from('exam_history')
+        .insert([resultPayload])
+        .select()
+        .single())
+    );
 
     if (submitError) {
       // A duplicate submission (concurrent request, retry, or a response lost
@@ -1220,15 +1278,19 @@ export class ExamUserService {
       // that authoritative result instead of creating a second one.
       if ((submitError as AnyObject).code === '23505') {
         const existing = attempt
-          ? await ExamAttemptService.findHistoryByAttempt(attempt.id)
+          ? await measureSupabaseOperation(trace, 'exam_history.find_by_attempt', () =>
+              ExamAttemptService.findHistoryByAttempt(attempt.id)
+            )
           : historyId
             ? (
-                await supabase
-                  .from('exam_history')
-                  .select('id, user_id')
-                  .eq('id', historyId)
-                  .eq('user_id', user_id)
-                  .maybeSingle()
+                await measureSupabaseOperation(trace, 'exam_history.find_duplicate_by_id', () =>
+                  supabase
+                    .from('exam_history')
+                    .select('id, user_id')
+                    .eq('id', historyId)
+                    .eq('user_id', user_id)
+                    .maybeSingle()
+                )
               ).data
             : null;
 
@@ -1241,7 +1303,11 @@ export class ExamUserService {
         }
       }
 
-      if (attempt) await ExamAttemptService.releaseClaim(attempt.id);
+      if (attempt) {
+        await measureSupabaseOperation(trace, 'exam_progress.release_claim', () =>
+          ExamAttemptService.releaseClaim(attempt.id)
+        );
+      }
 
       if (isSchemaDriftError(submitError)) {
         throw new ExamAttemptError(
@@ -1254,7 +1320,11 @@ export class ExamUserService {
     }
 
     if (!result?.id) {
-      if (attempt) await ExamAttemptService.releaseClaim(attempt.id);
+      if (attempt) {
+        await measureSupabaseOperation(trace, 'exam_progress.release_claim', () =>
+          ExamAttemptService.releaseClaim(attempt.id)
+        );
+      }
       throw new Error('Failed to persist exam result');
     }
 
@@ -1285,9 +1355,17 @@ export class ExamUserService {
     // them instead of paying for two serial round trips.
     const [detailsResult, earnedXP] = await Promise.all([
       detailRows.length > 0
-        ? supabase.from('exam_history_details').insert(detailRows)
+        ? measureSubmissionPhase(trace, 'database_detail_insert', () =>
+            measureSupabaseOperation(trace, 'exam_history_details.insert_rows', () =>
+              supabase.from('exam_history_details').insert(detailRows)
+            )
+          )
         : Promise.resolve({ error: null }),
-      xpEligible ? calculateExamXP(correct, totalQuestions) : Promise.resolve(0),
+      xpEligible
+        ? measureSubmissionPhase(trace, 'xp_calculation', () =>
+            calculateExamXP(correct, totalQuestions, trace)
+          )
+        : Promise.resolve(0),
     ]);
 
     if (detailsResult.error) {
@@ -1296,11 +1374,17 @@ export class ExamUserService {
     let xpAwarded = false;
 
     if (earnedXP > 0) {
-      const { error: progressError } = await supabase.rpc('update_user_progress', {
-        p_user_id: user_id,
-        p_coins: 0,
-        p_xp: earnedXP,
-      });
+      const { error: progressError } = await measureSubmissionPhase(
+        trace,
+        'xp_update',
+        () => measureSupabaseOperation(trace, 'rpc.update_user_progress', () =>
+          supabase.rpc('update_user_progress', {
+            p_user_id: user_id,
+            p_coins: 0,
+            p_xp: earnedXP,
+          })
+        )
+      );
 
       if (progressError) {
         // The attempt is already claimed and its single history row exists, so
@@ -1314,7 +1398,11 @@ export class ExamUserService {
     if (attempt) {
       // Record only XP that was actually persisted, so the audit column never
       // claims a reward the user did not receive.
-      await ExamAttemptService.finalizeAttempt(attempt.id, historyId, xpAwarded ? earnedXP : 0);
+      await measureSubmissionPhase(trace, 'attempt_finalization', () =>
+        measureSupabaseOperation(trace, 'exam_progress.finalize_attempt', () =>
+          ExamAttemptService.finalizeAttempt(attempt.id, historyId, xpAwarded ? earnedXP : 0)
+        )
+      );
     }
 
     if (xpAwarded && earnedXP > 0) {

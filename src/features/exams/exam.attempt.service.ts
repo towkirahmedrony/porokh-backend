@@ -2,6 +2,11 @@ import { randomUUID } from 'crypto';
 import { supabase } from '../../config/supabase';
 import { notifyQuotaExhausted } from '../notifications/notifications.service';
 import {
+  measureSubmissionPhase,
+  measureSupabaseOperation,
+  type SubmissionPerformanceTrace,
+} from './examSubmissionPerformance';
+import {
   ATTEMPT_KIND,
   ATTEMPT_STATUS,
   checkExamWindow,
@@ -190,32 +195,48 @@ export const loadPracticeDurationMinutes = async (): Promise<number | null> => {
 };
 
 export class ExamAttemptService {
-  static async getAttempt(userId: string, attemptId: string) {
+  static async getAttempt(
+    userId: string,
+    attemptId: string,
+    trace?: SubmissionPerformanceTrace
+  ) {
     const normalizedAttemptId = normalizeId(attemptId);
 
     if (!userId) throw new ExamAttemptError('Unauthorized', 401);
     if (!normalizedAttemptId) throw new ExamAttemptError('Attempt id is required', 400);
 
-    const { data, error } = await supabase
-      .from('exam_progress')
-      .select(ATTEMPT_SELECT)
-      .eq('id', normalizedAttemptId)
-      .eq('user_id', userId)
-      .maybeSingle();
+    const { data, error } = await measureSupabaseOperation(
+      trace,
+      'exam_progress.get_attempt',
+      () => supabase
+        .from('exam_progress')
+        .select(ATTEMPT_SELECT)
+        .eq('id', normalizedAttemptId)
+        .eq('user_id', userId)
+        .maybeSingle()
+    );
 
     if (error) throw new Error(error.message);
 
     return data ?? null;
   }
 
-  static async findActiveExamAttempt(userId: string, examId: string) {
-    const { data, error } = await supabase
-      .from('exam_progress')
-      .select(ATTEMPT_SELECT)
-      .eq('user_id', userId)
-      .eq('exam_id', normalizeId(examId))
-      .eq('status', ATTEMPT_STATUS.IN_PROGRESS)
-      .maybeSingle();
+  static async findActiveExamAttempt(
+    userId: string,
+    examId: string,
+    trace?: SubmissionPerformanceTrace
+  ) {
+    const { data, error } = await measureSupabaseOperation(
+      trace,
+      'exam_progress.find_active_attempt',
+      () => supabase
+        .from('exam_progress')
+        .select(ATTEMPT_SELECT)
+        .eq('user_id', userId)
+        .eq('exam_id', normalizeId(examId))
+        .eq('status', ATTEMPT_STATUS.IN_PROGRESS)
+        .maybeSingle()
+    );
 
     if (error) throw new Error(error.message);
 
@@ -240,13 +261,16 @@ export class ExamAttemptService {
     return data ?? null;
   }
 
-  static async expireAttempt(attemptId: string): Promise<void> {
+  static async expireAttempt(
+    attemptId: string,
+    trace?: SubmissionPerformanceTrace
+  ): Promise<void> {
     try {
-      await supabase
+      await measureSupabaseOperation(trace, 'exam_progress.expire_attempt', () => supabase
         .from('exam_progress')
         .update({ status: ATTEMPT_STATUS.EXPIRED, last_updated_at: new Date().toISOString() })
         .eq('id', attemptId)
-        .eq('status', ATTEMPT_STATUS.IN_PROGRESS);
+        .eq('status', ATTEMPT_STATUS.IN_PROGRESS));
     } catch {
       // Best effort: the authoritative deadline still blocks further use.
     }
@@ -592,9 +616,12 @@ export class ExamAttemptService {
   static async claimAttemptForSubmission(
     userId: string,
     attemptId: string,
-    examHistoryId: string
+    examHistoryId: string,
+    trace?: SubmissionPerformanceTrace
   ): Promise<{ attempt: AnyObject; claimed: boolean }> {
-    const attempt = await ExamAttemptService.getAttempt(userId, attemptId);
+    const attempt = await measureSubmissionPhase(trace, 'attempt_reads', () =>
+      ExamAttemptService.getAttempt(userId, attemptId, trace)
+    );
 
     if (!attempt) throw new ExamAttemptError('Attempt not found', 404);
 
@@ -610,7 +637,7 @@ export class ExamAttemptService {
     // `isAttemptExpired` is inclusive at the boundary; subtracting the grace is
     // exactly the same instant the database filter compares against below.
     if (!untimed && isAttemptExpired(attempt.deadline_at, now - graceMs)) {
-      await ExamAttemptService.expireAttempt(attempt.id);
+      await ExamAttemptService.expireAttempt(attempt.id, trace);
 
       return { attempt: { ...attempt, status: ATTEMPT_STATUS.EXPIRED }, claimed: false };
     }
@@ -631,12 +658,22 @@ export class ExamAttemptService {
       updateQuery = updateQuery.gt('deadline_at', toIso(now - graceMs));
     }
 
-    const { data, error } = await updateQuery.select(ATTEMPT_SELECT);
+    const { data, error } = await measureSubmissionPhase(
+      trace,
+      'atomic_attempt_claim',
+      () => measureSupabaseOperation(
+        trace,
+        'exam_progress.claim_attempt',
+        () => updateQuery.select(ATTEMPT_SELECT)
+      )
+    );
 
     if (error) throw new Error(error.message);
 
     if (!data || data.length === 0) {
-      const latest = await ExamAttemptService.getAttempt(userId, attemptId);
+      const latest = await measureSubmissionPhase(trace, 'attempt_reads', () =>
+        ExamAttemptService.getAttempt(userId, attemptId, trace)
+      );
 
       return { attempt: latest ?? { ...attempt, status: ATTEMPT_STATUS.SUBMITTED }, claimed: false };
     }
