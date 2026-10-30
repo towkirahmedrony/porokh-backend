@@ -5,14 +5,17 @@ import logger from '../../lib/utils/logger';
 import { AutoFetchDTO, PunishUserDTO } from './exams.types';
 import { ATTEMPT_STATUS, MINUTE_MS } from './exam.timing';
 import {
+  ADMISSION_EXAM_MODES,
   EXAM_AUTHORING_CATEGORIES,
   MODEL_TEST_TRACKS,
   ExamAuthoringError,
+  assertValidAdmissionState,
   assertValidExamSubject,
   assertValidExamTrack,
   assertValidExamWindow,
   parseExamCreatePayload,
   parseExamUpdatePayload,
+  type AdmissionExamMode,
   type ExamAuthoringFields,
   type ExamAuthoringPatch,
 } from './exam.authoring';
@@ -77,6 +80,7 @@ const PAPER_AUTHORED_COLUMNS = [
   'default_negative_marks',
   'show_leaderboard',
   'is_premium',
+  'admission_unit_id',
 ] as const;
 
 /**
@@ -84,10 +88,13 @@ const PAPER_AUTHORED_COLUMNS = [
  * and have them graded: active, not deleted, and published (the submission path
  * filters on `status = 'published'`, so anything else would be ungradeable).
  */
-const requireEligibleQuestions = async (questionIds: string[]): Promise<string[]> => {
+const requireEligibleQuestions = async (
+  questionIds: string[],
+  { subjectId }: { subjectId?: string | null } = {}
+): Promise<string[]> => {
   const { data, error } = await supabase
     .from('questions')
-    .select('id, status, is_active, deleted_at')
+    .select('id, status, is_active, deleted_at, subject_id')
     .in('id', questionIds);
 
   if (error) throw new Error(error.message);
@@ -104,14 +111,25 @@ const requireEligibleQuestions = async (questionIds: string[]): Promise<string[]
     return !(row.is_active === true && row.status === 'published' && (row.deleted_at ?? null) === null);
   });
 
-  if (missing.length > 0 || ineligible.length > 0) {
+  const incompatibleSubject = subjectId
+    ? questionIds.filter((questionId) => {
+        const row = byId.get(questionId);
+
+        return row ? String(row.subject_id ?? '') !== subjectId : false;
+      })
+    : [];
+
+  if (missing.length > 0 || ineligible.length > 0 || incompatibleSubject.length > 0) {
     throw new ExamAuthoringError(
-      'One or more questions are not available for an exam',
+      incompatibleSubject.length > 0
+        ? 'Every question must belong to the selected subject'
+        : 'One or more questions are not available for an exam',
       400,
       'VALIDATION_FAILED',
       {
         missing_question_ids: missing.slice(0, 25),
         ineligible_question_ids: ineligible.slice(0, 25),
+        incompatible_subject_question_ids: incompatibleSubject.slice(0, 25),
       }
     );
   }
@@ -129,6 +147,119 @@ const assertSubjectExists = async (subjectId: string): Promise<void> => {
   if (error) throw new Error(error.message);
   if (!data) throw new ExamAuthoringError('Subject not found');
 };
+
+/**
+ * Resolves an admission unit and verifies its institution is a university.
+ * When the wizard also sends the selected university, the unit must belong to
+ * it. The university is deliberately not persisted: the unit owns that
+ * relationship in the database.
+ */
+const assertAdmissionUnit = async (
+  unitId: string,
+  universityId?: string | null
+): Promise<{ unitId: string; universityId: string }> => {
+  const { data: unit, error } = await supabase
+    .from('admission_units')
+    .select('id, institution_id')
+    .eq('id', unitId)
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
+
+  if (!unit) {
+    throw new ExamAuthoringError(
+      'Admission unit not found',
+      400,
+      'ADMISSION_UNIT_NOT_FOUND'
+    );
+  }
+
+  const unitUniversityId = String(unit.institution_id ?? '');
+
+  if (universityId && unitUniversityId !== universityId) {
+    throw new ExamAuthoringError(
+      'The selected unit does not belong to the selected university',
+      400,
+      'ADMISSION_UNIT_MISMATCH'
+    );
+  }
+
+  const { data: institution, error: institutionError } = await supabase
+    .from('institutions')
+    .select('id, type')
+    .eq('id', unitUniversityId)
+    .maybeSingle();
+
+  if (institutionError) throw new Error(institutionError.message);
+
+  if (!institution || institution.type !== 'university') {
+    throw new ExamAuthoringError(
+      'The selected admission unit is not attached to a university',
+      400,
+      'ADMISSION_UNIT_INVALID_UNIVERSITY'
+    );
+  }
+
+  return { unitId, universityId: unitUniversityId };
+};
+
+const readMetadataObject = (value: unknown): AnyObject =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...(value as AnyObject) }
+    : {};
+
+const readMetadataString = (value: unknown, key: string): string | null => {
+  const metadata = readMetadataObject(value);
+  const raw = metadata[key];
+
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+};
+
+const readMetadataExamMode = (value: unknown): AdmissionExamMode | null => {
+  const mode = readMetadataString(value, 'exam_mode');
+
+  return mode && (ADMISSION_EXAM_MODES as readonly string[]).includes(mode)
+    ? (mode as AdmissionExamMode)
+    : null;
+};
+
+/**
+ * Merges canonical admission keys into existing metadata. Legacy keys used by
+ * the student adapter are preserved untouched.
+ */
+const buildAdmissionMetadata = (
+  existing: unknown,
+  category: string,
+  mode: AdmissionExamMode | null,
+  session: string | null
+): AnyObject | null => {
+  const metadata = readMetadataObject(existing);
+
+  if (category === 'admission') {
+    if (mode) metadata.exam_mode = mode;
+    else delete metadata.exam_mode;
+
+    if (session) metadata.admission_session = session;
+    else delete metadata.admission_session;
+
+    return metadata;
+  }
+
+  // Leaving admission must not leave a stale unit relationship behind, but all
+  // unrelated/legacy metadata keys stay intact.
+  delete metadata.exam_mode;
+  delete metadata.admission_session;
+
+  return Object.keys(metadata).length > 0 ? metadata : null;
+};
+
+const marksForQuestions = (
+  questionIds: string[],
+  questionMarks: Record<string, number> | null | undefined
+): number[] => questionIds.map((questionId) => questionMarks?.[questionId] ?? 1);
+
+const totalForMarks = (marks: number[]): number =>
+  marks.reduce((total, mark) => total + mark, 0);
 
 const countExamQuestions = async (examId: string): Promise<number> => {
   const { count, error } = await supabase
@@ -205,8 +336,22 @@ export class ExamAdminService {
     if (error) throw new Error(error.message);
     if (!data) throw new Error('Exam not found');
 
+    let admissionUniversityId: string | null = null;
+
+    if (data.admission_unit_id) {
+      const { data: unit, error: unitError } = await supabase
+        .from('admission_units')
+        .select('institution_id')
+        .eq('id', data.admission_unit_id)
+        .maybeSingle();
+
+      if (unitError) throw new Error(unitError.message);
+      admissionUniversityId = unit?.institution_id ?? null;
+    }
+
     return {
       ...data,
+      admission_university_id: admissionUniversityId,
       question_count: await countExamQuestions(id),
       has_attempts: await examHasAttempts(id),
     };
@@ -304,6 +449,7 @@ export class ExamAdminService {
       })),
       categories: [...EXAM_AUTHORING_CATEGORIES],
       tracks: [...MODEL_TEST_TRACKS],
+      admission_modes: [...ADMISSION_EXAM_MODES],
     };
   }
 
@@ -371,7 +517,31 @@ export class ExamAdminService {
 
     if (parsed.subject_id) await assertSubjectExists(parsed.subject_id);
 
-    const questionIds = await requireEligibleQuestions(parsed.question_ids);
+    const admission =
+      parsed.category === 'admission'
+        ? await assertAdmissionUnit(
+            parsed.admission_unit_id as string,
+            parsed.admission_university_id
+          )
+        : null;
+
+    const questionIds = await requireEligibleQuestions(parsed.question_ids, {
+      subjectId:
+        parsed.category === 'admission' && parsed.exam_mode === 'subject_practice'
+          ? parsed.subject_id
+          : null,
+    });
+    const questionMarks = marksForQuestions(questionIds, parsed.question_marks);
+    const totalMarks = totalForMarks(questionMarks);
+    const metadata =
+      parsed.category === 'admission'
+        ? buildAdmissionMetadata(
+            null,
+            parsed.category,
+            parsed.exam_mode,
+            parsed.admission_session
+          )
+        : null;
     const paperId = randomUUID();
 
     const paperRow: AnyObject = {
@@ -390,13 +560,15 @@ export class ExamAdminService {
       instructions_en: parsed.instructions_en,
       syllabus_details: parsed.syllabus_details,
       syllabus_details_en: parsed.syllabus_details_en,
-      // Derived server-side: one mark per question.
-      total_marks: questionIds.length,
-      pass_mark: Math.min(parsed.pass_mark, questionIds.length),
+      // Derived server-side from the verified question set and per-question marks.
+      total_marks: totalMarks,
+      pass_mark: Math.min(parsed.pass_mark, totalMarks),
       default_negative_marks: parsed.default_negative_marks,
       show_leaderboard: parsed.show_leaderboard,
       is_premium: parsed.is_premium,
       is_published: false,
+      admission_unit_id: admission?.unitId ?? null,
+      ...(metadata ? { meta_data: metadata } : {}),
     };
 
     const { data: created, error: paperError } = await supabase
@@ -412,7 +584,7 @@ export class ExamAdminService {
         exam_id: paperId,
         question_id: questionId,
         sequence: index + 1,
-        marks: 1,
+        marks: questionMarks[index],
       }))
     );
 
@@ -493,12 +665,72 @@ export class ExamAdminService {
     const nextTrack = 'track' in patch ? patch.track ?? null : existing.track ?? null;
     const nextSubjectId =
       'subject_id' in patch ? patch.subject_id ?? null : existing.subject_id ?? null;
+    const nextExamMode =
+      nextCategory === 'admission'
+        ? 'exam_mode' in patch
+          ? patch.exam_mode ?? null
+          : readMetadataExamMode(existing.meta_data)
+        : null;
+    const nextAdmissionSession =
+      nextCategory === 'admission'
+        ? 'admission_session' in patch
+          ? patch.admission_session ?? null
+          : readMetadataString(existing.meta_data, 'admission_session')
+        : null;
+    const nextAdmissionUnitId =
+      nextCategory === 'admission'
+        ? 'admission_unit_id' in patch
+          ? patch.admission_unit_id ?? null
+          : existing.admission_unit_id ?? null
+        : null;
+    const nextAdmissionUniversityId =
+      'admission_university_id' in patch ? patch.admission_university_id ?? null : null;
+
+    const admissionTouched =
+      nextCategory === 'admission' &&
+      (existing.category !== 'admission' ||
+        'category' in patch ||
+        'admission_unit_id' in patch ||
+        'admission_university_id' in patch ||
+        'exam_mode' in patch ||
+        'admission_session' in patch ||
+        'subject_id' in patch);
+
+    if (
+      nextCategory !== 'admission' &&
+      ('admission_unit_id' in patch ||
+        'admission_university_id' in patch ||
+        'exam_mode' in patch ||
+        'admission_session' in patch)
+    ) {
+      throw new ExamAuthoringError(
+        'Admission fields are only allowed when category is admission'
+      );
+    }
 
     assertValidExamTrack(nextCategory, nextTrack);
-    assertValidExamSubject(nextCategory, nextSubjectId);
+    assertValidExamSubject(nextCategory, nextSubjectId, nextExamMode);
+    assertValidAdmissionState(
+      nextCategory,
+      {
+        unitId: nextAdmissionUnitId,
+        universityId: nextAdmissionUniversityId,
+        examMode: nextExamMode,
+        admissionSession: nextAdmissionSession,
+        subjectId: nextSubjectId,
+      },
+      {
+        enforce: admissionTouched,
+        requireMode: nextCategory === 'admission' && existing.category !== 'admission',
+      }
+    );
 
     if (nextSubjectId && nextSubjectId !== existing.subject_id) {
       await assertSubjectExists(nextSubjectId);
+    }
+
+    if (nextCategory === 'admission' && admissionTouched && nextAdmissionUnitId) {
+      await assertAdmissionUnit(nextAdmissionUnitId, nextAdmissionUniversityId);
     }
 
     assertValidExamWindow(
@@ -509,12 +741,22 @@ export class ExamAdminService {
 
     const replacingQuestions = Array.isArray(patch.question_ids);
     const nextQuestionIds = replacingQuestions
-      ? await requireEligibleQuestions(patch.question_ids as string[])
+      ? await requireEligibleQuestions(patch.question_ids as string[], {
+          subjectId:
+            nextCategory === 'admission' && nextExamMode === 'subject_practice'
+              ? nextSubjectId
+              : null,
+        })
       : null;
 
     if (replacingQuestions && (nextQuestionIds as string[]).length === 0) {
       throw new ExamAuthoringError('An exam must keep at least one question');
     }
+
+    const nextQuestionMarks = nextQuestionIds
+      ? marksForQuestions(nextQuestionIds, patch.question_marks)
+      : null;
+    const nextTotalMarks = nextQuestionMarks ? totalForMarks(nextQuestionMarks) : null;
 
     const nextDuration = Number(patch.duration_min ?? existing.duration_min);
     const nextPublished = patch.is_published ?? existing.is_published === true;
@@ -541,9 +783,36 @@ export class ExamAdminService {
       if (column in patch) update[column] = (patch as unknown as AnyObject)[column];
     }
 
-    if (nextQuestionIds) {
-      update.total_marks = nextQuestionIds.length;
-      update.pass_mark = Math.min(Number(patch.pass_mark ?? existing.pass_mark ?? 0), nextQuestionIds.length);
+    if (
+      nextCategory !== 'admission' &&
+      existing.category === 'admission' &&
+      'category' in patch
+    ) {
+      update.admission_unit_id = null;
+    }
+
+    if (nextQuestionIds && nextTotalMarks !== null) {
+      update.total_marks = nextTotalMarks;
+      update.pass_mark = Math.min(
+        Number(patch.pass_mark ?? existing.pass_mark ?? 0),
+        nextTotalMarks
+      );
+    }
+
+    const shouldUpdateMetadata =
+      nextCategory === 'admission'
+        ? existing.category !== 'admission' ||
+          'exam_mode' in patch ||
+          'admission_session' in patch
+        : existing.category === 'admission' && 'category' in patch;
+
+    if (shouldUpdateMetadata) {
+      update.meta_data = buildAdmissionMetadata(
+        existing.meta_data,
+        nextCategory,
+        nextExamMode,
+        nextAdmissionSession
+      );
     }
 
     update.is_published = nextPublished;
@@ -572,7 +841,7 @@ export class ExamAdminService {
           exam_id: id,
           question_id: questionId,
           sequence: index + 1,
-          marks: 1,
+          marks: nextQuestionMarks?.[index] ?? 1,
         }))
       );
 

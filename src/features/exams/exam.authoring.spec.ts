@@ -448,7 +448,14 @@ test('model tests require a supported track and other categories reject one', ()
   assert.equal(board.track, null);
 
   const admission = parseExamCreatePayload(
-    validPayload({ category: 'admission', track: null })
+    validPayload({
+      category: 'admission',
+      track: null,
+      subject_id: null,
+      exam_mode: 'past_exam',
+      admission_session: '2025-26',
+      admission_unit_id: 'unit-1',
+    })
   );
   assert.equal(admission.track, null);
 });
@@ -466,7 +473,16 @@ test('a null subject is allowed only for model tests', async () => {
   );
 
   assert.throws(
-    () => parseExamCreatePayload(validPayload({ subject_id: null, category: 'admission', track: null })),
+    () =>
+      parseExamCreatePayload(
+        validPayload({
+          subject_id: null,
+          category: 'admission',
+          track: null,
+          exam_mode: 'subject_practice',
+          admission_unit_id: 'unit-1',
+        })
+      ),
     (error: any) => error.status === 400 && /subject_id is required/.test(error.message)
   );
 
