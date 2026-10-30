@@ -25,6 +25,7 @@ import { GROUP_ERROR_CODES } from './features/groups/groups.errors';
 // এক্সাম, সিস্টেম, ফাইন্যান্স, নোটিফিকেশন এবং হিস্ট্রি রাউট ইম্পোর্ট
 import { ExamUserRoutes } from './features/exams/exams.user.routes';
 import { ExamAdminRoutes } from './features/exams/exams.admin.routes';
+import { AdmissionAdminRoutes } from './features/admissions/admissions.admin.routes';
 import examBookmarkRoutes from './features/exams/exam.bookmark.routes';
 import systemRoutes from './features/system/system.routes'; 
 import { financeRoutes } from './features/finance/finance.routes';
@@ -113,6 +114,9 @@ app.use('/internal', groupInternalRoutes);
 // এক্সাম মডিউট রাউট
 app.use('/api/v1/exams/user', ExamUserRoutes);
 app.use('/api/v1/exams/admin', ExamAdminRoutes);
+
+// University/admission unit management under the exam administration area.
+app.use('/api/v1/admin/admissions', AdmissionAdminRoutes);
 // Existing clients call POST /api/v1/exams/bookmark; keep that path stable.
 app.use('/api/v1/exams/bookmark', examBookmarkRoutes);
 
@@ -175,6 +179,11 @@ const EXPOSED_ERROR_CODES = new Set([
   'ALREADY_ATTEMPTED',
   'PAYMENT_NOT_PENDING',
   'VALIDATION_FAILED',
+  'UNIVERSITY_NOT_FOUND',
+  'UNIVERSITY_INVALID_TYPE',
+  'ADMISSION_UNIT_NOT_FOUND',
+  'ADMISSION_UNIT_CODE_TAKEN',
+  'ADMISSION_UNIT_IN_USE',
   ...GROUP_ERROR_CODES,
 ]);
 
