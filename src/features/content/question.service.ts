@@ -3,6 +3,7 @@ import { ComprehensionPayload, QuestionPayload } from './content.types';
 import type { TablesInsert, TablesUpdate } from '../../types/database.type';
 import { autoCreateMissingInstitutions } from './institution.service';
 import { buildQuestionContentHash, decideQuestionWrite } from './question.policy';
+import { resolveExamReferenceLists, withResolvedExamReferences } from './exam-references';
 import { buildIdMatchClause, joinOrClauses, normalizeSearchTerm } from '../../lib/utils/search';
 
 export interface QuestionBankFilters {
@@ -160,9 +161,13 @@ export const saveSmartQuestion = async (
   questionData: QuestionPayload,
   options: { role?: string | null; userId?: string | null } = {}
 ) => {
+  const bodyWithReferences = await withResolvedExamReferences(
+    questionData as unknown as Record<string, unknown>
+  );
+
   const { payload } = decideQuestionWrite({
     role: options.role,
-    body: questionData,
+    body: bodyWithReferences,
     mode: 'create',
   });
 
@@ -186,9 +191,13 @@ export const updateQuestion = async (
   questionData: Partial<QuestionPayload>,
   options: { role?: string | null } = {}
 ) => {
+  const bodyWithReferences = await withResolvedExamReferences(
+    questionData as unknown as Record<string, unknown>
+  );
+
   const { payload } = decideQuestionWrite({
     role: options.role,
-    body: questionData,
+    body: bodyWithReferences,
     mode: 'update',
   });
 
@@ -232,6 +241,31 @@ export const saveBulkQuestions = async (
   const BATCH_SIZE = 500;
   const allInsertedData: unknown[] = [];
   const flatQuestionsToInsert: TablesInsert<'questions'>[] = [];
+
+  // Resolve every reference list in one pass so a bulk import does not run a
+  // pair of lookup queries per question. Validation happens before any
+  // question insert, and unknown reference keys are carried through untouched.
+  const referenceTargets: Record<string, unknown>[] = [];
+  for (const item of questionsData) {
+    if (item.type === 'Comprehension' && Array.isArray(item.questions)) {
+      for (const question of item.questions as Record<string, unknown>[]) {
+        if (Object.prototype.hasOwnProperty.call(question, 'exam_references')) {
+          referenceTargets.push(question);
+        }
+      }
+    } else if (Object.prototype.hasOwnProperty.call(item, 'exam_references')) {
+      referenceTargets.push(item as Record<string, unknown>);
+    }
+  }
+
+  if (referenceTargets.length > 0) {
+    const resolvedLists = await resolveExamReferenceLists(
+      referenceTargets.map((target) => target.exam_references)
+    );
+    referenceTargets.forEach((target, index) => {
+      target.exam_references = resolvedLists[index];
+    });
+  }
 
   for (const item of questionsData) {
     if (item.type === 'Comprehension') {
