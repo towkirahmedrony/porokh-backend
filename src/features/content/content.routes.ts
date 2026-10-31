@@ -22,6 +22,8 @@ router.get('/institutions', rbacGuard(['admin', 'moderator', 'teacher']), catchA
   sendResponse(res, { statusCode: 200, success: true, message: 'Institutions retrieved', data: institutions });
 }));
 
+router.get('/institutions/:id/admission-units', rbacGuard(['admin', 'moderator', 'editor', 'teacher']), institutionController.getInstitutionAdmissionUnits);
+
 router.post('/institutions', rbacGuard(['admin']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), institutionController.createInstitution);
 router.put('/institutions/:id', rbacGuard(['admin']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), institutionController.updateInstitution);
 router.delete('/institutions/:id', rbacGuard(['admin']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), institutionController.deleteInstitution);

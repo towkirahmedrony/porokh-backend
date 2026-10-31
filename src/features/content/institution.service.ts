@@ -130,3 +130,20 @@ export const autoCreateMissingInstitutions = async (questionsData: Record<string
     await supabase.from('institutions').insert(toInsert);
   }
 };
+
+/**
+ * Read-only admission units for the content editors. The write surface stays
+ * on the admissions admin routes; content authors only need the labels to
+ * attach an optional unit to an exam reference.
+ */
+export const getInstitutionAdmissionUnits = async (institutionId: string) => {
+  const { data, error } = await supabase
+    .from('admission_units')
+    .select('id, institution_id, name_bn, name_en, code, is_active, display_order')
+    .eq('institution_id', institutionId)
+    .order('display_order', { ascending: true })
+    .order('name_bn', { ascending: true });
+
+  if (error) throw new Error(error.message);
+  return data ?? [];
+};

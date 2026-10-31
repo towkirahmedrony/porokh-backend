@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { supabase } from '../../config/supabase';
 import { CurriculumNode, QuestionPayload, ComprehensionPayload, NodeType, AuditFilterParams } from './content.types';
 import { buildQuestionContentHash, canEditQuestion, decideQuestionWrite, isPrivilegedContentRole } from './question.policy';
+import { withResolvedExamReferences } from './exam-references';
 import { buildIdMatchClause, joinOrClauses, normalizeSearchTerm } from '../../lib/utils/search';
 
 const writeContentAudit = async (actorId: string, action: string, targetId: string) => {
@@ -249,9 +250,13 @@ export const saveSmartQuestion = async (
   questionData: QuestionPayload,
   options: { role?: string | null; userId?: string | null } = {}
 ) => {
+  const bodyWithReferences = await withResolvedExamReferences(
+    questionData as unknown as Record<string, unknown>
+  );
+
   const { payload, status } = decideQuestionWrite({
     role: options.role,
-    body: questionData,
+    body: bodyWithReferences,
     mode: 'create',
   });
 
@@ -310,9 +315,13 @@ export const updateQuestion = async (
   questionData: Partial<QuestionPayload>,
   options: { role?: string | null; userId?: string | null } = {}
 ) => {
+  const bodyWithReferences = await withResolvedExamReferences(
+    questionData as unknown as Record<string, unknown>
+  );
+
   const { payload } = decideQuestionWrite({
     role: options.role,
-    body: questionData,
+    body: bodyWithReferences,
     mode: 'update',
   });
 
