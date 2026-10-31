@@ -202,6 +202,34 @@ test('kind helpers map legacy aliases and unit support', () => {
 });
 
 
+test('empty institution and unit ids become null, never empty strings', () => {
+  const resolved = normalizeExamReference(
+    { source_kind: 'board', board: 'Dhaka Board', institution_id: '', unit_id: '' },
+    lookups
+  );
+
+  assert.equal(resolved.institution_id, null);
+  assert.equal(resolved.unit_id, null);
+
+  const padded = normalizeExamReference(
+    { source_kind: 'college', institution_id: '   ', unit_id: '   ' },
+    lookups
+  );
+
+  assert.equal(padded.institution_id, null);
+  assert.equal(padded.unit_id, null);
+});
+
+test('a numeric year is stored as a string and unknown keys survive', () => {
+  const resolved = normalizeExamReference(
+    { source_kind: 'board', board: 'Dhaka Board', year: 2024, imported_from: 'excel-v1' },
+    lookups
+  );
+
+  assert.equal(resolved.year, '2024');
+  assert.equal(resolved.imported_from, 'excel-v1');
+});
+
 test('legacy names resolve across board short names and university word order', () => {
   assert.ok(
     referenceNameVariants('Dhaka Board', 'board').includes(

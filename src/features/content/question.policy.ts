@@ -117,13 +117,50 @@ export const buildQuestionContentHash = (question: AnyObject): string => {
   return crypto.createHash('md5').update(stableStringify(canonical)).digest('hex');
 };
 
+const OPTION_FLAG_KEYS = ['is_correct', 'isCorrect', 'correct', 'answer'] as const;
+
+const isTruthyFlag = (value: unknown): boolean =>
+  value === true || (typeof value === 'string' && value.trim().toLowerCase() === 'true');
+
+/**
+ * Canonical option shape for every write path.
+ *
+ * `is_correct` is stored; the older `isCorrect` spelling is accepted and
+ * rewritten so the two cannot drift. An option without an id would be dropped
+ * by the student question bank and could never be graded, so its position
+ * supplies the id. Unknown option keys are copied through untouched.
+ */
+export const normalizeQuestionOptions = (value: unknown): unknown => {
+  if (!Array.isArray(value)) return value;
+
+  return value.flatMap((raw, index) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+
+    const option: AnyObject = { ...(raw as AnyObject) };
+    const id = option.id;
+    const hasId =
+      (typeof id === 'string' && id.trim() !== '') ||
+      (typeof id === 'number' && Number.isFinite(id));
+
+    if (!hasId) option.id = index + 1;
+
+    option.is_correct = OPTION_FLAG_KEYS.some((key) => isTruthyFlag(option[key]));
+    delete option.isCorrect;
+
+    return [option];
+  });
+};
+
 /** Copies only author-editable fields from an untrusted request body. */
 export const pickEditableQuestionFields = (input: unknown): AnyObject => {
   const source = (input ?? {}) as AnyObject;
   const picked: AnyObject = {};
 
   for (const field of EDITABLE_QUESTION_FIELDS) {
-    if (source[field] !== undefined) picked[field] = source[field];
+    if (source[field] === undefined) continue;
+
+    picked[field] =
+      field === 'options' ? normalizeQuestionOptions(source[field]) : source[field];
   }
 
   return picked;

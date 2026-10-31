@@ -209,8 +209,18 @@ export const normalizeExamReference = (
   const kind = normalizeReferenceSourceKind(reference.source_kind);
   if (kind) reference.source_kind = kind;
 
+  // Export one shape: a year is a string. Numeric legacy years keep importing.
+  if (reference.year !== undefined && reference.year !== null) {
+    reference.year = asTrimmedString(reference.year) || null;
+  }
+
   const institutionId = readId(reference.institution_id, 'institution_id');
   const unitId = readId(reference.unit_id, 'unit_id');
+
+  // Empty optional ids are stored as null, never as blank strings that would
+  // never match a JSONB filter or an equality check.
+  if ('institution_id' in reference) reference.institution_id = institutionId;
+  if ('unit_id' in reference) reference.unit_id = unitId;
 
   let institution = institutionId ? lookups.institutions.get(institutionId) : undefined;
   if (institutionId && !institution) {
