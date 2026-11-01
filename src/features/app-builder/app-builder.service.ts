@@ -52,11 +52,17 @@ export const AppBuilderService = {
   },
 
   // ================== HOME GRIDS ==================
-  async getHomeGrids(language: Language = 'bn') {
-    const { data, error } = await supabaseAdmin
+  async getHomeGrids(language: Language = 'bn', activeOnly = false) {
+    let query = supabaseAdmin
       .from('home_grids')
       .select('*, title_en')
       .order('serial_order', { ascending: true });
+
+    if (activeOnly) {
+      query = query.eq('is_active', true);
+    }
+
+    const { data, error } = await query;
     
     if (error) throw error;
     return localizeRecords(data, language, ['title']);
@@ -74,14 +80,16 @@ export const AppBuilderService = {
   },
 
   async reorderHomeGrids(grids: any[]) {
-    // Frontend is now sending the full objects. Type adjusted to any[]
-    const { data, error } = await supabaseAdmin
-      .from('home_grids')
-      .upsert(grids, { onConflict: 'id' })
-      .select();
-    
-    if (error) throw error;
-    return data;
+    for (const grid of grids) {
+      const { error } = await supabaseAdmin
+        .from('home_grids')
+        .update({ serial_order: grid.serial_order })
+        .eq('id', grid.id);
+
+      if (error) throw error;
+    }
+
+    return true;
   },
 
   async deleteHomeGrid(id: string) {
