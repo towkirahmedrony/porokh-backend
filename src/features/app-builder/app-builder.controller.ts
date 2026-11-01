@@ -23,7 +23,8 @@ export const getAllConfigs = async (req: Request, res: Response, next: NextFunct
 // --- Home Grids Controllers ---
 export const getHomeGrids = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const data = await AppBuilderService.getHomeGrids();
+    const activeOnly = req.query.active === 'true';
+    const data = await AppBuilderService.getHomeGrids('bn', activeOnly);
     res.status(200).json({ success: true, data });
   } catch (error) { next(error); }
 };

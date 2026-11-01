@@ -26,7 +26,13 @@ const httpUrl = z
   .regex(/^https?:\/\//i, 'URL must use http or https');
 
 const targetRulesSchema = z.record(
-  z.union([z.string().trim().max(200), z.number().finite(), z.boolean(), z.null()])
+  z.union([
+    z.string().trim().max(200),
+    z.number().finite(),
+    z.boolean(),
+    z.null(),
+    z.array(z.string().trim().max(200)).max(50),
+  ])
 );
 
 export const bannerCreateSchema = z
@@ -53,7 +59,9 @@ export const homeGridSchema = z
   .object({
     id: z.string().trim().min(1).max(100).optional(),
     title: z.string().trim().min(1).max(200),
+    title_en: nullableText(200),
     icon_name: z.string().trim().min(1).max(200),
+    image_url: z.union([httpUrl, z.null()]).optional(),
     link: nullableText(2048),
     type: nullableText(50),
     color: nullableText(50),

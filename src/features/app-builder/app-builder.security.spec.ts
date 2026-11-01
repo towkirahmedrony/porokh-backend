@@ -396,6 +396,73 @@ test('other privileged app-builder routes are guarded consistently', async () =>
   assert.equal(state.writes.length, 0);
 });
 
+test('home-grid writes accept image_url and targeting, and reject unsafe image URLs', async () => {
+  const valid = await request('POST', '/api/v1/app-builder/home-grids', {
+    token: ADMIN_TOKEN,
+    body: {
+      title: 'লিডারবোর্ড',
+      title_en: 'Leaderboard',
+      icon_name: 'trophy',
+      image_url: 'https://pbswsbfcmztmbcqnuqny.supabase.co/storage/v1/object/public/app-assets/home-grids/trophy.webp',
+      link: '/dashboard/leaderboard',
+      type: 'link',
+      color: '#16a34a',
+      bg_color: '#f0fdf4',
+      is_active: true,
+      target_rules: { study_goal: ['hsc'] },
+    },
+  });
+
+  assert.equal(valid.status, 200);
+  assert.equal(state.writes.length, 1);
+  assert.equal(state.writes[0].table, 'home_grids');
+  assert.equal(state.writes[0].payload.image_url.includes('/app-assets/'), true);
+  assert.deepEqual(state.writes[0].payload.target_rules, { study_goal: ['hsc'] });
+
+  const invalid = await request('POST', '/api/v1/app-builder/home-grids', {
+    token: ADMIN_TOKEN,
+    body: {
+      title: 'Bad',
+      icon_name: 'trophy',
+      image_url: 'javascript:alert(1)',
+    },
+  });
+
+  assert.equal(invalid.status, 400);
+  assert.equal(state.writes.length, 1);
+});
+
+test('home-grid reorder updates serial_order for each row', async () => {
+  const response = await request('PATCH', '/api/v1/app-builder/home-grids/reorder', {
+    token: ADMIN_TOKEN,
+    body: {
+      grids: [
+        { id: 'grid-1', serial_order: 1 },
+        { id: 'grid-2', serial_order: 2 },
+      ],
+    },
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(state.writes.length, 2);
+  assert.deepEqual(
+    state.writes.map((write) => ({ id: write.filters.id, order: write.payload.serial_order })),
+    [
+      { id: 'grid-1', order: 1 },
+      { id: 'grid-2', order: 2 },
+    ]
+  );
+});
+
+test('the public active home-grid read filters inactive rows', async () => {
+  const response = await request('GET', '/api/v1/app-builder/home-grids?active=true');
+
+  assert.equal(response.status, 200);
+  const read = state.reads.find((row) => row.table === 'home_grids');
+  assert.ok(read);
+  assert.equal(read.filters.is_active, true);
+});
+
 test('system configuration reads are restricted to the public allowlist', async () => {
   const privateRead = await request('GET', '/api/v1/system/configs/private_secret');
   assert.equal(privateRead.status, 404);
