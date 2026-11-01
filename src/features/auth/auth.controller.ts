@@ -7,6 +7,26 @@ import crypto from 'crypto';
 const isAdminRole = (role: string): boolean =>
   (ADMIN_ROLES as readonly string[]).includes(role);
 
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 8;
+const MAX_PASSWORD_LENGTH = 72;
+
+const readRegisterError = (message: string): { status: number; code: string } => {
+  const normalized = message.toLowerCase();
+
+  if (normalized.includes('already registered') || normalized.includes('already exists')) {
+    return { status: 409, code: 'EMAIL_ALREADY_REGISTERED' };
+  }
+  if (normalized.includes('password')) {
+    return { status: 400, code: 'WEAK_PASSWORD' };
+  }
+  if (normalized.includes('rate limit') || normalized.includes('too many')) {
+    return { status: 429, code: 'RATE_LIMITED' };
+  }
+
+  return { status: 400, code: 'REGISTRATION_FAILED' };
+};
+
 const getClientIp = (req: Request): string => {
   const forwarded = req.headers['x-forwarded-for'];
   const realIp = req.headers['x-real-ip'];
@@ -75,6 +95,84 @@ export const authController = {
       return res.status(200).json({ qrCode: qrCodeImage, setupKey: secret.base32, message: "Scan this QR code in Google Authenticator" });
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
+    }
+  },
+
+  /**
+   * Public registration accepts credentials only. Name, username and academic
+   * details are deliberately not read here: they are collected in onboarding
+   * after the email is verified.
+   */
+  async register(req: Request, res: Response) {
+    const email =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const referredByCode =
+      typeof req.body?.referred_by_code === 'string' && req.body.referred_by_code.trim()
+        ? req.body.referred_by_code.trim()
+        : null;
+
+    if (!EMAIL_PATTERN.test(email) || email.length > 254) {
+      return res.status(400).json({
+        success: false,
+        code: 'VALIDATION_FAILED',
+        message: 'Enter a valid email address',
+      });
+    }
+
+    if (password.length < MIN_PASSWORD_LENGTH || password.length > MAX_PASSWORD_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        code: 'WEAK_PASSWORD',
+        message: `Password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters`,
+      });
+    }
+
+    try {
+      const { data, error } = await authService.registerWithEmail(
+        email,
+        password,
+        referredByCode
+      );
+
+      if (error) {
+        const mapped = readRegisterError(error.message ?? '');
+        return res.status(mapped.status).json({
+          success: false,
+          code: mapped.code,
+          message: 'Registration could not be completed',
+        });
+      }
+
+      if (data.user?.identities && data.user.identities.length === 0) {
+        return res.status(409).json({
+          success: false,
+          code: 'EMAIL_ALREADY_REGISTERED',
+          message: 'An account with this email already exists',
+        });
+      }
+
+      const session = data.session;
+      return res.status(201).json({
+        success: true,
+        user: { id: data.user?.id ?? null, email: data.user?.email ?? email },
+        requires_email_verification: !session,
+        session: session
+          ? {
+              access_token: session.access_token,
+              refresh_token: session.refresh_token,
+              expires_at: session.expires_at,
+              expires_in: session.expires_in,
+              token_type: session.token_type,
+            }
+          : null,
+      });
+    } catch {
+      return res.status(503).json({
+        success: false,
+        code: 'REGISTRATION_UNAVAILABLE',
+        message: 'Registration is temporarily unavailable',
+      });
     }
   },
 

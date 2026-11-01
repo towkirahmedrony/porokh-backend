@@ -110,6 +110,22 @@ export const authService = {
   },
 
   /**
+   * Creates an account with email + password only. Profile details are
+   * collected later in onboarding, after the email is verified.
+   */
+  async registerWithEmail(email: string, password: string, referredByCode?: string | null) {
+    const { data, error } = await supabaseAuth.auth.signUp({
+      email,
+      password,
+      options: {
+        data: referredByCode ? { referred_by_code: referredByCode } : {},
+      },
+    });
+
+    return { data, error };
+  },
+
+  /**
    * Verifies real credentials through Supabase Auth. Returns null on any
    * failure so callers can answer with a single generic 401.
    */

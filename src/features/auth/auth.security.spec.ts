@@ -24,6 +24,7 @@ const db = {
 
 const calls = {
   signIn: [] as Row[],
+  signUp: [] as Row[],
   signOut: [] as string[],
   generateLink: [] as Row[],
   verifyOtp: [] as Row[],
@@ -163,6 +164,36 @@ const fakeSupabaseAdmin = {
 
 const fakeSupabaseAuth = {
   auth: {
+    signUp: async (payload: Row) => {
+      calls.signUp.push(payload);
+
+      if (payload.email === 'existing@example.com') {
+        return {
+          data: { user: { id: 'existing-1', email: payload.email, identities: [] }, session: null },
+          error: null,
+        };
+      }
+
+      if (payload.password === 'short') {
+        return {
+          data: { user: null, session: null },
+          error: { message: 'Password should be at least 8 characters' },
+        };
+      }
+
+      return {
+        data: {
+          user: {
+            id: 'new-1',
+            email: payload.email,
+            email_confirmed_at: null,
+            identities: [{ id: 'identity-1' }],
+          },
+          session: null,
+        },
+        error: null,
+      };
+    },
     signInWithPassword: async (payload: Row) => {
       calls.signIn.push(payload);
 
@@ -296,6 +327,7 @@ beforeEach(() => {
   db.user_devices = [];
   db.profileQueryError = false;
   calls.signIn = [];
+  calls.signUp = [];
   calls.signOut = [];
   calls.generateLink = [];
   calls.verifyOtp = [];
@@ -352,6 +384,64 @@ test('unknown usernames and incorrect passwords share the same public failure', 
   assert.equal(unknown.statusCode, 401);
   assert.deepEqual(unknown.body, wrongPassword.body);
   assert.equal(JSON.stringify(unknown.body).includes('@'), false);
+});
+
+test('registration sends credentials only and ignores profile fields', async () => {
+  const res = await invoke(authController.register, {
+    body: {
+      email: '  New@Example.com ',
+      password: 'correct-password',
+      full_name: 'Should Be Ignored',
+      username: 'should_be_ignored',
+    },
+    headers: {},
+    socket: {},
+  });
+
+  assert.equal(res.statusCode, 201);
+  assert.equal(res.body.requires_email_verification, true);
+  assert.equal(res.body.session, null);
+  assert.deepEqual(calls.signUp.at(-1), {
+    email: 'new@example.com',
+    password: 'correct-password',
+    options: { data: {} },
+  });
+});
+
+test('registration reports an existing email without issuing a session', async () => {
+  const res = await invoke(authController.register, {
+    body: { email: 'existing@example.com', password: 'correct-password' },
+    headers: {},
+    socket: {},
+  });
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.code, 'EMAIL_ALREADY_REGISTERED');
+  assert.equal(res.body.session, undefined);
+});
+
+test('registration rejects a short password before calling Supabase', async () => {
+  const res = await invoke(authController.register, {
+    body: { email: 'new@example.com', password: 'short' },
+    headers: {},
+    socket: {},
+  });
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.code, 'WEAK_PASSWORD');
+  assert.equal(calls.signUp.length, 0);
+});
+
+test('registration rejects a malformed email before calling Supabase', async () => {
+  const res = await invoke(authController.register, {
+    body: { email: 'not-an-email', password: 'correct-password' },
+    headers: {},
+    socket: {},
+  });
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.code, 'VALIDATION_FAILED');
+  assert.equal(calls.signUp.length, 0);
 });
 
 test('H-05: a client-supplied role cannot grant administrator access', async () => {
