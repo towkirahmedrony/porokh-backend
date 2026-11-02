@@ -8,9 +8,10 @@
 
 type AnyObject = Record<string, unknown>;
 
-export const MAX_EXTRACT_IMAGES = 10;
 export const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
-export const MAX_TOTAL_IMAGE_BYTES = 24 * 1024 * 1024;
+
+/** Phase 4 extracts one page per request; multi-page batches are not accepted. */
+export const EXTRACT_IMAGE_COUNT = 1;
 
 /** Gemini accepts these inline image formats; anything else is rejected early. */
 export const ACCEPTED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
@@ -91,7 +92,6 @@ export interface ExtractionSourceHint {
 export interface ParsedExtractionRequest {
   images: ExtractionImageInput[];
   sourceHint: ExtractionSourceHint;
-  generateMissingExplanations: boolean;
 }
 
 /** Strips an optional data-URL prefix and whitespace from inline base64. */
@@ -120,18 +120,17 @@ export const parseExtractionRequest = (body: unknown): ParsedExtractionRequest =
   const rawImages = record.images;
 
   if (!Array.isArray(rawImages) || rawImages.length === 0) {
-    throw new ExtractionValidationError('At least one question-paper image is required.');
+    throw new ExtractionValidationError('Exactly one question-paper image is required.');
   }
 
-  if (rawImages.length > MAX_EXTRACT_IMAGES) {
+  if (rawImages.length !== EXTRACT_IMAGE_COUNT) {
     throw new ExtractionValidationError(
-      `A single extraction may contain at most ${MAX_EXTRACT_IMAGES} images.`
+      'Only one question-paper image can be extracted per request. Remove the extra images.'
     );
   }
 
   const images: ExtractionImageInput[] = [];
   const seenIds = new Set<string>();
-  let totalBytes = 0;
 
   rawImages.forEach((entry, position) => {
     const image = asRecord(entry);
@@ -162,13 +161,6 @@ export const parseExtractionRequest = (body: unknown): ParsedExtractionRequest =
       );
     }
 
-    totalBytes += bytes;
-    if (totalBytes > MAX_TOTAL_IMAGE_BYTES) {
-      throw new ExtractionValidationError(
-        `The request exceeds the ${Math.round(MAX_TOTAL_IMAGE_BYTES / (1024 * 1024))}MB total image limit.`
-      );
-    }
-
     const imageId = asText(image.image_id) || `image_${position + 1}`;
     if (seenIds.has(imageId)) {
       throw new ExtractionValidationError(`Duplicate image_id "${imageId}" in the request.`);
@@ -193,14 +185,14 @@ export const parseExtractionRequest = (body: unknown): ParsedExtractionRequest =
     }
   }
 
-  return {
-    images,
-    sourceHint,
-    generateMissingExplanations: record.generate_missing_explanations !== false,
-  };
+  return { images, sourceHint };
 };
 
+export type ExtractionConfidence = 'high' | 'medium' | 'low';
+
 export interface ExtractedQuestion {
+  /** Number printed on the paper, kept verbatim so the original order survives. */
+  question_number: string;
   type: 'mcq';
   body: { text_bn: string; text_en: string; image_url: string | null };
   options: Array<{ id: number; text_bn: string; text_en: string; isCorrect: boolean }>;
@@ -212,6 +204,8 @@ export interface ExtractedQuestion {
   source_metadata?: { institution?: string; exam_name?: string; year?: string };
   requires_manual_answer_verification: boolean;
   uncertain_ocr_flags: string[];
+  /** Server-side review indicator derived from the flags, never model-reported. */
+  confidence: ExtractionConfidence;
   source_image_index: number;
 }
 
@@ -383,12 +377,16 @@ const applyAnswerGuard = (
   return { options, flags: Array.from(new Set(flags)), requiresVerification: false };
 };
 
+type DraftQuestion = Omit<ExtractedQuestion, 'confidence'>;
+
+type BatchSourceInfo = { institution?: string; exam_name?: string; year?: string };
+
 const sanitizeQuestion = (
   raw: unknown,
   index: number,
   imageCount: number,
-  batch: { institution?: string; exam_name?: string; year?: string }
-): ExtractedQuestion | { reason: string; source_image_index: number } => {
+  batch: BatchSourceInfo
+): DraftQuestion | { reason: string; source_image_index: number } => {
   const record = asRecord(raw);
   const fallbackImageIndex = 0;
 
@@ -425,6 +423,15 @@ const sanitizeQuestion = (
   }
   if (!text_en) flags.push('english_text_missing');
 
+  // Anything other than the usual four options is kept but surfaced for a
+  // human, because an incomplete option list is a quality signal.
+  if (options.length !== 4) {
+    flags.push(`option_count_unexpected: ${options.length}`);
+  }
+
+  const questionNumber = asText(record.question_number);
+  if (!questionNumber) flags.push('question_number_missing');
+
   // A claimed printed answer without the quoted proving line is still kept,
   // but it is never trusted silently: the reviewer has to confirm it.
   const evidenceMissing = !asText(record.answer_evidence);
@@ -436,7 +443,14 @@ const sanitizeQuestion = (
   const explanationRecord = asRecord(record.explanation) ?? {};
   const sourceMetadata = normalizeSourceMetadata(record.source_metadata, batch);
 
+  if (!sourceMetadata) {
+    // Not a confidence signal by itself (many papers do not print a source),
+    // but the reviewer must still see that the metadata was not detected.
+    guarded.flags.push('source_metadata_not_detected');
+  }
+
   return {
+    question_number: questionNumber,
     type: 'mcq',
     body: {
       text_bn,
@@ -457,6 +471,66 @@ const sanitizeQuestion = (
       guarded.requiresVerification || (evidenceMissing && guarded.options.some((option) => option.isCorrect)),
     uncertain_ocr_flags: guarded.flags,
     source_image_index: clampedImageIndex,
+  };
+};
+
+/**
+ * Flags that make a question unreliable enough to need a careful human read.
+ * Confidence is derived here, so the model cannot talk its way to "high".
+ */
+const LOW_CONFIDENCE_PATTERN =
+  /illegible|unreadable|ambiguous|missing|cropped|unexpected|boundary|merged|incomplete|duplicate/i;
+
+const deriveConfidence = (question: DraftQuestion): ExtractionConfidence => {
+  if (question.requires_manual_answer_verification) return 'low';
+  if (question.uncertain_ocr_flags.some((flag) => LOW_CONFIDENCE_PATTERN.test(flag))) return 'low';
+  return question.uncertain_ocr_flags.length > 0 ? 'medium' : 'high';
+};
+
+/**
+ * Cross-question checks that need the whole page: duplicate printed numbers and
+ * out-of-order numbering usually mean two questions were merged or a boundary
+ * was missed, so they are reported instead of silently trusting the model.
+ */
+const finalizeQuestions = (
+  drafts: DraftQuestion[]
+): { questions: ExtractedQuestion[]; warnings: string[] } => {
+  const warnings: string[] = [];
+  const positionsByNumber = new Map<string, number[]>();
+
+  drafts.forEach((question, index) => {
+    if (!question.question_number) return;
+    const positions = positionsByNumber.get(question.question_number) ?? [];
+    positions.push(index);
+    positionsByNumber.set(question.question_number, positions);
+  });
+
+  for (const [number, positions] of positionsByNumber) {
+    if (positions.length < 2) continue;
+
+    warnings.push(
+      `Question number ${number} appears ${positions.length} times; check the question boundaries on the image.`
+    );
+
+    for (const index of positions) {
+      drafts[index].uncertain_ocr_flags = Array.from(
+        new Set([...drafts[index].uncertain_ocr_flags, `duplicate_question_number: ${number}`])
+      );
+    }
+  }
+
+  const numericNumbers = drafts
+    .map((question) => Number.parseInt(question.question_number, 10))
+    .filter((value) => Number.isFinite(value));
+
+  const outOfOrder = numericNumbers.some((value, index) => index > 0 && value < numericNumbers[index - 1]);
+  if (outOfOrder) {
+    warnings.push('Questions are not in the printed numerical order; the original order was kept.');
+  }
+
+  return {
+    questions: drafts.map((question) => ({ ...question, confidence: deriveConfidence(question) })),
+    warnings,
   };
 };
 
@@ -487,9 +561,8 @@ export const sanitizeModelOutput = (
     Object.entries(batchSourceInfo).filter(([, value]) => value !== '')
   ) as { institution?: string; exam_name?: string; year?: string };
 
-  const questions: ExtractedQuestion[] = [];
+  const drafts: DraftQuestion[] = [];
   const rejected: ExtractionRejection[] = [];
-  const warnings: string[] = [];
 
   record.questions.forEach((entry, index) => {
     const result = sanitizeQuestion(entry, index, imageCount, cleanedBatch);
@@ -499,18 +572,34 @@ export const sanitizeModelOutput = (
       return;
     }
 
-    if (result.requires_manual_answer_verification) {
-      warnings.push(`Question #${questions.length + 1}: the answer key needs manual confirmation.`);
-    }
-
-    questions.push(result);
+    drafts.push(result);
   });
 
-  if (questions.length === 0) {
-    warnings.push('No questions could be read from the supplied image(s).');
+  const finalized = finalizeQuestions(drafts);
+  const warnings = [...finalized.warnings];
+
+  finalized.questions.forEach((question, position) => {
+    if (question.requires_manual_answer_verification) {
+      warnings.push(`Question #${position + 1}: the answer key needs manual confirmation.`);
+    }
+  });
+
+  if (rejected.length > 0) {
+    warnings.push(
+      `${rejected.length} question(s) could not be read completely and need a manual re-check of the image.`
+    );
   }
 
-  return { questions, rejected, batchSourceInfo: cleanedBatch, warnings };
+  if (finalized.questions.length === 0) {
+    warnings.push('No questions could be read from the supplied image.');
+  }
+
+  return {
+    questions: finalized.questions,
+    rejected,
+    batchSourceInfo: cleanedBatch,
+    warnings,
+  };
 };
 
 export interface ExtractionImageResult {

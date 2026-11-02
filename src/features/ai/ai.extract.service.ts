@@ -13,7 +13,7 @@ import {
 } from './ai.extract';
 
 /**
- * Gemini-backed extraction of bilingual MCQs from question-paper images.
+ * Gemini-backed extraction of bilingual MCQs from a single question-paper image.
  *
  * The API key never leaves this process and the model is given a strict
  * response schema; whatever comes back is re-validated by `ai.extract` before
@@ -53,6 +53,7 @@ const QUESTION_SCHEMA: ResponseSchema = {
       items: {
         type: SchemaType.OBJECT,
         properties: {
+          question_number: { type: SchemaType.STRING },
           body: {
             type: SchemaType.OBJECT,
             properties: {
@@ -104,6 +105,7 @@ const QUESTION_SCHEMA: ResponseSchema = {
           source_image_index: { type: SchemaType.INTEGER },
         },
         required: [
+          'question_number',
           'body',
           'options',
           'explanation',
@@ -124,13 +126,16 @@ const QUESTION_SCHEMA: ResponseSchema = {
 };
 
 const SYSTEM_INSTRUCTION = `You are a precise exam-paper digitisation engine for a Bangladeshi bilingual question bank (Bangla and English).
-Read every multiple-choice question (MCQ) from the supplied question-paper images in order.
+Read every multiple-choice question (MCQ) from the supplied question-paper image in order.
 
 Transcription rules:
-- Return each question once, in reading order, grouped by the image it came from (source_image_index is 0-based).
+- Return each question once, in original reading order. source_image_index is always 0 because one page is supplied per request.
+- Set question_number to the number printed next to the question (for example "3" or "3(a)"). Never renumber and never invent a number; leave it empty if no number is printed.
+- Treat each printed question as its own item. Never merge two questions into one item, and never split one question into two items.
 - body.text_bn must be the Bengali question text; body.text_en must be the English question text. If the paper is printed in only one language, translate the other faithfully. Never change the meaning, numbers, or answer options.
 - Preserve mathematical and scientific notation exactly: use LaTeX between $...$ for inline math and $$...$$ for display math, keeping symbols (±, √, °, ×, ÷, ⇒, ⇌), subscripts, superscripts, chemical formulas and units. Do not "simplify" or round anything.
-- Keep option order exactly as printed. Exactly 4 options unless the paper differs.
+- Keep option order exactly as printed. Extract every printed option; do not add or drop options.
+- If a question refers to a diagram or image, describe the reference inside the text (for example "[চিত্র ২]") and add the flag "diagram_required: figure 2".
 
 Answer-key rules (critical):
 - Set isCorrect true ONLY for an option confirmed by a printed answer key or a clearly marked answer (tick, circle, cross-out, filled bubble).
@@ -151,6 +156,7 @@ Metadata:
 Uncertainty:
 - Put concrete OCR/visual problems in uncertain_ocr_flags (for example "illegible_text: option C", "diagram_required: figure 2", "cropped_margin").
 - Set requires_manual_answer_verification=true whenever the answer key needs a human check.
+- Add a flag for every unreadable or incomplete part (for example "illegible_text: option C", "missing_option", "incomplete_question", "merged_question_boundary"). Never silently drop a partially readable question.
 
 Return only JSON that matches the supplied schema. No markdown fences, no commentary.`;
 
@@ -160,13 +166,8 @@ const IMAGE_MIME_LABELS: Record<string, string> = {
   'image/webp': 'WebP',
 };
 
-const buildPrompt = (images: ExtractionImageInput[], hint: ExtractionSourceHint): string => {
-  const imageList = images
-    .map(
-      (image, index) =>
-        `- source_image_index ${index}: "${image.file_name}" (${IMAGE_MIME_LABELS[image.mime_type] ?? image.mime_type})`
-    )
-    .join('\n');
+const buildPrompt = (image: ExtractionImageInput, hint: ExtractionSourceHint): string => {
+  const imageLabel = `"${image.file_name}" (${IMAGE_MIME_LABELS[image.mime_type] ?? image.mime_type})`;
 
   const hintLines = [
     hint.institution ? `Institution/board hint: ${hint.institution}` : '',
@@ -177,8 +178,8 @@ const buildPrompt = (images: ExtractionImageInput[], hint: ExtractionSourceHint)
     .filter(Boolean)
     .join('\n');
 
-  return `Extract every MCQ from these ${images.length} question-paper image(s), in the order listed:
-${imageList}
+  return `Extract every MCQ from this question-paper image:
+- source_image_index 0: ${imageLabel}
 
 ${hintLines ? `The uploader supplied these hints; use them only when the paper is consistent with them:\n${hintLines}\n\n` : ''}Respond with JSON matching the schema.`;
 };
@@ -189,7 +190,7 @@ const mapModelError = (error: unknown): ExtractionServiceError => {
 
   if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('aborted')) {
     return new ExtractionServiceError(
-      'The AI extraction timed out. Try fewer images or retry.',
+      'The AI extraction timed out. Try a clearer photo or retry.',
       504,
       'EXTRACTION_TIMEOUT'
     );
@@ -220,16 +221,16 @@ export interface ExtractionServiceResult {
 }
 
 /**
- * Extracts questions from the supplied images in one multimodal call.
+ * Extracts questions from the single supplied question-paper image.
  *
- * A single call keeps questions from consecutive pages in context and stays
- * inside one request budget; per-image statuses are derived from the questions
- * that cite each image.
+ * Phase 4 processes one image per request, so every question cites
+ * source_image_index 0 and the image status is derived from those questions.
  */
-export const extractQuestionsFromImages = async (
+export const extractQuestionsFromImage = async (
   body: unknown
 ): Promise<ExtractionServiceResult> => {
   const request = parseExtractionRequest(body);
+  const image = request.images[0];
 
   if (!process.env.GEMINI_API_KEY) {
     // Never include the value or any part of it in the message.
@@ -242,12 +243,9 @@ export const extractQuestionsFromImages = async (
   }
 
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
-    { text: buildPrompt(request.images, request.sourceHint) },
+    { text: buildPrompt(image, request.sourceHint) },
+    { inlineData: { mimeType: image.mime_type, data: image.data } },
   ];
-
-  for (const image of request.images) {
-    parts.push({ inlineData: { mimeType: image.mime_type, data: image.data } });
-  }
 
   const controller = new AbortController();
   let timedOut = false;
@@ -290,7 +288,7 @@ export const extractQuestionsFromImages = async (
     if (error instanceof ExtractionServiceError) throw error;
     if (timedOut) {
       throw new ExtractionServiceError(
-        'The AI extraction timed out. Try fewer images or retry.',
+        'The AI extraction timed out. Try a clearer photo or retry.',
         504,
         'EXTRACTION_TIMEOUT'
       );

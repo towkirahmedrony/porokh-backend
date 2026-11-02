@@ -7,7 +7,7 @@ import sendResponse from '../../lib/utils/response';import {
   getAiConfigService, 
   updateAiConfigService 
 } from './ai.service';
-import { extractQuestionsFromImages, ExtractionServiceError } from './ai.extract.service';
+import { extractQuestionsFromImage, ExtractionServiceError } from './ai.extract.service';
 import { ExtractionValidationError } from './ai.extract';
 
 export const getAiConfig = catchAsync(async (req: Request, res: Response) => {
@@ -51,7 +51,7 @@ export const explainQuestion = catchAsync(async (req: Request, res: Response) =>
  */
 export const extractQuestions = catchAsync(async (req: Request, res: Response) => {
   try {
-    const result = await extractQuestionsFromImages(req.body);
+    const result = await extractQuestionsFromImage(req.body);
 
     return sendResponse(res, {
       statusCode: 200,
