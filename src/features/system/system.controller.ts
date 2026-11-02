@@ -5,6 +5,11 @@ import * as SystemService from './system.service';
 import speakeasy from 'speakeasy';
 import nodemailer from 'nodemailer';
 import { supabase } from '../../config/supabase';
+import {
+  UPDATE_POLICY_KEY,
+  UpdatePolicyValidationError,
+  validateUpdatePolicy,
+} from './update-policy';
 
 // ... (requestAdminOTP code) ...
 export const requestAdminOTP = catchAsync(async (req: Request, res: Response) => {
@@ -82,6 +87,30 @@ export const updateAppConfig = catchAsync(async (req: Request, res: Response) =>
   
   if (!key) return sendResponse(res, { statusCode: 400, success: false, message: 'Config key is required' });
 
+  /**
+   * The update policy drives blocking screens, so it is validated before it is
+   * stored: a malformed version string or a non-https download URL would only
+   * surface on a user's device otherwise.
+   */
+  if (key === UPDATE_POLICY_KEY) {
+    try {
+      const policy = validateUpdatePolicy(valuePayload.value);
+      const config = await SystemService.upsertAppConfig(key, { value: policy });
+      await SystemService.createAuditLog(req.user!.id, 'UPDATE', 'app_configs', key, policy);
+      return sendResponse(res, { statusCode: 200, success: true, message: 'Update policy saved', data: config });
+    } catch (error) {
+      if (error instanceof UpdatePolicyValidationError) {
+        return sendResponse(res, {
+          statusCode: 400,
+          success: false,
+          message: error.message,
+          errorCode: error.errorCode,
+        });
+      }
+      throw error;
+    }
+  }
+
   const config = await SystemService.upsertAppConfig(key, valuePayload);
   await SystemService.createAuditLog(req.user!.id, 'UPDATE', 'app_configs', key, valuePayload);
   sendResponse(res, { statusCode: 200, success: true, message: 'Config updated', data: config });
@@ -93,6 +122,18 @@ export const updateXPRules = catchAsync(async (req: Request, res: Response) => {
   const data = await SystemService.updateXPRules(rules);
   await SystemService.createAuditLog(req.user!.id, 'UPDATE', 'app_configs', 'xp_rules', rules);
   sendResponse(res, { statusCode: 200, success: true, message: 'XP rules updated successfully', data });
+});
+
+/**
+ * Published build identities + the active policy.
+ *
+ * Public: the website version and the signed OTA pointer are already public
+ * documents, and the clients need the policy. Nothing administrative (secrets,
+ * tokens, signing keys) is part of this payload.
+ */
+export const getVersionStatus = catchAsync(async (_req: Request, res: Response) => {
+  const status = await SystemService.getVersionStatus();
+  sendResponse(res, { statusCode: 200, success: true, message: 'Version status', data: status });
 });
 
 export const getThemeConfig = catchAsync(async (req: Request, res: Response) => {

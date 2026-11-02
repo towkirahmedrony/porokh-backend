@@ -12,6 +12,8 @@ const router = Router();
 // ==========================================
 router.get('/home-grids', SystemController.getHomeGrids);
 router.get('/theme-config', SystemController.getThemeConfig);
+// Published website/OTA identities plus the active update policy.
+router.get('/version-status', SystemController.getVersionStatus);
 
 // সব কনফিগ বা নির্দিষ্ট কী দিয়ে কনফিগ আনা
 router.get('/configs', SystemController.getAppConfigs);

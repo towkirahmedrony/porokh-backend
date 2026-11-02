@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 import { createCorsOptions } from './config/cors';
+import { requireSupportedNativeVersion } from './middlewares/requireSupportedNativeVersion';
 
 // রাউট ইম্পোর্ট
 import authRoutes from './features/auth/auth.routes';
@@ -84,6 +85,30 @@ app.get('/health', (req: Request, res: Response) => {
 // Application Routes (Standard API v1)
 app.use('/api/v1/auth', authRoutes); 
 app.use('/api/v1/profiles', profileRoutes);
+
+// An installed APK that declares itself below the enforced minimum may not use
+// the student APIs. Auth, profiles and /system stay reachable so it can sign in
+// and read the policy that tells it to update. A client that sends no
+// `x-native-version` header (website, admin, older APKs) is unaffected.
+app.use(
+  [
+    '/api/v1/content',
+    '/api/v1/institutions',
+    '/api/v1/exams',
+    '/api/v1/history',
+    '/api/v1/progress',
+    '/api/v1/leaderboard',
+    '/api/v1/groups',
+    '/api/v1/battles',
+    '/api/v1/notices',
+    '/api/v1/notifications',
+    '/api/v1/admissions',
+    '/api/v1/ai',
+    '/api/v1/growth',
+    '/api/v1/referral',
+  ],
+  requireSupportedNativeVersion
+);
 
 // 🛠️ Content & Institutions Fix
 app.use('/api/v1/content', contentRoutes);

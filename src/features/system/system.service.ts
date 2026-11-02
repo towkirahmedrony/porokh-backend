@@ -1,5 +1,10 @@
 import { supabase } from '../../config/supabase';
 import { supabaseAdmin } from '../../config/supabaseAdmin';
+import {
+  UPDATE_POLICY_KEY,
+  parseUpdatePolicy,
+  type UpdatePolicy,
+} from './update-policy';
 
 // ==========================================
 // Home Grids (Dynamic Homepage Builder)
@@ -45,6 +50,7 @@ const PUBLIC_SYSTEM_CONFIG_KEYS = [
   'theme_config',
   'daily_quote',
   'xp_rules',
+  UPDATE_POLICY_KEY,
 ] as const;
 
 const PUBLIC_SYSTEM_CONFIG_COLUMNS =
@@ -78,6 +84,98 @@ export const upsertAppConfig = async (key: string, valuePayload: any) => {
   const { data, error } = await supabaseAdmin.from('app_configs').upsert({ key, ...valuePayload }, { onConflict: 'key' }).select().single();
   if (error) throw error;
   return data;
+};
+
+export const getUpdatePolicy = async (): Promise<UpdatePolicy> => {
+  const { data, error } = await supabase
+    .from('app_configs')
+    .select('value')
+    .eq('key', UPDATE_POLICY_KEY)
+    .maybeSingle();
+
+  // A missing row is the normal state before any admin has saved a policy.
+  if (error && error.code !== 'PGRST116') throw error;
+  return parseUpdatePolicy(data?.value);
+};
+
+/**
+ * Where the public build identities are published. Both documents are already
+ * public and are exactly what the clients read, so nothing secret is involved.
+ */
+const PRODUCTION_WEB_URL = 'https://porokhbd.vercel.app';
+const OTA_POINTER_URL =
+  'https://raw.githubusercontent.com/towkirahmedrony/porokh-ota/main/channels/production-android.json';
+
+const VERSION_STATUS_TTL_MS = 30_000;
+
+let versionStatusCache: { at: number; value: VersionStatus } | null = null;
+
+export type VersionStatus = {
+  website: { version: string; buildId: string | null; builtAt: string | null } | null;
+  ota: {
+    version: string;
+    minNativeVersion: string | null;
+    publishedAt: string | null;
+  } | null;
+  policy: UpdatePolicy;
+};
+
+const fetchJson = async (url: string): Promise<unknown> => {
+  const response = await fetch(url, {
+    headers: {
+      accept: 'application/json',
+      'user-agent': 'porokh-backend',
+    },
+    signal: AbortSignal.timeout(4_000),
+  });
+  if (!response.ok) return null;
+  return (await response.json()) as unknown;
+};
+
+const str = (value: unknown): string | null =>
+  typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+
+/**
+ * Snapshot of the currently published identities, for the admin panel.
+ *
+ * Read-only and best-effort: a GitHub/Vercel hiccup must render as "unknown"
+ * in the admin UI, never as a failed settings page.
+ */
+export const getVersionStatus = async (): Promise<VersionStatus> => {
+  const cached = versionStatusCache;
+  if (cached && Date.now() - cached.at < VERSION_STATUS_TTL_MS) {
+    return cached.value;
+  }
+
+  const [webRaw, otaRaw, policy] = await Promise.all([
+    fetchJson(`${PRODUCTION_WEB_URL}/version.json`).catch(() => null),
+    fetchJson(OTA_POINTER_URL).catch(() => null),
+    getUpdatePolicy(),
+  ]);
+
+  const web = (webRaw ?? {}) as Record<string, unknown>;
+  const ota = (otaRaw ?? {}) as Record<string, unknown>;
+
+  const value: VersionStatus = {
+    website: str(web.version)
+      ? {
+          version: str(web.version) as string,
+          buildId: str(web.buildId),
+          builtAt: str(web.builtAt),
+        }
+      : null,
+    ota: str(ota.version)
+      ? {
+          version: str(ota.version) as string,
+          minNativeVersion: str(ota.minNativeVersion),
+          publishedAt: str(ota.publishedAt),
+        }
+      : null,
+    policy,
+  };
+
+  versionStatusCache = { at: Date.now(), value };
+  return value;
 };
 
 export const getGlobalThemeConfig = async () => {
