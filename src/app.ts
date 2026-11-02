@@ -70,6 +70,10 @@ app.use(
     })
   )
 );
+// Question-paper images are sent inline, so this one route needs a larger body
+// limit than the 100kb default. Base64 adds ~33%, so 33mb leaves room for the
+// 24MB decoded total the route itself enforces (plus the per-image cap).
+app.use('/api/v1/ai/extract-questions', express.json({ limit: '33mb' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());

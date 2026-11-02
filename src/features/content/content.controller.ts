@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import * as contentService from './content.service';
 import * as questionService from './question.service';
+import * as questionImportService from './question.import.service';
 import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response';
 import { AuditFilterParams } from './content.types';
@@ -70,6 +71,53 @@ export const bulkCreateQuestions = catchAsync(async (req: AuthReq, res: Response
     role: req.userRole,
   });
   sendResponse(res, { statusCode: 201, success: true, message: `${result.length} questions uploaded successfully`, data: result });
+});
+
+/**
+ * Question Importer batch endpoint.
+ *
+ * `dry_run: true` runs the same validation and duplicate detection without
+ * writing, so the importer can show duplicates before anything is committed.
+ * The author identity and role come from the verified token, never the body.
+ */
+export const importQuestions = catchAsync(async (req: AuthReq, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  if (!req.user?.id) {
+    return sendResponse(res, { statusCode: 401, success: false, message: 'Unauthorized' });
+  }
+
+  const result = await questionImportService.importQuestions(body.questions, {
+    userId: req.user.id,
+    role: req.userRole,
+    dryRun: body.dry_run === true,
+    sourceLabel: typeof body.source_label === 'string' ? body.source_label : null,
+    subjectLabels: Array.isArray(body.subject_labels)
+      ? body.subject_labels.filter((label): label is string => typeof label === 'string')
+      : [],
+  });
+
+  sendResponse(res, {
+    statusCode: result.dry_run ? 200 : 201,
+    success: true,
+    message: result.dry_run
+      ? 'Import pre-check completed'
+      : `${result.counts.imported} of ${result.counts.total} questions imported`,
+    data: result,
+  });
+});
+
+export const getQuestionImportHistory = catchAsync(async (req: AuthReq, res: Response) => {
+  if (!req.user?.id) {
+    return sendResponse(res, { statusCode: 401, success: false, message: 'Unauthorized' });
+  }
+
+  const history = await questionImportService.getQuestionImportHistory(
+    req.user.id,
+    Number(req.query.limit) || 50
+  );
+
+  sendResponse(res, { statusCode: 200, success: true, message: 'Import history retrieved', data: history });
 });
 
 export const updateQuestion = catchAsync(async (req: AuthReq, res: Response) => {

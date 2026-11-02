@@ -26,7 +26,8 @@ const DEFAULT_SYSTEM_PROMPT =
 let genAiClient: GoogleGenerativeAI | null = null;
 let embeddingGenAiClient: GoogleGenerativeAI | null = null;
 
-const getGeminiClient = (): GoogleGenerativeAI => {
+/** Shared Gemini client for every text-generation feature (chat, explanation, extraction). */
+export const getGeminiClient = (): GoogleGenerativeAI => {
   if (!genAiClient) {
     genAiClient = new GoogleGenerativeAI(getEnvOrThrow('GEMINI_API_KEY'));
   }

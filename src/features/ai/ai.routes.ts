@@ -1,7 +1,10 @@
 import { Router } from 'express';
-import { syncVectorIndex, chatWithAI, explainQuestion, getAiConfig, updateAiConfig } from './ai.controller';
+import { syncVectorIndex, chatWithAI, explainQuestion, getAiConfig, updateAiConfig, extractQuestions } from './ai.controller';
 import { requireAuth } from '../../middlewares/requireAuth';
 import { rbacGuard } from '../../middlewares/rbacGuard';
+import { requirePermission } from '../../middlewares/requirePermission';
+import { PERMISSIONS } from '../../middlewares/authorization';
+import { rateLimit } from '../../middlewares/rateLimit';
 
 const router = Router();
 
@@ -15,5 +18,16 @@ router.post('/sync-embeddings', requireAuth, rbacGuard(['admin']), syncVectorInd
 // Chat (Any logged in user)
 router.post('/chat', requireAuth, chatWithAI);
 router.post('/explanation', requireAuth, explainQuestion);
+
+// AI Question Importer: the same author roles and permission as the import
+// endpoint, plus a per-user cap so one account cannot drain the Gemini quota.
+router.post(
+  '/extract-questions',
+  requireAuth,
+  rbacGuard(['admin', 'editor', 'teacher']),
+  requirePermission(PERMISSIONS.QUESTIONS_MANAGE),
+  rateLimit({ windowMs: 10 * 60 * 1000, max: 12, keyPrefix: 'ai:extract' }),
+  extractQuestions
+);
 
 export default router;

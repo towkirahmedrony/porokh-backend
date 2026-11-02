@@ -1,13 +1,14 @@
 import { Request, Response } from 'express';
 import catchAsync from '../../lib/utils/catchAsync';
-import sendResponse from '../../lib/utils/response';
-import { 
+import sendResponse from '../../lib/utils/response';import {
   syncVectorEmbeddingsService, 
   chatWithAiService, 
   explainQuestionWithAiService,
   getAiConfigService, 
   updateAiConfigService 
 } from './ai.service';
+import { extractQuestionsFromImages, ExtractionServiceError } from './ai.extract.service';
+import { ExtractionValidationError } from './ai.extract';
 
 export const getAiConfig = catchAsync(async (req: Request, res: Response) => {
   const result = await getAiConfigService();
@@ -40,4 +41,33 @@ export const explainQuestion = catchAsync(async (req: Request, res: Response) =>
   const { question, lang } = req.body;
   const result = await explainQuestionWithAiService((req as any).user.id, question, lang);
   sendResponse(res, 200, true, 'AI explanation generated', result);
+});
+
+/**
+ * Question-paper extraction for the AI Question Importer.
+ *
+ * Request/response validation lives in `ai.extract`; the service maps upstream
+ * failures to safe statuses so no Gemini detail (or key) reaches the client.
+ */
+export const extractQuestions = catchAsync(async (req: Request, res: Response) => {
+  try {
+    const result = await extractQuestionsFromImages(req.body);
+
+    return sendResponse(res, {
+      statusCode: 200,
+      success: true,
+      message: `${result.questions.length} question(s) extracted`,
+      data: result,
+    });
+  } catch (error) {
+    if (error instanceof ExtractionValidationError || error instanceof ExtractionServiceError) {
+      return sendResponse(res, {
+        statusCode: error.status,
+        success: false,
+        message: error.message,
+      });
+    }
+
+    throw error;
+  }
 });

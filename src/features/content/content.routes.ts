@@ -49,6 +49,11 @@ router.delete('/questions/:id/hard', rbacGuard(['admin']), requirePermission(PER
 
 router.post('/questions', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), contentController.createQuestion);
 router.post('/questions/bulk', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), contentController.bulkCreateQuestions);
+
+// AI Question Importer: duplicate-aware batch import and its history.
+// Same author roles and permission as the admin panel's bulk upload.
+router.post('/questions/import', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), contentController.importQuestions);
+router.get('/questions/import-history', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), contentController.getQuestionImportHistory);
 router.put('/questions/:id', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), contentController.updateQuestion);
 router.delete('/questions/:id', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.MODERATION_ACTION), contentController.deleteQuestion); // Soft Delete
 
