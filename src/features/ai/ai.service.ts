@@ -26,7 +26,10 @@ const DEFAULT_SYSTEM_PROMPT =
 let genAiClient: GoogleGenerativeAI | null = null;
 let embeddingGenAiClient: GoogleGenerativeAI | null = null;
 
-/** Shared Gemini client for every text-generation feature (chat, explanation, extraction). */
+/**
+ * Shared Gemini client for the student AI Assistant (chat and explanations).
+ * Question extraction uses its own provider credential instead.
+ */
 export const getGeminiClient = (): GoogleGenerativeAI => {
   if (!genAiClient) {
     genAiClient = new GoogleGenerativeAI(getEnvOrThrow('GEMINI_API_KEY'));

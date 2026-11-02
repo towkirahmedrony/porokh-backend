@@ -46,8 +46,8 @@ export const explainQuestion = catchAsync(async (req: Request, res: Response) =>
 /**
  * Question-paper extraction for the AI Question Importer.
  *
- * Request/response validation lives in `ai.extract`; the service maps upstream
- * failures to safe statuses so no Gemini detail (or key) reaches the client.
+ * Request/response validation lives in `ai.extract`; the service maps provider
+ * failures to safe statuses so no upstream detail (or key) reaches the client.
  */
 export const extractQuestions = catchAsync(async (req: Request, res: Response) => {
   try {

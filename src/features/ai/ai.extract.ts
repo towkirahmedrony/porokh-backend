@@ -3,7 +3,8 @@
  *
  * Everything here is deterministic and database-free, so the extraction rules
  * (limits, answer-key guard, uncertain-flag propagation) can be tested without
- * calling Gemini or a live project. The service layer owns the model call.
+ * calling the extraction provider or a live project. The service layer owns
+ * the model call.
  */
 
 type AnyObject = Record<string, unknown>;
@@ -13,7 +14,7 @@ export const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 /** Phase 4 extracts one page per request; multi-page batches are not accepted. */
 export const EXTRACT_IMAGE_COUNT = 1;
 
-/** Gemini accepts these inline image formats; anything else is rejected early. */
+/** These inline image formats are accepted; anything else is rejected early. */
 export const ACCEPTED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
 
 const DIFFICULTY_LEVELS = ['easy', 'medium', 'hard', 'expert'] as const;
@@ -45,7 +46,7 @@ const REFERENCE_KINDS = new Set([
 ]);
 
 /**
- * Only these Gemini-reported answer sources may set `isCorrect`. Everything
+ * Only these provider-reported answer sources may set `isCorrect`. Everything
  * else is left blank for a human, because an unprinted answer must never be
  * invented by the model.
  */
@@ -342,7 +343,7 @@ const sanitizeOptions = (value: unknown): Array<{
 /**
  * Enforces "never invent a missing answer".
  *
- * Gemini may only keep an answer key when it says the answer was printed or
+ * The model may only keep an answer key when it says the answer was printed or
  * marked on the paper AND exactly one option is flagged. Any other combination
  * clears the key and asks the reviewer to choose, so an ambiguous or absent
  * answer can never be imported silently.

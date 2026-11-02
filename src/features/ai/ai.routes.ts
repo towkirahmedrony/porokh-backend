@@ -20,7 +20,8 @@ router.post('/chat', requireAuth, chatWithAI);
 router.post('/explanation', requireAuth, explainQuestion);
 
 // AI Question Importer: the same author roles and permission as the import
-// endpoint, plus a per-user cap so one account cannot drain the Gemini quota.
+// endpoint, plus a per-user cap so one account cannot drain the free extraction
+// provider's quota (a separate credential from the student Assistant Gemini).
 router.post(
   '/extract-questions',
   requireAuth,

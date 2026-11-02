@@ -1,6 +1,10 @@
-import { SchemaType, type ResponseSchema } from '@google/generative-ai';
 import logger from '../../lib/utils/logger';
-import { getGeminiClient } from './ai.service';
+import {
+  ExtractionProviderError,
+  callExtractionProvider,
+  readExtractionProviderConfig,
+  type ExtractionProviderConfig,
+} from './ai.extract.provider';
 import {
   buildImageResults,
   parseExtractionRequest,
@@ -13,17 +17,15 @@ import {
 } from './ai.extract';
 
 /**
- * Gemini-backed extraction of bilingual MCQs from a single question-paper image.
+ * Extraction of bilingual MCQs from a single question-paper image.
  *
- * The API key never leaves this process and the model is given a strict
- * response schema; whatever comes back is re-validated by `ai.extract` before
- * it reaches the importer.
+ * The model call goes through the dedicated extraction Gemini project
+ * (`EXTRACTION_GEMINI_API_KEY`), so the student AI Assistant's Gemini project and
+ * quota are never used. Whatever comes back is re-validated by `ai.extract`
+ * before it reaches the importer.
  */
 
-const EXTRACTION_MODEL = 'gemini-2.5-flash';
 const REQUEST_TIMEOUT_MS = 90_000;
-const MAX_OUTPUT_TOKENS = 8192;
-const TEMPERATURE = 0.15;
 
 export class ExtractionServiceError extends Error {
   status: number;
@@ -36,94 +38,6 @@ export class ExtractionServiceError extends Error {
     this.errorCode = errorCode;
   }
 }
-
-const QUESTION_SCHEMA: ResponseSchema = {
-  type: SchemaType.OBJECT,
-  properties: {
-    batch_source_info: {
-      type: SchemaType.OBJECT,
-      properties: {
-        institution: { type: SchemaType.STRING },
-        exam_name: { type: SchemaType.STRING },
-        year: { type: SchemaType.STRING },
-      },
-    },
-    questions: {
-      type: SchemaType.ARRAY,
-      items: {
-        type: SchemaType.OBJECT,
-        properties: {
-          question_number: { type: SchemaType.STRING },
-          body: {
-            type: SchemaType.OBJECT,
-            properties: {
-              text_bn: { type: SchemaType.STRING },
-              text_en: { type: SchemaType.STRING },
-            },
-            required: ['text_bn', 'text_en'],
-          },
-          options: {
-            type: SchemaType.ARRAY,
-            items: {
-              type: SchemaType.OBJECT,
-              properties: {
-                text_bn: { type: SchemaType.STRING },
-                text_en: { type: SchemaType.STRING },
-                isCorrect: { type: SchemaType.BOOLEAN },
-              },
-              required: ['text_bn', 'text_en', 'isCorrect'],
-            },
-          },
-          explanation: {
-            type: SchemaType.OBJECT,
-            properties: {
-              bn: { type: SchemaType.STRING },
-              en: { type: SchemaType.STRING },
-            },
-            required: ['bn', 'en'],
-          },
-          difficulty_level: { type: SchemaType.STRING },
-          source_type: { type: SchemaType.STRING },
-          exam_references: {
-            type: SchemaType.ARRAY,
-            items: {
-              type: SchemaType.OBJECT,
-              properties: {
-                source_kind: { type: SchemaType.STRING },
-                board: { type: SchemaType.STRING },
-                institution_name: { type: SchemaType.STRING },
-                exam_name: { type: SchemaType.STRING },
-                year: { type: SchemaType.STRING },
-              },
-            },
-          },
-          tags: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
-          answer_source: { type: SchemaType.STRING },
-          answer_evidence: { type: SchemaType.STRING },
-          requires_manual_answer_verification: { type: SchemaType.BOOLEAN },
-          uncertain_ocr_flags: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
-          source_image_index: { type: SchemaType.INTEGER },
-        },
-        required: [
-          'question_number',
-          'body',
-          'options',
-          'explanation',
-          'difficulty_level',
-          'source_type',
-          'exam_references',
-          'tags',
-          'answer_source',
-          'answer_evidence',
-          'requires_manual_answer_verification',
-          'uncertain_ocr_flags',
-          'source_image_index',
-        ],
-      },
-    },
-  },
-  required: ['batch_source_info', 'questions'],
-};
 
 const SYSTEM_INSTRUCTION = `You are a precise exam-paper digitisation engine for a Bangladeshi bilingual question bank (Bangla and English).
 Read every multiple-choice question (MCQ) from the supplied question-paper image in order.
@@ -158,7 +72,10 @@ Uncertainty:
 - Set requires_manual_answer_verification=true whenever the answer key needs a human check.
 - Add a flag for every unreadable or incomplete part (for example "illegible_text: option C", "missing_option", "incomplete_question", "merged_question_boundary"). Never silently drop a partially readable question.
 
-Return only JSON that matches the supplied schema. No markdown fences, no commentary.`;
+Output format:
+- Reply with one JSON object and nothing else: no markdown fences, no commentary.
+- Shape: {"batch_source_info":{"institution":"","exam_name":"","year":""},"questions":[{"question_number":"","body":{"text_bn":"","text_en":""},"options":[{"text_bn":"","text_en":"","isCorrect":false}],"explanation":{"bn":"","en":""},"difficulty_level":"medium","source_type":"unknown","exam_references":[{"source_kind":"unknown","board":"","institution_name":"","exam_name":"","year":""}],"tags":[""],"answer_source":"none","answer_evidence":"","requires_manual_answer_verification":true,"uncertain_ocr_flags":[""],"source_image_index":0}]}
+- Every field above is required on every question, even when its value is empty.`;
 
 const IMAGE_MIME_LABELS: Record<string, string> = {
   'image/jpeg': 'JPEG',
@@ -181,34 +98,43 @@ const buildPrompt = (image: ExtractionImageInput, hint: ExtractionSourceHint): s
   return `Extract every MCQ from this question-paper image:
 - source_image_index 0: ${imageLabel}
 
-${hintLines ? `The uploader supplied these hints; use them only when the paper is consistent with them:\n${hintLines}\n\n` : ''}Respond with JSON matching the schema.`;
+${hintLines ? `The uploader supplied these hints; use them only when the paper is consistent with them:\n${hintLines}\n\n` : ''}Respond with the JSON object described by the system instructions.`;
 };
 
-const mapModelError = (error: unknown): ExtractionServiceError => {
-  const message = error instanceof Error ? error.message : '';
-  const lower = message.toLowerCase();
-
-  if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('aborted')) {
-    return new ExtractionServiceError(
-      'The AI extraction timed out. Try a clearer photo or retry.',
-      504,
-      'EXTRACTION_TIMEOUT'
-    );
+/** Maps a provider failure to a safe HTTP status and machine-readable code. */
+const mapProviderError = (error: ExtractionProviderError): ExtractionServiceError => {
+  switch (error.failure) {
+    case 'not_configured':
+      return new ExtractionServiceError(
+        'The AI extraction service is not configured.',
+        503,
+        'EXTRACTION_NOT_CONFIGURED'
+      );
+    case 'timeout':
+      return new ExtractionServiceError(
+        'The AI extraction timed out. Try a clearer photo or retry.',
+        504,
+        'EXTRACTION_TIMEOUT'
+      );
+    case 'rate_limited':
+      return new ExtractionServiceError(
+        'The AI service is busy right now. Please wait a moment and retry.',
+        429,
+        'EXTRACTION_RATE_LIMITED'
+      );
+    case 'invalid_response':
+      return new ExtractionServiceError(
+        'The AI response could not be read. Please retry.',
+        502,
+        'EXTRACTION_INVALID_RESPONSE'
+      );
+    default:
+      return new ExtractionServiceError(
+        'The AI extraction service is unavailable. Please retry.',
+        502,
+        'EXTRACTION_UNAVAILABLE'
+      );
   }
-
-  if (lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted')) {
-    return new ExtractionServiceError(
-      'The AI service is busy right now. Please wait a moment and retry.',
-      429,
-      'EXTRACTION_RATE_LIMITED'
-    );
-  }
-
-  return new ExtractionServiceError(
-    'The AI extraction service is unavailable. Please retry.',
-    502,
-    'EXTRACTION_UNAVAILABLE'
-  );
 };
 
 export interface ExtractionServiceResult {
@@ -232,81 +158,44 @@ export const extractQuestionsFromImage = async (
   const request = parseExtractionRequest(body);
   const image = request.images[0];
 
-  if (!process.env.GEMINI_API_KEY) {
+  let config: ExtractionProviderConfig;
+  try {
+    config = readExtractionProviderConfig();
+  } catch (error) {
     // Never include the value or any part of it in the message.
-    logger.error('[ai:extract] GEMINI_API_KEY is not configured');
-    throw new ExtractionServiceError(
-      'The AI extraction service is not configured.',
-      503,
-      'EXTRACTION_NOT_CONFIGURED'
-    );
+    logger.error('[ai:extract] EXTRACTION_GEMINI_API_KEY is not configured');
+    throw error instanceof ExtractionProviderError ? mapProviderError(error) : error;
   }
 
-  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
-    { text: buildPrompt(image, request.sourceHint) },
-    { inlineData: { mimeType: image.mime_type, data: image.data } },
-  ];
-
-  const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, REQUEST_TIMEOUT_MS);
-
   let text: string;
-
   try {
-    const model = getGeminiClient().getGenerativeModel({
-      model: EXTRACTION_MODEL,
+    const result = await callExtractionProvider({
+      config,
       systemInstruction: SYSTEM_INSTRUCTION,
-      generationConfig: {
-        temperature: TEMPERATURE,
-        maxOutputTokens: MAX_OUTPUT_TOKENS,
-        responseMimeType: 'application/json',
-        responseSchema: QUESTION_SCHEMA,
-      },
+      prompt: buildPrompt(image, request.sourceHint),
+      image: { mime_type: image.mime_type, data: image.data },
+      timeoutMs: REQUEST_TIMEOUT_MS,
     });
 
-    const result = await model.generateContent(
-      { contents: [{ role: 'user', parts }] },
-      { timeout: REQUEST_TIMEOUT_MS, signal: controller.signal }
-    );
-
-    const response = result.response;
-
-    if (response.promptFeedback?.blockReason) {
-      throw new ExtractionServiceError(
-        'The images could not be processed. Please try clearer photos.',
-        422,
-        'EXTRACTION_BLOCKED'
-      );
-    }
-
-    text = response.text();
+    text = result.text;
   } catch (error) {
-    if (error instanceof ExtractionServiceError) throw error;
-    if (timedOut) {
-      throw new ExtractionServiceError(
-        'The AI extraction timed out. Try a clearer photo or retry.',
-        504,
-        'EXTRACTION_TIMEOUT'
-      );
+    if (error instanceof ExtractionProviderError) {
+      if (error.failure !== 'not_configured') {
+        // Log the normalised failure only: never the key, the image or the body.
+        logger.error(`[ai:extract] provider failure: ${error.failure}`);
+      }
+      throw mapProviderError(error);
     }
-    // Log only the upstream type, never the API key or the image payload.
-    logger.error(
-      `[ai:extract] Gemini request failed: ${error instanceof Error ? error.name : 'unknown'}`
+    throw mapProviderError(
+      new ExtractionProviderError('The AI extraction provider failed.', 'unavailable')
     );
-    throw mapModelError(error);
-  } finally {
-    clearTimeout(timer);
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    logger.error('[ai:extract] Gemini returned non-JSON output');
+    logger.error('[ai:extract] provider returned non-JSON output');
     throw new ExtractionServiceError(
       'The AI response could not be read. Please retry.',
       502,
@@ -318,7 +207,7 @@ export const extractQuestionsFromImage = async (
   try {
     sanitized = sanitizeModelOutput(parsed, request.images.length);
   } catch {
-    logger.error('[ai:extract] Gemini response failed schema validation');
+    logger.error('[ai:extract] provider response failed schema validation');
     throw new ExtractionServiceError(
       'The AI response could not be read. Please retry.',
       502,
@@ -327,7 +216,7 @@ export const extractQuestionsFromImage = async (
   }
 
   return {
-    model: EXTRACTION_MODEL,
+    model: config.model,
     images: buildImageResults(request.images, sanitized.questions),
     questions: sanitized.questions,
     rejected: sanitized.rejected,

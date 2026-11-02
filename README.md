@@ -26,7 +26,26 @@ development and never commit the result.
 | `FIREBASE_*` | Firebase Admin credentials for push notifications. |
 | `CLOUDINARY_*` | Media uploads. |
 | `SMTP_EMAIL`, `SMTP_PASSWORD` | Outbound email. |
+| `GEMINI_API_KEY` | Student AI Assistant (tutor chat and explanations). |
 | `GEMINI_EMBEDDING_API_KEY` | Question embeddings. |
+| `EXTRACTION_GEMINI_API_KEY` | AI Question Importer extraction, from its own Google Cloud project. |
+| `EXTRACTION_GEMINI_MODEL` | Optional extraction model override (default `gemini-3.8-flash`). |
+
+### AI provider isolation
+
+Two Gemini credentials exist and they are never interchangeable:
+
+- `GEMINI_API_KEY` serves the student AI Assistant and is read only by
+  `features/ai/ai.service.ts`.
+- `EXTRACTION_GEMINI_API_KEY` serves question extraction and is read only by
+  `features/ai/ai.extract.provider.ts`. It must come from a second Google Cloud
+  project so importer traffic cannot exhaust the assistant's quota.
+
+When the extraction key is missing the endpoint answers `503` with
+`EXTRACTION_NOT_CONFIGURED`; it never borrows the assistant key. Extraction runs
+on `EXTRACTION_GEMINI_MODEL` (default `gemini-3.8-flash`, a free-tier vision
+model) with its own prompt, JSON output mode, validation and per-user rate
+limit.
 
 ### `EXAM_SUBMIT_GRACE_MS`
 
