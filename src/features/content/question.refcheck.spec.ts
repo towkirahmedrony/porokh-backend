@@ -10,8 +10,9 @@ const inst = (
   name_bn: string,
   short_name: string,
   code: string,
-  type = 'university'
-): InstitutionRecord => ({ id, name_en, name_bn, short_name, code, eiin: code, type });
+  type = 'university',
+  aliases: string[] = []
+): InstitutionRecord => ({ id, name_en, name_bn, short_name, code, eiin: code, type, aliases });
 
 const INSTITUTIONS: InstitutionRecord[] = [
   inst('du', 'University of Dhaka', 'ঢাকা বিশ্ববিদ্যালয়', 'DU', '90000001'),
@@ -66,6 +67,58 @@ test('different spellings of the same institution resolve to one row', () => {
   ]) {
     assert.equal(idOf(name), 'ru', name);
   }
+});
+
+test('exact English and Bengali aliases match and show the canonical institution', () => {
+  const rows = [
+    inst('college', 'Abdul Kadir Mollah City College', 'আবদুল কাদির মোল্লা সিটি কলেজ', 'AKMCC', '108500', 'college', [
+      'কাদির মোল্লা সিটি কলেজ',
+      'abdul kadir molla city college',
+    ]),
+  ];
+
+  for (const alias of ['abdul kadir molla city college', 'কাদির মোল্লা সিটি কলেজ']) {
+    const result = matchInstitution(alias, 'college', rows);
+    assert.equal(result.status, 'matched');
+    if (result.status === 'matched') {
+      assert.equal(result.institution.id, 'college');
+      assert.equal(result.matchedByAlias, true);
+    }
+  }
+
+  const parsed = parseQuestionText(
+    '@institution: abdul kadir molla city college\nQ: x\nA: a\nB: b\nANS: A'
+  );
+  const checks = applyReferenceChecks(parsed.questions, rows, new Map());
+  assert.match(checks[0].message, /Abdul Kadir Mollah City College/);
+  assert.match(checks[0].message, /matched by alternative name/);
+});
+
+test('aliases normalize case, whitespace and punctuation and allow stored misspellings', () => {
+  const rows = [
+    inst('college', 'North Valley College', 'নর্থ ভ্যালি কলেজ', 'NVC', '101', 'college', [
+      'north valley colledge',
+    ]),
+  ];
+  assert.equal(matchInstitution('  NORTH   VALLEY, COLLEDGE! ', 'college', rows).status, 'matched');
+});
+
+test('shared aliases are ambiguous and institution type filtering is preserved', () => {
+  const rows = [
+    inst('college', 'Example College', '', 'EXC', '101', 'college', ['common name']),
+    inst('university', 'Example University', '', 'EXU', '102', 'university', ['common name']),
+  ];
+  assert.equal(matchInstitution('common name', null, rows).status, 'ambiguous');
+  const collegeOnly = matchInstitution('common name', 'college', rows);
+  assert.equal(collegeOnly.status, 'matched');
+  if (collegeOnly.status === 'matched') assert.equal(collegeOnly.institution.id, 'college');
+});
+
+test('EIIN matching remains exact while fuzzy similarity remains suggestion-only', () => {
+  assert.equal(matchInstitution('90000002', 'admission', INSTITUTIONS).status, 'matched');
+  const fuzzy = matchInstitution('Dhaka Univ.', 'admission', INSTITUTIONS);
+  assert.equal(fuzzy.status, 'not_found');
+  if (fuzzy.status === 'not_found') assert.ok(fuzzy.suggestions.length > 0);
 });
 
 test('similar names do not collapse into each other', () => {

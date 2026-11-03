@@ -76,7 +76,7 @@ const institutionLabel = (row: InstitutionRecord): string => {
 const unitLabel = (unit: AdmissionUnitRecord): string => unit.name_en || unit.name_bn || unit.id;
 
 type InstitutionMatch =
-  | { status: 'matched'; institution: InstitutionRecord }
+  | { status: 'matched'; institution: InstitutionRecord; matchedByAlias?: boolean }
   | { status: 'ambiguous'; candidates: InstitutionRecord[] }
   | { status: 'not_found'; suggestions: string[] };
 
@@ -86,21 +86,35 @@ export const matchInstitution = (
   rows: InstitutionRecord[]
 ): InstitutionMatch => {
   const needle = input.trim();
-  const code = needle.toLowerCase();
+  const code = needle.toLowerCase().replace(/[^\p{L}\p{M}\p{N}]/gu, '');
   const inputVariants = new Set(referenceNameVariants(needle, kind));
   const eligible = rows.filter((row) => referenceKindMatchesInstitutionType(kind, row.type));
 
-  const hits = eligible.filter((row) => {
-    if (code && (lower(row.code) === code || lower(row.eiin) === code)) return true;
-
-    return [row.name_bn, row.name_en, row.short_name]
+  const matchesNames = (values: Array<string | null | undefined>): boolean =>
+    values
       .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
       .some((value) =>
         referenceNameVariants(value, kind).some((variant) => inputVariants.has(variant))
       );
-  });
+  const matchesIdentifier = (value: string | null | undefined): boolean =>
+    Boolean(code && value && value.toLowerCase().replace(/[^\p{L}\p{M}\p{N}]/gu, '') === code);
 
-  if (hits.length === 1) return { status: 'matched', institution: hits[0] };
+  const primaryHits = eligible.filter(
+    (row) =>
+      matchesIdentifier(row.code) ||
+      matchesIdentifier(row.eiin) ||
+      matchesNames([row.name_bn, row.name_en, row.short_name])
+  );
+  const aliasHits = eligible.filter((row) => matchesNames(row.aliases ?? []));
+  const hits = eligible.filter((row) => primaryHits.includes(row) || aliasHits.includes(row));
+
+  if (hits.length === 1) {
+    return {
+      status: 'matched',
+      institution: hits[0],
+      ...(primaryHits.includes(hits[0]) ? {} : { matchedByAlias: true }),
+    };
+  }
   if (hits.length > 1) return { status: 'ambiguous', candidates: hits };
 
   const wanted = new Set(tokens(needle));
@@ -108,7 +122,7 @@ export const matchInstitution = (
     .map((row) => ({
       row,
       score: Math.max(
-        ...[row.name_en, row.name_bn, row.short_name].map((value) =>
+        ...[row.name_en, row.name_bn, row.short_name, ...(row.aliases ?? [])].map((value) =>
           jaccard(wanted, new Set(tokens(value ?? '')))
         ),
         0
@@ -221,7 +235,7 @@ const resolveReference = (
       check: {
         ...base,
         status: 'ok',
-        message: `Linked to ${institutionLabel(institution)}.`,
+        message: `Linked to ${institutionLabel(institution)}${found.matchedByAlias ? ' (matched by alternative name)' : ''}.`,
         institution: institutionInfo,
       },
     };
@@ -239,7 +253,7 @@ const resolveReference = (
       check: {
         ...base,
         status: 'ok',
-        message: `Linked to ${institutionLabel(institution)}, ${unitLabel(unit)}.`,
+        message: `Linked to ${institutionLabel(institution)}, ${unitLabel(unit)}${found.matchedByAlias ? ' (matched by alternative name)' : ''}.`,
         institution: institutionInfo,
         unit: { id: unit.id, name_en: unit.name_en ?? null, name_bn: unit.name_bn ?? null },
       },

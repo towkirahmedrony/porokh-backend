@@ -19,7 +19,7 @@ export const checkParsedReferences = async (
   const [institutionResult, unitResult] = await Promise.all([
     supabase
       .from('institutions')
-      .select('id, name_bn, name_en, short_name, type, code, eiin, is_active')
+      .select('id, name_bn, name_en, short_name, type, code, eiin, aliases, is_active')
       .eq('is_active', true)
       .limit(5000),
     supabase

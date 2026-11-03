@@ -28,6 +28,7 @@ export interface InstitutionRecord {
   type?: string | null;
   code?: string | null;
   eiin?: string | null;
+  aliases?: string[] | null;
   is_active?: boolean | null;
 }
 
@@ -287,4 +288,3 @@ export const parseReferenceList = (input: unknown): unknown[] | null | undefined
     'exam_references must be an array of reference objects, an object, null or empty'
   );
 };
-
