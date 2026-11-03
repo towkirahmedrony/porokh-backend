@@ -74,6 +74,7 @@ app.use(
 // limit than the 100kb default. Base64 adds ~33%, so 33mb leaves room for the
 // 24MB decoded total the route itself enforces (plus the per-image cap).
 app.use('/api/v1/ai/extract-questions', express.json({ limit: '33mb' }));
+app.use(['/api/v1/content/questions/parse-text', '/api/v1/admin/content/questions/parse-text'], express.json({ limit: '1mb' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
