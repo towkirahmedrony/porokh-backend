@@ -50,8 +50,10 @@ const call = (
   callExtractionProvider({
     config: CONFIG,
     systemInstruction: 'system prompt',
-    prompt: 'extract this page',
-    image: IMAGE,
+    parts: [
+      { kind: 'text', text: 'extract this page' },
+      { kind: 'image', image: IMAGE },
+    ],
     timeoutMs: 1_000,
     fetchImpl: fetchImpl as typeof fetch,
     ...overrides,
@@ -134,14 +136,14 @@ test('readExtractionProviderConfig rejects a model id that could break the reque
 
 // --- request shape ---------------------------------------------------------
 
-test('callExtractionProvider posts one inline image to generateContent', async () => {
+test('callExtractionProvider posts the ordered text and image parts to generateContent', async () => {
   let seenUrl = '';
   let seenInit: RequestInit | undefined;
 
   const fetchImpl = async (url: string, init: RequestInit) => {
     seenUrl = url;
     seenInit = init;
-    return okResponse('{"questions":[]}');
+    return okResponse('Q_EN: What is it?\nANS: A');
   };
 
   const result = await call(fetchImpl);
@@ -153,7 +155,7 @@ test('callExtractionProvider posts one inline image to generateContent', async (
   // The key travels in a header so it never appears in a URL.
   assert.ok(!seenUrl.includes(CONFIG.apiKey));
 
-  assert.equal(result.text, '{"questions":[]}');
+  assert.equal(result.text, 'Q_EN: What is it?\nANS: A');
   assert.equal(result.model, 'gemini-test-vision');
 
   const headers = seenInit?.headers as Record<string, string>;
@@ -173,15 +175,15 @@ test('callExtractionProvider posts one inline image to generateContent', async (
     data: IMAGE.data,
   });
 
-  assert.equal(body.generationConfig.responseMimeType, 'application/json');
+  assert.equal(body.generationConfig.responseMimeType, undefined);
   assert.equal(body.generationConfig.maxOutputTokens, 8192);
   assert.equal(body.generationConfig.temperature, 0.15);
 });
 
-test('callExtractionProvider unwraps a fenced JSON reply', async () => {
-  const result = await call(async () => okResponse('```json\n{"questions":[]}\n```'));
+test('callExtractionProvider unwraps a fenced reply', async () => {
+  const result = await call(async () => okResponse('```text\nQ_EN: What is it?\nANS: A\n```'));
 
-  assert.equal(result.text, '{"questions":[]}');
+  assert.equal(result.text, 'Q_EN: What is it?\nANS: A');
 });
 
 test('callExtractionProvider joins answer parts and skips thinking parts', async () => {
@@ -192,8 +194,8 @@ test('callExtractionProvider joins answer parts and skips thinking parts', async
           content: {
             parts: [
               { text: 'ignored reasoning', thought: true },
-              { text: '{"questions":' },
-              { text: '[]}' },
+              { text: 'Q_EN: What is it?' },
+              { text: '\nANS: A' },
             ],
           },
           finishReason: 'STOP',
@@ -202,7 +204,7 @@ test('callExtractionProvider joins answer parts and skips thinking parts', async
     })
   );
 
-  assert.equal(result.text, '{"questions":[]}');
+  assert.equal(result.text, 'Q_EN: What is it?\nANS: A');
 });
 
 // --- upstream failures -----------------------------------------------------
@@ -283,7 +285,7 @@ test('callExtractionProvider rejects responses without usable content', async ()
     { candidates: [{ content: { parts: [] } }] },
     { candidates: [{ content: { parts: [{ text: '' }] } }] },
     { candidates: [{ content: { parts: [{ text: '   ' }] } }] },
-    { candidates: [{ content: { parts: [{ text: '{"q":1}', thought: true }] } }] },
+    { candidates: [{ content: { parts: [{ text: 'Q_EN: hidden', thought: true }] } }] },
     {},
   ];
 

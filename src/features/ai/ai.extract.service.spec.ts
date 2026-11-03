@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ExtractionServiceError, extractQuestionsFromImage } from './ai.extract.service';
+import { ExtractionServiceError, extractQuestionsFromSources } from './ai.extract.service';
 import { DEFAULT_EXTRACTION_MODEL, GEMINI_API_BASE_URL } from './ai.extract.provider';
 
 /**
@@ -11,51 +11,46 @@ import { DEFAULT_EXTRACTION_MODEL, GEMINI_API_BASE_URL } from './ai.extract.prov
  */
 
 const IMAGE = {
-  image_id: 'img_1',
+  source_id: 'img_1',
   file_name: 'page-1.jpg',
+  kind: 'image',
   mime_type: 'image/jpeg',
   data: Buffer.from('fake-jpeg-bytes').toString('base64'),
 };
 
 const REQUEST_BODY = {
-  images: [IMAGE],
+  sources: [
+    IMAGE,
+    {
+      source_id: 'txt_1',
+      file_name: 'csv-questions.csv',
+      kind: 'text',
+      text: 'Question: রাজধানী? | Answer: ঢাকা',
+    },
+  ],
   source_hint: { institution: 'Dhaka Board', year: '2024' },
 };
 
-/** A bilingual page as the extraction model would return it. */
-const GEMINI_ANSWER = {
-  batch_source_info: { institution: 'Dhaka Board', exam_name: 'SSC', year: '2024' },
-  questions: [
-    {
-      question_number: '1',
-      body: {
-        text_bn: 'বাংলাদেশের রাজধানী কোনটি?',
-        text_en: 'What is the capital of Bangladesh?',
-      },
-      options: [
-        { text_bn: 'ঢাকা', text_en: 'Dhaka', isCorrect: true },
-        { text_bn: 'খুলনা', text_en: 'Khulna', isCorrect: false },
-        { text_bn: 'চট্টগ্রাম', text_en: 'Chattogram', isCorrect: false },
-        { text_bn: 'রাজশাহী', text_en: 'Rajshahi', isCorrect: false },
-      ],
-      explanation: {
-        bn: 'ঢাকা বাংলাদেশের রাজধানী।',
-        en: 'Dhaka is the capital of Bangladesh.',
-      },
-      difficulty_level: 'easy',
-      source_type: 'board_exam',
-      exam_references: [
-        { source_kind: 'board', board: 'Dhaka Board', exam_name: 'SSC', year: '2024' },
-      ],
-      tags: ['capital'],
-      answer_source: 'printed',
-      answer_evidence: 'Answer key: 1. ঢাকা',
-      requires_manual_answer_verification: false,
-      uncertain_ocr_flags: [],
-      source_image_index: 0,
-    },
-  ],
-};
+/** Structured Plain Text as the extraction model would return it. */
+const PLAIN_TEXT_ANSWER = `@source: admission
+@institution: University of Dhaka
+@year: 2024-25
+
+Q_BN: বাংলাদেশের রাজধানী কোনটি?
+Q_EN: What is the capital of Bangladesh?
+A_BN: ঢাকা
+A_EN: Dhaka
+B_BN: খুলনা
+B_EN: Khulna
+C_BN: চট্টগ্রাম
+C_EN: Chattogram
+D_BN: রাজশাহী
+D_EN: Rajshahi
+ANS: A
+EXP_BN: ঢাকা বাংলাদেশের রাজধানী।
+EXP_EN: Dhaka is the capital of Bangladesh.
+DIFF: easy
+TAGS: bangladesh, capital, geography`;
 
 interface SeenCall {
   url: string;
@@ -112,11 +107,11 @@ const withEnv = async (
   }
 };
 
-test('extraction works with only EXTRACTION_GEMINI_API_KEY configured', async () => {
+test('extraction sends every source to the model and returns plain text', async () => {
   await withEnv({ EXTRACTION_GEMINI_API_KEY: 'extraction-project-key' }, async () => {
-    const calls = stubFetch(async () => geminiReply(JSON.stringify(GEMINI_ANSWER)));
+    const calls = stubFetch(async () => geminiReply(PLAIN_TEXT_ANSWER));
 
-    const result = await extractQuestionsFromImage(REQUEST_BODY);
+    const result = await extractQuestionsFromSources(REQUEST_BODY);
 
     assert.equal(calls.length, 1);
     assert.equal(
@@ -127,28 +122,36 @@ test('extraction works with only EXTRACTION_GEMINI_API_KEY configured', async ()
     const headers = calls[0].init.headers as Record<string, string>;
     assert.equal(headers['x-goog-api-key'], 'extraction-project-key');
 
-    assert.equal(result.model, DEFAULT_EXTRACTION_MODEL);
-    assert.equal(result.questions.length, 1);
+    // The request carries the canonical format instructions and both sources.
+    const body = JSON.parse(String(calls[0].init.body));
+    const systemText = body.systemInstruction.parts[0].text as string;
+    assert.ok(systemText.includes('Structured Plain Text'));
+    assert.ok(systemText.includes('Q_BN'));
+    assert.ok(systemText.includes('Never invent'));
 
-    const [question] = result.questions;
-    // Bangla and English text, and the bilingual explanation, survive intact.
-    assert.equal(question.body.text_bn, 'বাংলাদেশের রাজধানী কোনটি?');
-    assert.equal(question.body.text_en, 'What is the capital of Bangladesh?');
-    assert.equal(question.explanation.bn, 'ঢাকা বাংলাদেশের রাজধানী।');
-    assert.equal(question.explanation.en, 'Dhaka is the capital of Bangladesh.');
-    // The printed answer key is preserved because it is backed by evidence.
-    assert.equal(question.options[0].isCorrect, true);
-    assert.equal(question.requires_manual_answer_verification, false);
-    assert.equal(result.images[0].status, 'extracted');
+    const parts = body.contents[0].parts as Array<Record<string, unknown>>;
+    const textParts = parts
+      .map((part) => (typeof part.text === 'string' ? part.text : ''))
+      .join('\n');
+    assert.ok(textParts.includes('page-1.jpg'));
+    assert.ok(textParts.includes('csv-questions.csv'));
+    assert.ok(textParts.includes('রাজধানী?'));
+    assert.ok(parts.some((part) => part.inlineData));
+
+    assert.equal(result.model, DEFAULT_EXTRACTION_MODEL);
+    assert.equal(result.plain_text, `${PLAIN_TEXT_ANSWER}\n`);
+    assert.equal(result.question_count, 1);
+    assert.equal(result.sources.length, 2);
+    assert.ok(result.sources.every((source) => source.status === 'extracted'));
   });
 });
 
 test('a missing extraction key returns a configuration error without calling Gemini', async () => {
   await withEnv({ GEMINI_API_KEY: 'assistant-key' }, async () => {
-    const calls = stubFetch(async () => geminiReply(JSON.stringify(GEMINI_ANSWER)));
+    const calls = stubFetch(async () => geminiReply(PLAIN_TEXT_ANSWER));
 
     await assert.rejects(
-      () => extractQuestionsFromImage(REQUEST_BODY),
+      () => extractQuestionsFromSources(REQUEST_BODY),
       (error: unknown) => {
         assert.ok(error instanceof ExtractionServiceError);
         assert.equal(error.status, 503);
@@ -163,19 +166,27 @@ test('a missing extraction key returns a configuration error without calling Gem
   });
 });
 
-test('a malformed Gemini reply is reported as an invalid response', async () => {
+test('an empty or NONE reply produces no questions and no plain text', async () => {
   await withEnv({ EXTRACTION_GEMINI_API_KEY: 'extraction-project-key' }, async () => {
-    stubFetch(async () => geminiReply('not json at all'));
+    stubFetch(async () => geminiReply('NONE'));
 
-    await assert.rejects(
-      () => extractQuestionsFromImage(REQUEST_BODY),
-      (error: unknown) => {
-        assert.ok(error instanceof ExtractionServiceError);
-        assert.equal(error.status, 502);
-        assert.equal(error.errorCode, 'EXTRACTION_INVALID_RESPONSE');
-        return true;
-      }
-    );
+    const result = await extractQuestionsFromSources(REQUEST_BODY);
+
+    assert.equal(result.plain_text, '');
+    assert.equal(result.question_count, 0);
+    assert.ok(result.sources.every((source) => source.status === 'empty'));
+  });
+});
+
+test('a non-question reply is returned with a warning instead of failing the batch', async () => {
+  await withEnv({ EXTRACTION_GEMINI_API_KEY: 'extraction-project-key' }, async () => {
+    stubFetch(async () => geminiReply('I could not read this page.'));
+
+    const result = await extractQuestionsFromSources(REQUEST_BODY);
+
+    assert.equal(result.plain_text, '');
+    assert.equal(result.question_count, 0);
+    assert.ok(result.warnings.length > 0);
   });
 });
 
@@ -184,7 +195,7 @@ test('a Gemini rate limit is surfaced as a retryable 429', async () => {
     stubFetch(async () => geminiError(429, 'RESOURCE_EXHAUSTED'));
 
     await assert.rejects(
-      () => extractQuestionsFromImage(REQUEST_BODY),
+      () => extractQuestionsFromSources(REQUEST_BODY),
       (error: unknown) => {
         assert.ok(error instanceof ExtractionServiceError);
         assert.equal(error.status, 429);
@@ -193,5 +204,18 @@ test('a Gemini rate limit is surfaced as a retryable 429', async () => {
         return true;
       }
     );
+  });
+});
+
+test('invalid request content never reaches the provider', async () => {
+  await withEnv({ EXTRACTION_GEMINI_API_KEY: 'extraction-project-key' }, async () => {
+    const calls = stubFetch(async () => geminiReply(PLAIN_TEXT_ANSWER));
+
+    await assert.rejects(
+      () => extractQuestionsFromSources({ sources: [] }),
+      /At least one text or image source is required/
+    );
+
+    assert.equal(calls.length, 0);
   });
 });

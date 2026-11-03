@@ -4,25 +4,27 @@ import {
   callExtractionProvider,
   readExtractionProviderConfig,
   type ExtractionProviderConfig,
+  type ExtractionProviderPart,
 } from './ai.extract.provider';
 import {
-  buildImageResults,
+  buildSourceResults,
   parseExtractionRequest,
-  sanitizeModelOutput,
-  type ExtractionImageInput,
-  type ExtractionRejection,
-  type ExtractionSourceHint,
-  type ExtractedQuestion,
-  type ExtractionImageResult,
+  sanitizePlainText,
+  type ExtractionSourceResult,
+  type ExtractionSource,
 } from './ai.extract';
 
 /**
- * Extraction of bilingual MCQs from a single question-paper image.
+ * Extraction of bilingual MCQs from mixed source content.
+ *
+ * The importer converts pasted text, photos, PDF pages, CSV and TXT files into
+ * readable text or inline images, then calls this endpoint. The model is asked
+ * for the canonical Structured Plain Text document; no question JSON crosses
+ * the API boundary.
  *
  * The model call goes through the dedicated extraction Gemini project
  * (`EXTRACTION_GEMINI_API_KEY`), so the student AI Assistant's Gemini project and
- * quota are never used. Whatever comes back is re-validated by `ai.extract`
- * before it reaches the importer.
+ * quota are never used.
  */
 
 const REQUEST_TIMEOUT_MS = 90_000;
@@ -40,52 +42,79 @@ export class ExtractionServiceError extends Error {
 }
 
 const SYSTEM_INSTRUCTION = `You are a precise exam-paper digitisation engine for a Bangladeshi bilingual question bank (Bangla and English).
-Read every multiple-choice question (MCQ) from the supplied question-paper image in order.
+Read every supplied source (readable text and/or page images) and return the eligible multiple-choice questions as the Structured Plain Text format described below. Reply with plain text only: no JSON, no markdown, no code fences, no commentary.
 
-Transcription rules:
-- Return each question once, in original reading order. source_image_index is always 0 because one page is supplied per request.
-- Set question_number to the number printed next to the question (for example "3" or "3(a)"). Never renumber and never invent a number; leave it empty if no number is printed.
-- Treat each printed question as its own item. Never merge two questions into one item, and never split one question into two items.
-- body.text_bn must be the Bengali question text; body.text_en must be the English question text. If the paper is printed in only one language, translate the other faithfully. Never change the meaning, numbers, or answer options.
-- Preserve mathematical and scientific notation exactly: use LaTeX between $...$ for inline math and $$...$$ for display math, keeping symbols (±, √, °, ×, ÷, ⇒, ⇌), subscripts, superscripts, chemical formulas and units. Do not "simplify" or round anything.
-- Keep option order exactly as printed. Extract every printed option; do not add or drop options.
-- If a question refers to a diagram or image, describe the reference inside the text (for example "[চিত্র ২]") and add the flag "diagram_required: figure 2".
+WHAT TO EXTRACT
+- Only complete university admission MCQs: public university, engineering, medical and dental, agricultural, GST, and private university admission tests, admission model tests and admission guidebooks.
+- Skip HSC, SSC and board examination questions.
+- Skip non-MCQ content, instructions, headers, adverts and answer-key-only pages.
+- Skip a question when it is incomplete, unreadable, or depends on a diagram whose required information is missing.
+- Never invent questions, options, institutions, years or units, and never guess an answer.
+- Prefer an answer printed or clearly marked in the source. Solve a question yourself only when you are completely confident. If the answer is unknown, omit the ANS field for that question instead of guessing.
+- Preserve the original option order and the original meaning. Correct obvious OCR mistakes only when the meaning is unchanged.
+- Remove duplicate questions.
+- Preserve mathematical notation exactly: use LaTeX between $...$ for inline math, keep symbols (±, √, °, ×, ÷, ⇒, ⇌), subscripts, superscripts, chemical formulas and units.
+- Preserve statement-based questions and their continuation lines exactly; a line that does not look like a KEY: value field belongs to the field above it.
 
-Answer-key rules (critical):
-- Set isCorrect true ONLY for an option confirmed by a printed answer key or a clearly marked answer (tick, circle, cross-out, filled bubble).
-- answer_source must be "printed" (answer printed separately on the paper), "marked" (answer marked on the question), "none" (no answer visible) or "ambiguous" (marking is unclear or contradicts itself).
-- answer_evidence must quote the exact text/line that proves the answer. Leave it empty when there is no printed or marked answer.
-- NEVER solve the question yourself and NEVER guess. If no answer is printed or clearly marked, mark every option isCorrect=false and answer_source="none".
-- If the confirmable answer is unclear, use answer_source="ambiguous" with isCorrect=false on every option.
+OUTPUT FORMAT (canonical)
+Write optional metadata lines, then the question fields, then separate consecutive question blocks with a line containing only ---.
 
-Explanations:
-- Write a short, correct explanation in both explanation.bn (Bangla) and explanation.en (English).
-- If the answer key is absent or ambiguous, explain the concept/method without asserting which option is correct.
+Metadata (only when supported by the source):
+@source: admission | model_test | guidebook | unknown
+@institution: full official English institution name
+@exam: exam name
+@unit: unit label
+@year: academic year, for example 2022-23
+@tags: comma separated common tags
 
-Metadata:
-- batch_source_info and each question's exam_references should carry the board/institution, exam name and year printed on the paper. Use source_kind "board" for education boards, "college" for college tests, "university" for university admissions, "school" for school exams, else "unknown". Omit fields that are not printed; never invent them.
-- source_type must be one of: board_exam, admission, college_test, model_test, textbook, guidebook, school_exam, university_exam, unknown.
-- difficulty_level must be one of: easy, medium, hard, expert.
+Question fields:
+Q_BN: Bengali question
+Q_EN: English question
+A_BN / A_EN, B_BN / B_EN, C_BN / C_EN, D_BN / D_EN: bilingual options in printed order
+E_BN / E_EN, F_BN / F_EN: optional extra options
+ANS: one correct answer letter (A-F), only when confirmed
+EXP_BN: concise Bengali explanation
+EXP_EN: concise English explanation
+DIFF: easy | medium | hard | expert
+TAGS: 3-8 lowercase English topic tags
 
-Uncertainty:
-- Put concrete OCR/visual problems in uncertain_ocr_flags (for example "illegible_text: option C", "diagram_required: figure 2", "cropped_margin").
-- Set requires_manual_answer_verification=true whenever the answer key needs a human check.
-- Add a flag for every unreadable or incomplete part (for example "illegible_text: option C", "missing_option", "incomplete_question", "merged_question_boundary"). Never silently drop a partially readable question.
+Rules for the format:
+- Do not number questions. Do not add Markdown or code fences. Do not add introductory or concluding commentary.
+- If institution, year or unit changes later in a document, write the new @ metadata before the questions it applies to.
+- If a source contains no eligible question, reply with exactly NONE.
 
-Output format:
-- Reply with one JSON object and nothing else: no markdown fences, no commentary.
-- Shape: {"batch_source_info":{"institution":"","exam_name":"","year":""},"questions":[{"question_number":"","body":{"text_bn":"","text_en":""},"options":[{"text_bn":"","text_en":"","isCorrect":false}],"explanation":{"bn":"","en":""},"difficulty_level":"medium","source_type":"unknown","exam_references":[{"source_kind":"unknown","board":"","institution_name":"","exam_name":"","year":""}],"tags":[""],"answer_source":"none","answer_evidence":"","requires_manual_answer_verification":true,"uncertain_ocr_flags":[""],"source_image_index":0}]}
-- Every field above is required on every question, even when its value is empty.`;
+EXAMPLE
+@source: guidebook
+@institution: Rajshahi University
+@year: 2022-23
+@tags: biology, cell biology
 
-const IMAGE_MIME_LABELS: Record<string, string> = {
+Q_BN: কোষ ঝিল্লির মোট শুষ্ক ওজনের কত ভাগ লিপিড?
+Q_EN: What percentage of the total dry weight of the cell membrane is lipid?
+A_BN: প্রায় 50 ভাগ
+A_EN: About 50%
+B_BN: প্রায় 75 ভাগ
+B_EN: About 75%
+C_BN: প্রায় 90 ভাগ
+C_EN: About 90%
+D_BN: প্রায় 25 ভাগ
+D_EN: About 25%
+ANS: B
+EXP_BN: কোষ ঝিল্লির মোট শুষ্ক ওজনের প্রায় 75% লিপিড।
+EXP_EN: Lipids make up about 75% of the total dry weight of the cell membrane.
+DIFF: medium
+TAGS: biology, cell biology, cell membrane`;
+
+const MIME_LABELS: Record<string, string> = {
   'image/jpeg': 'JPEG',
   'image/png': 'PNG',
   'image/webp': 'WebP',
 };
 
-const buildPrompt = (image: ExtractionImageInput, hint: ExtractionSourceHint): string => {
-  const imageLabel = `"${image.file_name}" (${IMAGE_MIME_LABELS[image.mime_type] ?? image.mime_type})`;
-
+const buildParts = (
+  sources: ExtractionSource[],
+  hint: { institution?: string; exam_name?: string; year?: string; subject?: string }
+): ExtractionProviderPart[] => {
   const hintLines = [
     hint.institution ? `Institution/board hint: ${hint.institution}` : '',
     hint.exam_name ? `Exam name hint: ${hint.exam_name}` : '',
@@ -95,10 +124,41 @@ const buildPrompt = (image: ExtractionImageInput, hint: ExtractionSourceHint): s
     .filter(Boolean)
     .join('\n');
 
-  return `Extract every MCQ from this question-paper image:
-- source_image_index 0: ${imageLabel}
+  const parts: ExtractionProviderPart[] = [
+    {
+      kind: 'text',
+      text:
+        'Extract the eligible admission MCQs from the sources below and return only the Structured Plain Text document.' +
+        (hintLines
+          ? `\nThe uploader supplied these hints; use them only when the sources are consistent with them:\n${hintLines}`
+          : '') +
+        `\nThe request contains ${sources.length} source(s). Keep source boundaries: never merge questions from different sources.`,
+    },
+  ];
 
-${hintLines ? `The uploader supplied these hints; use them only when the paper is consistent with them:\n${hintLines}\n\n` : ''}Respond with the JSON object described by the system instructions.`;
+  sources.forEach((source, index) => {
+    const label =
+      source.kind === 'text'
+        ? `--- SOURCE ${index + 1}/${sources.length}: "${source.file_name}" (extracted text) ---`
+        : `--- SOURCE ${index + 1}/${sources.length}: "${source.file_name}" (${
+            MIME_LABELS[source.mime_type] ?? source.mime_type
+          } image) ---`;
+
+    parts.push({ kind: 'text', text: label });
+
+    if (source.kind === 'text') {
+      parts.push({ kind: 'text', text: source.text });
+    } else {
+      parts.push({ kind: 'image', image: { mime_type: source.mime_type, data: source.data } });
+    }
+  });
+
+  parts.push({
+    kind: 'text',
+    text: 'Respond with the Structured Plain Text document only, or exactly NONE when no eligible question exists.',
+  });
+
+  return parts;
 };
 
 /** Maps a provider failure to a safe HTTP status and machine-readable code. */
@@ -112,7 +172,7 @@ const mapProviderError = (error: ExtractionProviderError): ExtractionServiceErro
       );
     case 'timeout':
       return new ExtractionServiceError(
-        'The AI extraction timed out. Try a clearer photo or retry.',
+        'The AI extraction timed out. Try a smaller source or retry.',
         504,
         'EXTRACTION_TIMEOUT'
       );
@@ -139,24 +199,20 @@ const mapProviderError = (error: ExtractionProviderError): ExtractionServiceErro
 
 export interface ExtractionServiceResult {
   model: string;
-  images: ExtractionImageResult[];
-  questions: ExtractedQuestion[];
-  rejected: ExtractionRejection[];
-  batch_source_info: { institution?: string; exam_name?: string; year?: string };
+  plain_text: string;
+  question_count: number;
+  sources: ExtractionSourceResult[];
   warnings: string[];
 }
 
 /**
- * Extracts questions from the single supplied question-paper image.
- *
- * Phase 4 processes one image per request, so every question cites
- * source_image_index 0 and the image status is derived from those questions.
+ * Extracts the eligible admission MCQs from the supplied sources and returns
+ * one Structured Plain Text document. Nothing is written to the database.
  */
-export const extractQuestionsFromImage = async (
+export const extractQuestionsFromSources = async (
   body: unknown
 ): Promise<ExtractionServiceResult> => {
   const request = parseExtractionRequest(body);
-  const image = request.images[0];
 
   let config: ExtractionProviderConfig;
   try {
@@ -172,8 +228,7 @@ export const extractQuestionsFromImage = async (
     const result = await callExtractionProvider({
       config,
       systemInstruction: SYSTEM_INSTRUCTION,
-      prompt: buildPrompt(image, request.sourceHint),
-      image: { mime_type: image.mime_type, data: image.data },
+      parts: buildParts(request.sources, request.sourceHint),
       timeoutMs: REQUEST_TIMEOUT_MS,
     });
 
@@ -181,7 +236,7 @@ export const extractQuestionsFromImage = async (
   } catch (error) {
     if (error instanceof ExtractionProviderError) {
       if (error.failure !== 'not_configured') {
-        // Log the normalised failure only: never the key, the image or the body.
+        // Log the normalised failure only: never the key, the source or the body.
         logger.error(`[ai:extract] provider failure: ${error.failure}`);
       }
       throw mapProviderError(error);
@@ -191,23 +246,11 @@ export const extractQuestionsFromImage = async (
     );
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    logger.error('[ai:extract] provider returned non-JSON output');
-    throw new ExtractionServiceError(
-      'The AI response could not be read. Please retry.',
-      502,
-      'EXTRACTION_INVALID_RESPONSE'
-    );
-  }
-
   let sanitized;
   try {
-    sanitized = sanitizeModelOutput(parsed, request.images.length);
+    sanitized = sanitizePlainText(text);
   } catch {
-    logger.error('[ai:extract] provider response failed schema validation');
+    logger.error('[ai:extract] provider response was not plain text');
     throw new ExtractionServiceError(
       'The AI response could not be read. Please retry.',
       502,
@@ -217,10 +260,9 @@ export const extractQuestionsFromImage = async (
 
   return {
     model: config.model,
-    images: buildImageResults(request.images, sanitized.questions),
-    questions: sanitized.questions,
-    rejected: sanitized.rejected,
-    batch_source_info: sanitized.batchSourceInfo,
+    plain_text: sanitized.plain_text,
+    question_count: sanitized.question_count,
+    sources: buildSourceResults(request.sources, sanitized.question_count),
     warnings: sanitized.warnings,
   };
 };

@@ -87,11 +87,23 @@ export const readExtractionProviderConfig = (
   return { apiKey, model };
 };
 
-export interface VisionExtractionRequest {
+export interface ExtractionProviderImage {
+  mime_type: string;
+  data: string;
+}
+
+/**
+ * One ordered user turn: text labels and inline images interleaved so the model
+ * can tell which page a block belongs to when a request carries several pages.
+ */
+export type ExtractionProviderPart =
+  | { kind: 'text'; text: string }
+  | { kind: 'image'; image: ExtractionProviderImage };
+
+export interface ExtractionProviderRequest {
   config: ExtractionProviderConfig;
   systemInstruction: string;
-  prompt: string;
-  image: { mime_type: string; data: string };
+  parts: ExtractionProviderPart[];
   timeoutMs?: number;
   /** Injectible for tests; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
@@ -224,18 +236,17 @@ const failureForResponse = (
 };
 
 /**
- * Sends one question-paper image to the extraction Gemini model and returns the
- * raw JSON text. Transport, timeout and provider failures are normalised to
+ * Sends the prepared sources to the extraction Gemini model and returns the
+ * raw text. Transport, timeout and provider failures are normalised to
  * `ExtractionProviderError` so no upstream detail reaches the importer.
  */
 export const callExtractionProvider = async ({
   config,
   systemInstruction,
-  prompt,
-  image,
+  parts,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   fetchImpl = fetch,
-}: VisionExtractionRequest): Promise<VisionExtractionResult> => {
+}: ExtractionProviderRequest): Promise<VisionExtractionResult> => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -256,16 +267,16 @@ export const callExtractionProvider = async ({
           contents: [
             {
               role: 'user',
-              parts: [
-                { text: prompt },
-                { inlineData: { mimeType: image.mime_type, data: image.data } },
-              ],
+              parts: parts.map((part) =>
+                part.kind === 'text'
+                  ? { text: part.text }
+                  : { inlineData: { mimeType: part.image.mime_type, data: part.image.data } }
+              ),
             },
           ],
           generationConfig: {
             temperature: TEMPERATURE,
             maxOutputTokens: MAX_OUTPUT_TOKENS,
-            responseMimeType: 'application/json',
           },
         }),
       }

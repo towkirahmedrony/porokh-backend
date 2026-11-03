@@ -22,12 +22,14 @@ router.post('/explanation', requireAuth, explainQuestion);
 // AI Question Importer: the same author roles and permission as the import
 // endpoint, plus a per-user cap so one account cannot drain the free extraction
 // provider's quota (a separate credential from the student Assistant Gemini).
+// The importer batches up to 8 pages per request, so this covers a long PDF
+// while still bounding the number of provider calls.
 router.post(
   '/extract-questions',
   requireAuth,
   rbacGuard(['admin', 'editor', 'teacher']),
   requirePermission(PERMISSIONS.QUESTIONS_MANAGE),
-  rateLimit({ windowMs: 10 * 60 * 1000, max: 12, keyPrefix: 'ai:extract' }),
+  rateLimit({ windowMs: 10 * 60 * 1000, max: 20, keyPrefix: 'ai:extract' }),
   extractQuestions
 );
 

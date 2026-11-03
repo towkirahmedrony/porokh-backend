@@ -44,8 +44,34 @@ Two Gemini credentials exist and they are never interchangeable:
 When the extraction key is missing the endpoint answers `503` with
 `EXTRACTION_NOT_CONFIGURED`; it never borrows the assistant key. Extraction runs
 on `EXTRACTION_GEMINI_MODEL` (default `gemini-3.8-flash`, a free-tier vision
-model) with its own prompt, JSON output mode, validation and per-user rate
+model) with its own prompt, plain-text output, validation and per-user rate
 limit.
+
+## AI Question Importer API
+
+The importer has three responsibilities, and only the last one touches the
+database:
+
+1. `POST /api/v1/ai/extract-questions` accepts mixed sources and returns the
+   canonical Structured Plain Text. Original files never reach this API: CSV,
+   TXT and PDF pages are read in the browser, and scanned pages arrive as
+   inline page images.
+   ```json
+   { "sources": [ { "source_id": "p1", "file_name": "paper.pdf", "kind": "text", "text": "..." } ] }
+   ```
+   Response data: `{ model, plain_text, question_count, sources, warnings }`.
+2. `POST /api/v1/content/questions/parse-text` validates plain text and returns
+   `{ questions, errors, warnings, counts, reference_checks }` without writing.
+3. `POST /api/v1/content/questions/import-text` accepts
+   `{ text, subject_id, chapter_id, topic_id?, dry_run?, source_label? }`, parses
+   it with the same parser, adds the curriculum ids, then reuses the existing
+   import service (validation, duplicate detection, reference resolution and
+   Supabase insert). Response: the normal import result plus `parse`.
+
+All three require `admin`, `editor` or `teacher` plus the
+`questions.manage` permission. Question JSON from the model is no longer part of
+this workflow; the existing `/content/questions/import` JSON contract remains
+for the admin panel.
 
 ### `EXAM_SUBMIT_GRACE_MS`
 

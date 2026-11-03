@@ -73,6 +73,15 @@ test('the import route is POST with rbacGuard + requirePermission + controller',
   assert.equal(layer!.route!.stack.length, 3);
 });
 
+test('the plain-text import route is POST with the same guard chain', () => {
+  const layer = routeLayer('/questions/import-text');
+
+  assert.ok(layer?.route, '/questions/import-text must be registered');
+  assert.equal(layer!.route!.methods.post, true);
+  assert.equal(layer!.route!.methods.get, undefined);
+  assert.equal(layer!.route!.stack.length, 3);
+});
+
 test('the import history route is GET with the same guard chain', () => {
   const layer = routeLayer('/questions/import-history');
 

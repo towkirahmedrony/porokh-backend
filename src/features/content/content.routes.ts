@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import * as contentController from './content.controller';
 import { parseQuestionTextHandler } from './question.textparse.controller';
+import { importQuestionTextHandler } from './question.textimport.controller';
 import * as institutionController from './institution.controller';
 import * as institutionService from './institution.service';
 import { requireAuth } from '../../middlewares/requireAuth';
@@ -58,6 +59,9 @@ router.get('/questions/import-history', rbacGuard(['admin', 'editor', 'teacher']
 
 // Plain text -> question JSON preview for the importer (no database writes).
 router.post('/questions/parse-text', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), parseQuestionTextHandler);
+
+// Final approved plain text -> database. The importer never sends question JSON.
+router.post('/questions/import-text', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), importQuestionTextHandler);
 router.put('/questions/:id', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), contentController.updateQuestion);
 router.delete('/questions/:id', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.MODERATION_ACTION), contentController.deleteQuestion); // Soft Delete
 

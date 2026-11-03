@@ -7,7 +7,7 @@ import sendResponse from '../../lib/utils/response';import {
   getAiConfigService, 
   updateAiConfigService 
 } from './ai.service';
-import { extractQuestionsFromImage, ExtractionServiceError } from './ai.extract.service';
+import { extractQuestionsFromSources, ExtractionServiceError } from './ai.extract.service';
 import { ExtractionValidationError } from './ai.extract';
 
 export const getAiConfig = catchAsync(async (req: Request, res: Response) => {
@@ -44,19 +44,19 @@ export const explainQuestion = catchAsync(async (req: Request, res: Response) =>
 });
 
 /**
- * Question-paper extraction for the AI Question Importer.
+ * Question extraction for the AI Question Importer.
  *
  * Request/response validation lives in `ai.extract`; the service maps provider
  * failures to safe statuses so no upstream detail (or key) reaches the client.
  */
 export const extractQuestions = catchAsync(async (req: Request, res: Response) => {
   try {
-    const result = await extractQuestionsFromImage(req.body);
+    const result = await extractQuestionsFromSources(req.body);
 
     return sendResponse(res, {
       statusCode: 200,
       success: true,
-      message: `${result.questions.length} question(s) extracted`,
+      message: `${result.question_count} question(s) extracted`,
       data: result,
     });
   } catch (error) {

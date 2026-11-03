@@ -1,402 +1,169 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  MAX_IMAGE_BYTES,
-  buildImageResults,
+  MAX_SOURCES,
+  MAX_TEXT_SOURCE_CHARS,
+  buildSourceResults,
   parseExtractionRequest,
-  sanitizeModelOutput,
+  sanitizePlainText,
 } from './ai.extract';
 
+/**
+ * Pure extraction-contract checks: request limits for mixed text/image sources
+ * and normalisation of the model's Structured Plain Text answer.
+ */
+
 const IMAGE = {
-  image_id: 'img_1',
+  source_id: 'img_1',
   file_name: 'page-1.jpg',
+  kind: 'image',
   mime_type: 'image/jpeg',
   data: Buffer.from('fake-jpeg-bytes').toString('base64'),
 };
 
-const option = (text: string, isCorrect = false) => ({
-  text_bn: text,
-  text_en: text,
-  isCorrect,
-});
+const TEXT = {
+  source_id: 'txt_1',
+  file_name: 'questions.txt',
+  kind: 'text',
+  text: 'Q_EN: What is the capital of Bangladesh?\nANS: A',
+};
 
-const question = (overrides: Record<string, unknown> = {}) => ({
-  question_number: '1',
-  body: { text_bn: 'প্রশ্ন', text_en: 'Question' },
-  options: [option('ক', true), option('খ'), option('গ'), option('ঘ')],
-  explanation: { bn: 'ব্যাখ্যা', en: 'Explanation' },
-  difficulty_level: 'medium',
-  source_type: 'board_exam',
-  exam_references: [{ source_kind: 'board', board: 'Dhaka Board', year: '2024' }],
-  tags: ['algebra'],
-  source_metadata: { institution: 'Dhaka Board', exam_name: 'HSC', year: '2024' },
-  answer_source: 'printed',
-  answer_evidence: 'Answer: (ক)',
-  requires_manual_answer_verification: false,
-  uncertain_ocr_flags: [],
-  source_image_index: 0,
-  ...overrides,
-});
-
-// --- request parsing -------------------------------------------------------
-
-test('parseExtractionRequest accepts a valid image and strips the data URL prefix', () => {
+test('parseExtractionRequest accepts text and image sources and strips the data URL prefix', () => {
   const parsed = parseExtractionRequest({
-    images: [{ ...IMAGE, data: `data:image/jpeg;base64,${IMAGE.data}` }],
-    source_hint: { institution: 'Dhaka Board', year: 2024 },
+    sources: [
+      { ...TEXT, file_name: '  paper.txt  ' },
+      { ...IMAGE, data: `data:image/jpeg;base64,${IMAGE.data}` },
+    ],
+    source_hint: { institution: ' Dhaka Board ', year: 2024, ignored: 'x' },
   });
 
-  assert.equal(parsed.images.length, 1);
-  assert.equal(parsed.images[0].data, IMAGE.data);
-  assert.equal(parsed.images[0].mime_type, 'image/jpeg');
-  assert.equal(parsed.sourceHint.institution, 'Dhaka Board');
-  assert.equal(parsed.sourceHint.year, '2024');
+  assert.equal(parsed.sources.length, 2);
+  assert.equal(parsed.sources[0].kind, 'text');
+  assert.equal(parsed.sources[0].file_name, 'paper.txt');
+  assert.equal(parsed.sources[1].kind, 'image');
+
+  if (parsed.sources[1].kind === 'image') {
+    assert.equal(parsed.sources[1].data, IMAGE.data);
+  }
+
+  assert.deepEqual(parsed.sourceHint, { institution: 'Dhaka Board', year: '2024' });
 });
 
-test('parseExtractionRequest accepts exactly one image and rejects anything else', () => {
-  assert.throws(() => parseExtractionRequest({ images: [] }), /Exactly one/);
-  assert.throws(() => parseExtractionRequest({}), /Exactly one/);
+test('parseExtractionRequest rejects an empty source list or an unknown kind', () => {
+  assert.throws(() => parseExtractionRequest({ sources: [] }), /At least one/);
+  assert.throws(() => parseExtractionRequest({}), /At least one/);
   assert.throws(
-    () => parseExtractionRequest({ images: [IMAGE, { ...IMAGE, image_id: 'img_2' }] }),
-    /Only one question-paper image/
+    () => parseExtractionRequest({ sources: [{ kind: 'pdf', text: 'x' }] }),
+    /must be either "text" or "image"/
   );
-
-  const oversized = {
-    ...IMAGE,
-    data: Buffer.alloc(MAX_IMAGE_BYTES + 1).toString('base64'),
-  };
-  assert.throws(() => parseExtractionRequest({ images: [oversized] }), /per-image limit/);
 });
 
-test('parseExtractionRequest rejects bad mime types, empty data and duplicate ids', () => {
+test('parseExtractionRequest rejects empty text, duplicate ids, and too many sources', () => {
   assert.throws(
-    () => parseExtractionRequest({ images: [{ ...IMAGE, mime_type: 'image/gif' }] }),
-    /mime_type/
+    () => parseExtractionRequest({ sources: [{ ...TEXT, text: '   ' }] }),
+    /text is empty/
   );
+
   assert.throws(
-    () => parseExtractionRequest({ images: [{ ...IMAGE, data: '' }] }),
-    /base64 data/
+    () => parseExtractionRequest({ sources: [TEXT, { ...TEXT }] }),
+    /Duplicate source_id/
   );
+
+  const tooMany = Array.from({ length: MAX_SOURCES + 1 }, (_, index) => ({
+    ...TEXT,
+    source_id: `src_${index}`,
+  }));
+  assert.throws(() => parseExtractionRequest({ sources: tooMany }), /At most 8 sources/);
+});
+
+test('parseExtractionRequest enforces image type/size and the text budget', () => {
   assert.throws(
-    () => parseExtractionRequest({ images: [{ ...IMAGE, data: '!!!' }] }),
-    /base64 data/
+    () => parseExtractionRequest({ sources: [{ ...IMAGE, mime_type: 'application/pdf' }] }),
+    /mime_type must be one of/
+  );
+
+  assert.throws(
+    () => parseExtractionRequest({ sources: [{ ...IMAGE, data: 'not-valid-base64***' }] }),
+    /missing base64|not valid base64/
+  );
+
+  assert.throws(
+    () =>
+      parseExtractionRequest({
+        sources: [{ ...TEXT, text: 'x'.repeat(MAX_TEXT_SOURCE_CHARS + 1) }],
+      }),
+    /exceeds 120000 characters/
   );
 });
 
-// --- model output sanitising ----------------------------------------------
+test('sanitizePlainText keeps well-formed blocks and joins them with a separator', () => {
+  const result = sanitizePlainText(
+    '@institution: University of Dhaka\n\nQ_BN: প্রশ্ন?\nQ_EN: Question?\nA_BN: ক\nA_EN: A\nANS: A\n\n---\n\nQ_EN: Second?\nANS: B\n'
+  );
 
-test('sanitizeModelOutput keeps a printed answer key and structured fields', () => {
-  const result = sanitizeModelOutput({ questions: [question()] }, 1);
-
-  assert.equal(result.questions.length, 1);
-  assert.equal(result.rejected.length, 0);
-
-  const extracted = result.questions[0];
-  assert.equal(extracted.type, 'mcq');
-  assert.equal(extracted.question_number, '1');
-  assert.equal(extracted.confidence, 'high');
-  assert.equal(extracted.options.filter((entry) => entry.isCorrect).length, 1);
-  assert.equal(extracted.options[0].id, 1);
-  assert.equal(extracted.requires_manual_answer_verification, false);
-  assert.equal(extracted.source_type, 'board_exam');
-  assert.equal(extracted.exam_references[0].board, 'Dhaka Board');
+  assert.equal(result.question_count, 2);
+  assert.deepEqual(result.warnings, []);
+  assert.ok(result.plain_text.includes('---\n'));
+  assert.ok(result.plain_text.startsWith('@institution: University of Dhaka'));
+  assert.ok(result.plain_text.endsWith('\n'));
 });
 
-test('sanitizeModelOutput never invents an answer when none is printed', () => {
-  const result = sanitizeModelOutput(
-    {
-      questions: [
-        question({
-          answer_source: 'none',
-          answer_evidence: '',
-          // A model could still mark an option; that must be discarded.
-          options: [option('ক', true), option('খ'), option('গ'), option('ঘ')],
-        }),
-      ],
-    },
-    1
+test('sanitizePlainText removes code fences and leading commentary', () => {
+  const result = sanitizePlainText(
+    'Here are the questions:\n```text\nQ_EN: What is it?\nANS: A\n```\n'
   );
 
-  const extracted = result.questions[0];
-  assert.equal(extracted.options.some((entry) => entry.isCorrect), false);
-  assert.equal(extracted.requires_manual_answer_verification, true);
-  assert.ok(extracted.uncertain_ocr_flags.includes('answer_not_printed'));
-  assert.equal(extracted.confidence, 'low');
+  assert.equal(result.plain_text, 'Q_EN: What is it?\nANS: A\n');
+  assert.equal(result.question_count, 1);
+  assert.ok(result.warnings.some((warning) => warning.includes('before the first question')));
 });
 
-test('sanitizeModelOutput keeps a printed answer without evidence but requires review', () => {
-  const result = sanitizeModelOutput(
-    { questions: [question({ answer_source: 'printed', answer_evidence: '' })] },
-    1
-  );
+test('sanitizePlainText drops exact duplicate blocks and reports them', () => {
+  const block = 'Q_EN: Duplicate question?\nANS: A';
+  const result = sanitizePlainText(`${block}\n---\n${block}\n---\nQ_EN: Unique?\nANS: B`);
 
-  const extracted = result.questions[0];
-  assert.equal(extracted.options.filter((entry) => entry.isCorrect).length, 1);
-  assert.equal(extracted.requires_manual_answer_verification, true);
-  assert.ok(extracted.uncertain_ocr_flags.includes('answer_evidence_missing'));
-  assert.equal(extracted.confidence, 'low');
+  assert.equal(result.question_count, 2);
+  assert.ok(result.warnings.some((warning) => warning.includes('duplicated question block')));
+  assert.equal(result.plain_text.match(/Duplicate question/g)?.length, 1);
 });
 
-test('sanitizeModelOutput clears contradictory or ambiguous answers', () => {
-  const result = sanitizeModelOutput(
-    {
-      questions: [
-        question({
-          answer_source: 'marked',
-          options: [option('ক', true), option('খ', true), option('গ'), option('ঘ')],
-        }),
-      ],
-    },
-    1
-  );
-
-  const extracted = result.questions[0];
-  assert.equal(extracted.options.some((entry) => entry.isCorrect), false);
-  assert.equal(extracted.requires_manual_answer_verification, true);
-  assert.ok(extracted.uncertain_ocr_flags.includes('answer_ambiguous'));
+test('sanitizePlainText maps NONE to an empty document', () => {
+  assert.deepEqual(sanitizePlainText(' NONE \n'), {
+    plain_text: '',
+    question_count: 0,
+    warnings: [],
+  });
 });
 
-test('sanitizeModelOutput preserves LaTeX and scientific notation verbatim', () => {
-  const latex = 'যদি $x^2 + y^2 = r^2$ হয়, তবে $\\frac{dy}{dx}$ এর মান কত? Unit: m/s²';
-  const result = sanitizeModelOutput(
-    {
-      questions: [
-        question({
-          body: { text_bn: latex, text_en: '$x^2 + y^2 = r^2$' },
-          options: [
-            { text_bn: '$\\sqrt{2}$', text_en: '$\\sqrt{2}$', isCorrect: true },
-            { text_bn: '$\\pm 1$', text_en: '$\\pm 1$', isCorrect: false },
-          ],
-        }),
-      ],
-    },
-    1
-  );
+test('sanitizePlainText warns when no question block is present', () => {
+  const result = sanitizePlainText('@institution: University of Dhaka\nNo questions here.');
 
-  assert.equal(result.questions[0].body.text_bn, latex);
-  assert.equal(result.questions[0].options[0].text_bn, '$\\sqrt{2}$');
+  assert.equal(result.plain_text, '');
+  assert.equal(result.question_count, 0);
+  assert.ok(result.warnings.some((warning) => warning.includes('did not contain any question')));
 });
 
-test('sanitizeModelOutput rejects unreadable questions without dropping the batch', () => {
-  const result = sanitizeModelOutput(
-    {
-      questions: [
-        question({ question_number: '1', body: { text_bn: '', text_en: 'missing bangla' } }),
-        question({ question_number: '2', options: [option('only one')] }),
-        question({ question_number: '3' }),
-      ],
-    },
-    1
-  );
+test('sanitizePlainText preserves LaTeX and continuation lines verbatim', () => {
+  const math = 'Q_EN: Evaluate $\\int_0^1 x^2\\,dx$.\ni. Use the power rule.\nANS: A';
+  const result = sanitizePlainText(math);
 
-  assert.equal(result.questions.length, 1);
-  assert.equal(result.rejected.length, 2);
-  assert.match(result.rejected[0].reason, /Bengali text/);
-  assert.match(result.rejected[1].reason, /2-6 options/);
-  // Rejections are reported, never silently omitted.
-  assert.ok(result.warnings.some((warning) => warning.includes('manual re-check')));
+  assert.equal(result.plain_text, `${math}\n`);
 });
 
-test('sanitizeModelOutput keeps the printed question number and original order', () => {
-  const result = sanitizeModelOutput(
-    {
-      questions: [
-        question({ question_number: '12' }),
-        question({ question_number: '13' }),
-        question({ question_number: '14' }),
-      ],
-    },
-    1
-  );
-
-  assert.deepEqual(
-    result.questions.map((entry) => entry.question_number),
-    ['12', '13', '14']
-  );
+test('sanitizePlainText rejects a non-string provider answer', () => {
+  assert.throws(() => sanitizePlainText({ questions: [] }), /was not plain text/);
 });
 
-test('sanitizeModelOutput flags a missing number and derives low confidence', () => {
-  const result = sanitizeModelOutput(
-    { questions: [question({ question_number: undefined })] },
-    1
-  );
+test('buildSourceResults credits every source when questions were found', () => {
+  const sources = [
+    { ...TEXT, kind: 'text' as const },
+    { ...IMAGE, kind: 'image' as const },
+  ];
 
-  const extracted = result.questions[0];
-  assert.equal(extracted.question_number, '');
-  assert.ok(extracted.uncertain_ocr_flags.includes('question_number_missing'));
-  assert.equal(extracted.confidence, 'low');
-});
+  assert.deepEqual(buildSourceResults(sources, 2), [
+    { source_id: 'txt_1', file_name: 'questions.txt', status: 'extracted' },
+    { source_id: 'img_1', file_name: 'page-1.jpg', status: 'extracted' },
+  ]);
 
-test('sanitizeModelOutput warns about duplicate question numbers', () => {
-  const result = sanitizeModelOutput(
-    {
-      questions: [question({ question_number: '5' }), question({ question_number: '5' })],
-    },
-    1
-  );
-
-  assert.equal(result.questions.length, 2);
-  assert.ok(result.warnings.some((warning) => warning.includes('Question number 5 appears')));
-  assert.ok(
-    result.questions.every((entry) =>
-      entry.uncertain_ocr_flags.includes('duplicate_question_number: 5')
-    )
-  );
-  assert.ok(result.questions.every((entry) => entry.confidence === 'low'));
-});
-
-test('sanitizeModelOutput reports out-of-order numbering but keeps the order', () => {
-  const result = sanitizeModelOutput(
-    {
-      questions: [question({ question_number: '8' }), question({ question_number: '2' })],
-    },
-    1
-  );
-
-  assert.deepEqual(
-    result.questions.map((entry) => entry.question_number),
-    ['8', '2']
-  );
-  assert.ok(result.warnings.some((warning) => warning.includes('numerical order')));
-});
-
-test('sanitizeModelOutput flags an unexpected option count and missing source metadata', () => {
-  const result = sanitizeModelOutput(
-    {
-      questions: [
-        question({
-          options: [option('ক', true), option('খ'), option('গ')],
-          exam_references: [],
-          source_metadata: undefined,
-        }),
-      ],
-    },
-    1
-  );
-
-  const extracted = result.questions[0];
-  assert.ok(extracted.uncertain_ocr_flags.includes('option_count_unexpected: 3'));
-  assert.ok(extracted.uncertain_ocr_flags.includes('source_metadata_not_detected'));
-  assert.equal(extracted.source_metadata, undefined);
-});
-
-test('sanitizeModelOutput covers Bangla, English, bilingual, math and diagram pages', () => {
-  const result = sanitizeModelOutput(
-    {
-      batch_source_info: { institution: 'Dhaka Board', exam_name: 'HSC', year: '2024' },
-      questions: [
-        question({
-          question_number: '1',
-          body: { text_bn: 'বাংলা প্রশ্ন', text_en: '' },
-        }),
-        question({
-          question_number: '2',
-          body: { text_bn: 'ইংরেজি প্রশ্নের অনুবাদ', text_en: 'English question' },
-        }),
-        question({
-          question_number: '3',
-          body: { text_bn: 'বilingual প্রশ্ন', text_en: 'Bilingual question' },
-          answer_source: 'marked',
-          options: [option('$\\sqrt{2}$', true), option('$\\pi$'), option('$e$'), option('$1$')],
-        }),
-        question({
-          question_number: '4',
-          body: { text_bn: 'চিত্র ২ অনুযায়ী বল নির্ণয় করো।', text_en: 'Find the force from figure 2.' },
-          uncertain_ocr_flags: ['diagram_required: figure 2'],
-        }),
-        question({
-          question_number: '5',
-          answer_source: 'none',
-          answer_evidence: '',
-          options: [option('ক'), option('খ'), option('গ'), option('ঘ')],
-        }),
-      ],
-    },
-    1
-  );
-
-  assert.equal(result.questions.length, 5);
-  assert.equal(result.rejected.length, 0);
-  assert.equal(result.questions[0].confidence, 'low');
-  assert.equal(result.questions[1].confidence, 'high');
-  assert.equal(result.questions[2].options[0].text_bn, '$\\sqrt{2}$');
-  assert.equal(result.questions[3].uncertain_ocr_flags[0], 'diagram_required: figure 2');
-  assert.equal(result.questions[4].requires_manual_answer_verification, true);
-  assert.equal(result.questions[4].confidence, 'low');
-});
-
-test('sanitizeModelOutput normalises metadata and clamps the image index', () => {
-  const result = sanitizeModelOutput(
-    {
-      batch_source_info: { institution: 'BUET', exam_name: 'Admission', year: '2023' },
-      questions: [
-        question({
-          difficulty_level: 'impossible',
-          source_type: 'Board Exam',
-          source_image_index: 7,
-          source_metadata: undefined,
-          exam_references: [{ source_kind: 'madrasa', board: 'Dhaka Board' }],
-          tags: ['physics', 'physics', ''],
-        }),
-      ],
-    },
-    1
-  );
-
-  const extracted = result.questions[0];
-  assert.equal(extracted.difficulty_level, 'medium');
-  assert.equal(extracted.source_type, 'board_exam');
-  assert.equal(extracted.source_image_index, 0);
-  assert.ok(extracted.uncertain_ocr_flags.includes('source_image_index_out_of_range'));
-  assert.equal(extracted.exam_references[0].source_kind, 'unknown');
-  assert.deepEqual(extracted.tags, ['physics']);
-  assert.equal(extracted.source_metadata?.institution, 'BUET');
-});
-
-test('sanitizeModelOutput drops references without a traceable name', () => {
-  const result = sanitizeModelOutput(
-    {
-      questions: [
-        question({
-          exam_references: [{ source_kind: 'board', year: '2022' }],
-        }),
-      ],
-    },
-    1
-  );
-
-  assert.deepEqual(result.questions[0].exam_references, []);
-});
-
-test('sanitizeModelOutput rejects a response without a questions array', () => {
-  assert.throws(() => sanitizeModelOutput({}, 1), /questions array/);
-  assert.throws(() => sanitizeModelOutput(null, 1), /questions array/);
-});
-
-// --- per-image status ------------------------------------------------------
-
-test('buildImageResults reports the question count for the single image', () => {
-  const questions = sanitizeModelOutput(
-    {
-      questions: [
-        question({ question_number: '1', source_image_index: 0 }),
-        question({ question_number: '2', source_image_index: 0 }),
-      ],
-    },
-    1
-  ).questions;
-
-  const results = buildImageResults([{ ...IMAGE, image_id: 'a' }], questions);
-
-  assert.deepEqual(
-    results.map((entry) => [entry.image_id, entry.status, entry.question_count]),
-    [['a', 'extracted', 2]]
-  );
-});
-
-test('buildImageResults marks a page with no readable questions as empty', () => {
-  const results = buildImageResults([{ ...IMAGE, image_id: 'a' }], []);
-
-  assert.equal(results[0].status, 'empty');
-  assert.equal(results[0].question_count, 0);
+  assert.equal(buildSourceResults(sources, 0)[0].status, 'empty');
 });
