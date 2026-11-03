@@ -1,6 +1,10 @@
 import { supabase } from '../../config/supabase';
-import type { AdmissionUnitRecord, InstitutionRecord } from './exam-references.core';
-import { applyReferenceChecks, type ReferenceCheck } from './question.refcheck';
+import type { InstitutionRecord } from './exam-references.core';
+import {
+  applyReferenceChecks,
+  type AdmissionUnitWithGroup,
+  type ReferenceCheck,
+} from './question.refcheck';
 import type { ParsedQuestion } from './question.textparse';
 
 /**
@@ -22,18 +26,14 @@ export const checkParsedReferences = async (
       .select('id, name_bn, name_en, short_name, type, code, eiin, aliases, is_active')
       .eq('is_active', true)
       .limit(5000),
-    supabase
-      .from('admission_units')
-      .select('id, institution_id, name_bn, name_en, code, is_active')
-      .eq('is_active', true)
-      .limit(5000),
+    supabase.from('admission_units').select('*').eq('is_active', true).limit(5000),
   ]);
 
   if (institutionResult.error) throw new Error(institutionResult.error.message);
   if (unitResult.error) throw new Error(unitResult.error.message);
 
-  const unitsByInstitution = new Map<string, AdmissionUnitRecord[]>();
-  for (const unit of (unitResult.data ?? []) as AdmissionUnitRecord[]) {
+  const unitsByInstitution = new Map<string, AdmissionUnitWithGroup[]>();
+  for (const unit of (unitResult.data ?? []) as unknown as AdmissionUnitWithGroup[]) {
     const list = unitsByInstitution.get(unit.institution_id) ?? [];
     list.push(unit);
     unitsByInstitution.set(unit.institution_id, list);

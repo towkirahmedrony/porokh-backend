@@ -86,6 +86,7 @@ const BATCH_KEYS = new Set([
   'unit',
   'year',
   'difficulty',
+  'group',
   'tags',
 ]);
 
@@ -103,6 +104,7 @@ const QUESTION_KEYS = new Set([
   'exam',
   'unit',
   'year',
+  'group',
   'tags',
 ]);
 
@@ -135,6 +137,24 @@ const BN_DIGITS = '০১২৩৪৫৬৭৮৯';
 
 const toEnglishDigits = (value: string): string =>
   value.replace(/[০-৯]/g, (digit) => String(BN_DIGITS.indexOf(digit)));
+
+/** HSC group an admission unit is meant for (matches admission_units.group_type). */
+export const UNIT_GROUPS = ['science', 'humanities', 'commerce', 'fine_arts'] as const;
+
+const GROUP_ALIASES: Record<string, string> = {
+  science: 'science',
+  'বিজ্ঞান': 'science',
+  humanities: 'humanities',
+  arts: 'humanities',
+  'মানবিক': 'humanities',
+  'কলা': 'humanities',
+  commerce: 'commerce',
+  business: 'commerce',
+  'বাণিজ্য': 'commerce',
+  'ব্যবসায়_শিক্ষা': 'commerce',
+  fine_arts: 'fine_arts',
+  'চারুকলা': 'fine_arts',
+};
 
 const pick = (...values: Array<string | undefined>): string | undefined =>
   values.find((value) => value !== undefined && value !== '');
@@ -327,6 +347,15 @@ const buildQuestion = (
     errors.push(`Source type "${sourceType}" is not supported.`);
   }
 
+  const groupRaw = pick(fields.group, defaults.group);
+  let group: string | undefined;
+  if (groupRaw) {
+    group = GROUP_ALIASES[groupRaw.trim().toLowerCase().replace(/[\s-]+/g, '_')];
+    if (!group) {
+      errors.push(`GROUP "${groupRaw}" must be one of ${UNIT_GROUPS.join(', ')}.`);
+    }
+  }
+
   // Exam reference: only built when an institution is given.
   const institution = pick(fields.inst, defaults.institution);
   const exam = pick(fields.exam, defaults.exam);
@@ -345,10 +374,12 @@ const buildQuestion = (
       institution_name: institution,
       ...(exam ? { exam_name: exam } : {}),
       ...(unit ? { unit_name: unit } : {}),
+      // Transient: used by the reference check to find the unit, then removed.
+      ...(group ? { unit_group: group } : {}),
       ...(year ? { year } : {}),
     });
-  } else if (exam || unit || year) {
-    warnings.push('Exam/unit/year were ignored because no institution is set.');
+  } else if (exam || unit || year || groupRaw) {
+    warnings.push('Exam/unit/group/year were ignored because no institution is set.');
   }
 
   const explanationBn = pick(fields.exp_bn, fields.exp) ?? '';
@@ -403,6 +434,22 @@ export const parseQuestionText = (input: unknown): TextParseResult => {
   for (const block of splitBlocks(input)) {
     const line = block.lines.find((entry) => entry.text.trim() !== '')?.no ?? 1;
     const { headers, fields, problems } = parseBlock(block);
+
+    // A new institution starts a new section: the unit, group and exam of the
+    // previous one must not carry over unless this block sets them again.
+    if (
+      headers.institution !== undefined &&
+      headers.institution.trim().toLowerCase() !== (defaults.institution ?? '').trim().toLowerCase()
+    ) {
+      for (const key of ['unit', 'group', 'exam']) {
+        if (headers[key] === undefined) delete defaults[key];
+      }
+    }
+
+    // Unit and group are alternatives: setting one drops the inherited other,
+    // unless the same block sets both (then they are cross-checked later).
+    if (headers.unit !== undefined && headers.group === undefined) delete defaults.group;
+    if (headers.group !== undefined && headers.unit === undefined) delete defaults.unit;
 
     // An empty header value clears that default.
     Object.assign(defaults, headers);

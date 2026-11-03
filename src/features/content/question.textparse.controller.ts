@@ -3,7 +3,7 @@ import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response';
 import { parseQuestionText, TextParseValidationError } from './question.textparse';
 import { checkParsedReferences } from './question.refcheck.service';
-import type { ReferenceCheck } from './question.refcheck';
+import { stripUnitGroups, type ReferenceCheck } from './question.refcheck';
 
 /**
  * Preview-only: turns pasted plain text into question objects, links each
@@ -22,6 +22,7 @@ export const parseQuestionTextHandler = catchAsync(async (req: Request, res: Res
       referenceChecks = await checkParsedReferences(result.questions);
     } catch {
       // The parse itself is still valid; the import re-checks references anyway.
+      stripUnitGroups(result.questions);
       warnings.push({
         question: 0,
         line: 0,
