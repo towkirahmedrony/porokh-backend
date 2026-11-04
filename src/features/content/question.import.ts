@@ -224,6 +224,9 @@ const normalizeReference = (
     reference[key] = value;
   }
 
+  // Group classification is retired; old payloads may still send it.
+  delete reference.unit_group;
+
   const rawKind = asText(reference.source_kind).toLowerCase().replace(/[\s-]+/g, '_');
 
   if (rawKind) {
@@ -264,12 +267,27 @@ const normalizeReference = (
   return reference;
 };
 
+const referenceHasInstitution = (reference: AnyObject): boolean =>
+  asText(reference.institution_id) !== '' ||
+  REFERENCE_NAME_FIELDS.some((field) => asText(reference[field]) !== '');
+
+const referenceHasUnit = (reference: AnyObject): boolean =>
+  asText(reference.unit_id) !== '' || asText(reference.unit_name) !== '';
+
 const normalizeReferences = (
   value: unknown,
+  sourceType: ImportSourceType,
   errors: string[],
   warnings: string[]
 ): AnyObject[] => {
-  if (value === undefined || value === null || value === '') return [];
+  if (value === undefined || value === null || value === '') {
+    if (sourceType === 'admission') {
+      errors.push(
+        'Admission questions need an exam reference with both an institution and an admission unit.'
+      );
+    }
+    return [];
+  }
 
   const parsed = typeof value === 'string' ? parseJsonRecordArray(value) : value;
 
@@ -278,9 +296,26 @@ const normalizeReferences = (
     return [];
   }
 
-  return parsed
+  const references = parsed
     .map((entry, position) => normalizeReference(entry, position, errors, warnings))
     .filter((entry): entry is AnyObject => entry !== null);
+
+  for (const [position, reference] of references.entries()) {
+    if (referenceHasUnit(reference) && !referenceHasInstitution(reference)) {
+      errors.push(`exam_references[${position}] names a unit without an institution.`);
+    }
+  }
+
+  if (
+    sourceType === 'admission' &&
+    !references.some((reference) => referenceHasInstitution(reference) && referenceHasUnit(reference))
+  ) {
+    errors.push(
+      'Admission questions need an exam reference with both an institution and an admission unit.'
+    );
+  }
+
+  return references;
 };
 
 function parseJsonRecordArray(value: string): unknown[] | null {
@@ -393,7 +428,12 @@ export const normalizeImportQuestion = (
   const explanation = normalizeExplanation(record.explanation, warnings);
   const difficulty_level = normalizeDifficulty(record.difficulty_level, errors);
   const source_type = normalizeSourceType(record.source_type, errors, warnings);
-  const exam_references = normalizeReferences(record.exam_references, errors, warnings);
+  const exam_references = normalizeReferences(
+    record.exam_references,
+    source_type,
+    errors,
+    warnings
+  );
   const tags = normalizeTags(record.tags);
 
   const subject_id = asText(record.subject_id);
@@ -450,6 +490,30 @@ export const normalizeImportQuestions = (
   return input.map((item, index) => normalizeImportQuestion(item, index, role));
 };
 
+export const validateResolvedAdmissionReferences = (
+  sourceType: unknown,
+  references: unknown,
+  errors: string[]
+): void => {
+  if (sourceType !== 'admission') return;
+
+  const list = Array.isArray(references) ? references : [];
+  const linked = list.some((entry) => {
+    const reference = asRecord(entry);
+    return (
+      reference !== null &&
+      asText(reference.institution_id) !== '' &&
+      asText(reference.unit_id) !== ''
+    );
+  });
+
+  if (!linked) {
+    errors.push(
+      'Admission questions need a linked institution and admission unit; check the institution and unit names.'
+    );
+  }
+};
+
 /**
  * Copies backend-resolved exam references onto each payload and computes the
  * canonical content hash afterwards, because `exam_references` is one of the
@@ -462,6 +526,15 @@ export const assignResolvedExamReferences = (
   items.map((item, position) => {
     const resolved = resolvedLists[position];
     if (resolved !== undefined) item.payload.exam_references = resolved;
+
+    if (item.errors.length === 0) {
+      validateResolvedAdmissionReferences(
+        item.payload.source_type,
+        item.payload.exam_references,
+        item.errors
+      );
+    }
+
     return item;
   });
 

@@ -15,6 +15,7 @@ import {
 
 const VALID_TEXT = `@source: admission
 @institution: University of Dhaka
+@unit: A
 @year: 2024-25
 
 Q_BN: বাংলাদেশের রাজধানী কোনটি?
@@ -88,6 +89,7 @@ test('applyTextImportTaxonomy adds the curriculum ids without changing content',
     {
       source_kind: 'admission',
       institution_name: 'University of Dhaka',
+      unit_name: 'A',
       year: '2024-25',
     },
   ]);

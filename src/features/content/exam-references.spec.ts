@@ -113,6 +113,22 @@ test('a unit alone resolves its parent institution', () => {
   assert.equal(resolved.unit_name, 'A Unit');
 });
 
+test('a printed unit name links to the institution unit and drops unit_group', () => {
+  const resolved = normalizeExamReference(
+    {
+      source_kind: 'admission',
+      institution_id: university.id,
+      unit_name: 'ক ইউনিট',
+      unit_group: 'science',
+    },
+    lookups
+  );
+
+  assert.equal(resolved.unit_id, unitA.id);
+  assert.equal(resolved.unit_name, 'A Unit');
+  assert.equal('unit_group' in resolved, false);
+});
+
 test('null and missing admission units are accepted', () => {
   assert.deepEqual(
     normalizeExamReference(

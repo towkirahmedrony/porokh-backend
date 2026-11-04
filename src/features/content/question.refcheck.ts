@@ -1,4 +1,5 @@
 import {
+  matchAdmissionUnit,
   referenceKindMatchesInstitutionType,
   referenceNameVariants,
   type AdmissionUnitRecord,
@@ -18,7 +19,8 @@ import type { ParsedQuestion } from './question.textparse';
 
 export type ReferenceCheckStatus =
   | 'ok'
-  | 'unit_group_mismatch'
+  | 'institution_required'
+  | 'unit_required'
   | 'institution_not_found'
   | 'institution_ambiguous'
   | 'unit_not_found'
@@ -32,16 +34,13 @@ export interface ReferenceCheck {
   status: ReferenceCheckStatus;
   message: string;
   institution?: { id: string; name_en: string | null; name_bn: string | null };
-  unit?: { id: string; name_en: string | null; name_bn: string | null; group: string | null };
+  unit?: { id: string; name_en: string | null; name_bn: string | null };
   /** Closest institutions, or the institution's available units. */
   suggestions?: string[];
 }
 
 /** Institution row including the stored alternative names (institutions.aliases). */
 export type InstitutionWithAliases = InstitutionRecord & { aliases?: string[] | null };
-
-/** Admission unit row including the target HSC group (admission_units.group_type). */
-export type AdmissionUnitWithGroup = AdmissionUnitRecord & { group_type?: string | null };
 
 const STOPWORDS = new Set(['of', 'the', 'and', 'for', 'at', 'in', 'on']);
 const GENERIC_WORDS = new Set([
@@ -88,11 +87,10 @@ const institutionLabel = (row: InstitutionRecord): string => {
 
 const unitLabel = (unit: AdmissionUnitRecord): string => unit.name_en || unit.name_bn || unit.id;
 
-const unitInfo = (unit: AdmissionUnitWithGroup) => ({
+const unitInfo = (unit: AdmissionUnitRecord) => ({
   id: unit.id,
   name_en: unit.name_en ?? null,
   name_bn: unit.name_bn ?? null,
-  group: unit.group_type ?? null,
 });
 
 type InstitutionMatch =
@@ -152,43 +150,7 @@ export const matchInstitution = (
   return { status: 'not_found', suggestions };
 };
 
-/** "A Unit", "Unit A", "A" and "Unit A (Science)" all become "a". */
-const unitKey = (value: string): string =>
-  toEnglishDigits(value)
-    .toLowerCase()
-    .replace(/\([^)]*\)/g, ' ')
-    .replace(/sub[\s-]*unit|unit|উপ[\s-]*ইউনিট|ইউনিট/g, ' ')
-    .replace(/[^\p{L}\p{M}\p{N}]/gu, '');
-
-const plainKey = (value: string): string =>
-  toEnglishDigits(value)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{M}\p{N}]/gu, '');
-
-type UnitMatch =
-  | { status: 'matched'; unit: AdmissionUnitWithGroup }
-  | { status: 'ambiguous'; candidates: AdmissionUnitWithGroup[] }
-  | { status: 'not_found'; available: string[] };
-
-export const matchUnit = (input: string, units: AdmissionUnitWithGroup[]): UnitMatch => {
-  const wanted = new Set([unitKey(input), plainKey(input)].filter(Boolean));
-
-  const hits = units.filter((unit) =>
-    [
-      plainKey(unit.code ?? ''),
-      unitKey(unit.name_en ?? ''),
-      unitKey(unit.name_bn ?? ''),
-      plainKey(unit.name_en ?? ''),
-      plainKey(unit.name_bn ?? ''),
-    ]
-      .filter(Boolean)
-      .some((key) => wanted.has(key))
-  );
-
-  if (hits.length === 1) return { status: 'matched', unit: hits[0] };
-  if (hits.length > 1) return { status: 'ambiguous', candidates: hits };
-  return { status: 'not_found', available: units.map(unitLabel) };
-};
+export const matchUnit = matchAdmissionUnit;
 
 interface Resolved {
   check: ReferenceCheck;
@@ -198,15 +160,29 @@ interface Resolved {
 const resolveReference = (
   reference: Record<string, string>,
   institutions: InstitutionWithAliases[],
-  unitsByInstitution: Map<string, AdmissionUnitWithGroup[]>
+  unitsByInstitution: Map<string, AdmissionUnitRecord[]>
 ): Resolved => {
-  const institutionInput = reference.institution_name;
+  const institutionInput = reference.institution_name ?? '';
   const unitInput = reference.unit_name;
+  const admission = reference.source_kind === 'admission';
   const base = {
     institution_input: institutionInput,
     ...(unitInput ? { unit_input: unitInput } : {}),
     questions: 0,
   };
+
+  if (!institutionInput) {
+    return {
+      link: {},
+      check: {
+        ...base,
+        status: admission ? 'institution_required' : 'institution_not_found',
+        message: admission
+          ? 'Admission references need an institution name.'
+          : 'The reference has no institution name; it will be saved as typed (not linked).',
+      },
+    };
+  }
 
   const found = matchInstitution(institutionInput, reference.source_kind ?? null, institutions);
 
@@ -246,11 +222,10 @@ const resolveReference = (
   };
 
   const units = unitsByInstitution.get(institution.id) ?? [];
-  const group = reference.unit_group;
   const where = institutionLabel(institution);
   const via = found.matchedByAlias ? ' (matched by alternative name)' : '';
 
-  const linkUnit = (unit: AdmissionUnitWithGroup): Resolved => {
+  const linkUnit = (unit: AdmissionUnitRecord): Resolved => {
     link.unit_id = unit.id;
     link.unit_name = unit.name_en || unit.name_bn || unitInput || '';
     return {
@@ -280,24 +255,11 @@ const resolveReference = (
     },
   });
 
-  // A unit label was given: it decides, and the group (if any) must agree.
+  // An admission unit must be named; no unit is ever inferred from a group.
   if (unitInput) {
     const unitResult = matchUnit(unitInput, units);
 
-    if (unitResult.status === 'matched') {
-      const unit = unitResult.unit;
-      const unitGroup = unit.group_type ?? null;
-
-      if (group && unitGroup && unitGroup !== 'all' && unitGroup !== group) {
-        return withoutUnit(
-          'unit_group_mismatch',
-          `Unit "${unitInput}" of ${where} is for ${unitGroup}, not ${group}; it is kept as text only.`,
-          units.filter((entry) => entry.group_type === group).map(unitLabel)
-        );
-      }
-
-      return linkUnit(unit);
-    }
+    if (unitResult.status === 'matched') return linkUnit(unitResult.unit);
 
     if (unitResult.status === 'ambiguous') {
       return withoutUnit(
@@ -316,25 +278,12 @@ const resolveReference = (
     );
   }
 
-  // Only a group was given: pick the unit when exactly one fits.
-  if (group) {
-    const inGroup = units.filter((entry) => entry.group_type === group);
-
-    if (inGroup.length === 1) return linkUnit(inGroup[0]);
-
-    if (inGroup.length > 1) {
-      return withoutUnit(
-        'unit_ambiguous',
-        `${where} has several ${group} units; name the unit (e.g. @unit: A).`,
-        inGroup.map(unitLabel)
-      );
-    }
-
+  if (admission) {
     return withoutUnit(
-      'unit_not_found',
+      'unit_required',
       units.length === 0
-        ? `${where} has no admission units in the database, so the ${group} group cannot be linked.`
-        : `${where} has no ${group} unit recorded; name the unit (e.g. @unit: A).`,
+        ? `${where} has no admission units in the database; add the unit first.`
+        : `${where} needs an admission unit; add @unit (e.g. @unit: A).`,
       units.map(unitLabel)
     );
   }
@@ -350,13 +299,6 @@ const resolveReference = (
   };
 };
 
-/** `unit_group` only guides the unit lookup; it is not part of a stored reference. */
-export const stripUnitGroups = (questions: ParsedQuestion[]): void => {
-  for (const question of questions) {
-    for (const reference of question.exam_references) delete reference.unit_group;
-  }
-};
-
 /**
  * Resolves every reference once per distinct (kind, institution, unit) and
  * writes the verified ids and canonical names onto the questions. References
@@ -365,19 +307,18 @@ export const stripUnitGroups = (questions: ParsedQuestion[]): void => {
 export const applyReferenceChecks = (
   questions: ParsedQuestion[],
   institutions: InstitutionWithAliases[],
-  unitsByInstitution: Map<string, AdmissionUnitWithGroup[]>
+  unitsByInstitution: Map<string, AdmissionUnitRecord[]>
 ): ReferenceCheck[] => {
   const resolvedByKey = new Map<string, Resolved>();
 
   for (const question of questions) {
     for (const reference of question.exam_references) {
-      if (!reference.institution_name) continue;
+      delete reference.unit_group;
 
       const key = [
         reference.source_kind ?? '',
         lower(reference.institution_name),
         lower(reference.unit_name),
-        lower(reference.unit_group),
       ].join('|');
 
       let resolved = resolvedByKey.get(key);
@@ -390,8 +331,6 @@ export const applyReferenceChecks = (
       Object.assign(reference, resolved.link);
     }
   }
-
-  stripUnitGroups(questions);
 
   return Array.from(resolvedByKey.values()).map((entry) => entry.check);
 };

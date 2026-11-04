@@ -242,6 +242,57 @@ test('planImportBatch marks invalid questions without touching the duplicate ind
   );
 });
 
+const admissionQuestion = () => ({
+  ...baseQuestion(),
+  source_type: 'admission',
+  exam_references: [
+    {
+      source_kind: 'admission',
+      institution_name: 'University of Dhaka',
+      unit_name: 'A',
+    },
+  ],
+});
+
+test('admission imports need a resolved institution and unit, other sources do not', () => {
+  const [linked] = assignResolvedExamReferences(
+    [normalizeImportQuestion(admissionQuestion(), 0)],
+    [
+      [
+        {
+          source_kind: 'admission',
+          institution_id: '11111111-1111-4111-8111-111111111111',
+          institution_name: 'University of Dhaka',
+          unit_id: '22222222-2222-4222-8222-222222222222',
+          unit_name: 'A Unit',
+        },
+      ],
+    ]
+  );
+  assert.deepEqual(linked.errors, []);
+
+  const [unlinked] = assignResolvedExamReferences(
+    [normalizeImportQuestion(admissionQuestion(), 0)],
+    [
+      [
+        {
+          source_kind: 'admission',
+          institution_id: '11111111-1111-4111-8111-111111111111',
+          institution_name: 'University of Dhaka',
+          unit_name: 'A',
+        },
+      ],
+    ]
+  );
+  assert.ok(unlinked.errors.some((error) => error.includes('linked institution and admission unit')));
+
+  const modelTest = normalizeImportQuestion(
+    { ...baseQuestion(), source_type: 'model_test', exam_references: null },
+    0
+  );
+  assert.deepEqual(modelTest.errors, []);
+});
+
 /**
  * The guards are behaviour the suite cannot observe without a live project, so
  * they are asserted against the route table exactly as other route specs do.

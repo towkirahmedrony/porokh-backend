@@ -1,7 +1,7 @@
 import { supabase } from '../../config/supabase';
+import type { AdmissionUnitRecord } from './exam-references.core';
 import {
   applyReferenceChecks,
-  type AdmissionUnitWithGroup,
   type InstitutionWithAliases,
   type ReferenceCheck,
 } from './question.refcheck';
@@ -28,8 +28,8 @@ export const checkParsedReferences = async (
   if (institutionResult.error) throw new Error(institutionResult.error.message);
   if (unitResult.error) throw new Error(unitResult.error.message);
 
-  const unitsByInstitution = new Map<string, AdmissionUnitWithGroup[]>();
-  for (const unit of (unitResult.data ?? []) as unknown as AdmissionUnitWithGroup[]) {
+  const unitsByInstitution = new Map<string, AdmissionUnitRecord[]>();
+  for (const unit of (unitResult.data ?? []) as unknown as AdmissionUnitRecord[]) {
     const list = unitsByInstitution.get(unit.institution_id) ?? [];
     list.push(unit);
     unitsByInstitution.set(unit.institution_id, list);

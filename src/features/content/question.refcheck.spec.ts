@@ -195,6 +195,7 @@ test('unmatched institution stays as typed; unmatched unit stays as text', () =>
   const parsed = parseQuestionText(`
 @source: admission
 @institution: Dhaka Univ.
+@unit: A
 Q: One
 A: x
 B: y

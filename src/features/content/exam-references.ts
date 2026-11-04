@@ -156,6 +156,25 @@ const augmentWithLegacyMatches = async (
   }
 };
 
+/** Loads the units of every resolved institution so a unit name can be linked. */
+const addUnitsForInstitutions = async (
+  lookups: ReferenceLookups,
+  institutionIds: string[]
+): Promise<void> => {
+  if (institutionIds.length === 0) return;
+
+  const { data, error } = await supabase
+    .from('admission_units')
+    .select('id, institution_id, name_bn, name_en, code, is_active')
+    .in('institution_id', institutionIds);
+
+  if (error) throw new Error(error.message);
+
+  for (const row of data ?? []) {
+    lookups.units.set(String((row as AdmissionUnitRecord).id), row as AdmissionUnitRecord);
+  }
+};
+
 const fetchLookups = async (institutionIds: string[], unitIds: string[]): Promise<ReferenceLookups> => {
   const institutions = new Map<string, InstitutionRecord>();
   const units = new Map<string, AdmissionUnitRecord>();
@@ -217,6 +236,7 @@ export const resolveExamReferenceLists = async (
   const { institutionIds, unitIds } = readIds(parsed);
   const lookups = await fetchLookups(institutionIds, unitIds);
   await augmentWithLegacyMatches(parsed, lookups);
+  await addUnitsForInstitutions(lookups, Array.from(lookups.institutions.keys()));
 
   return parsed.map((list) => {
     if (list === null || list === undefined) return list;

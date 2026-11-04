@@ -86,7 +86,6 @@ const BATCH_KEYS = new Set([
   'unit',
   'year',
   'difficulty',
-  'group',
   'tags',
 ]);
 
@@ -104,7 +103,6 @@ const QUESTION_KEYS = new Set([
   'exam',
   'unit',
   'year',
-  'group',
   'tags',
 ]);
 
@@ -138,22 +136,14 @@ const BN_DIGITS = '০১২৩৪৫৬৭৮৯';
 const toEnglishDigits = (value: string): string =>
   value.replace(/[০-৯]/g, (digit) => String(BN_DIGITS.indexOf(digit)));
 
-/** HSC group an admission unit is meant for (matches admission_units.group_type). */
-export const UNIT_GROUPS = ['science', 'humanities', 'commerce', 'fine_arts'] as const;
-
-const GROUP_ALIASES: Record<string, string> = {
-  science: 'science',
-  'বিজ্ঞান': 'science',
-  humanities: 'humanities',
-  arts: 'humanities',
-  'মানবিক': 'humanities',
-  'কলা': 'humanities',
-  commerce: 'commerce',
-  business: 'commerce',
-  'বাণিজ্য': 'commerce',
-  'ব্যবসায়_শিক্ষা': 'commerce',
-  fine_arts: 'fine_arts',
-  'চারুকলা': 'fine_arts',
+const SOURCE_REFERENCE_KINDS: Record<string, string> = {
+  admission: 'admission',
+  board_exam: 'board',
+  college_test: 'college',
+  school_exam: 'school',
+  university_exam: 'university',
+  textbook: 'book',
+  guidebook: 'book',
 };
 
 const pick = (...values: Array<string | undefined>): string | undefined =>
@@ -258,8 +248,7 @@ const parseAnswer = (raw: string): number | null => {
 
 const buildQuestion = (
   fields: Bag,
-  defaults: Bag,
-  fallbackGroup?: string
+  defaults: Bag
 ): { question: ParsedQuestion | null; errors: string[]; warnings: string[] } => {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -348,28 +337,24 @@ const buildQuestion = (
     errors.push(`Source type "${sourceType}" is not supported.`);
   }
 
-  const groupRaw = pick(fields.group, defaults.group);
-  let group: string | undefined;
-  if (groupRaw) {
-    group = GROUP_ALIASES[groupRaw.trim().toLowerCase().replace(/[\s-]+/g, '_')];
-    if (!group) {
-      errors.push(`GROUP "${groupRaw}" must be one of ${UNIT_GROUPS.join(', ')}.`);
-    }
-  }
-
-  // The importer's default group only fills in when neither a unit nor a group was written.
-  if (!group && !groupRaw && !pick(fields.unit, defaults.unit) && fallbackGroup) {
-    group = fallbackGroup;
-  }
-
-  // Exam reference: only built when an institution is given.
+  // Exam reference: only built when an institution is given. The reference
+  // kind follows the source type unless @kind overrides it.
   const institution = pick(fields.inst, defaults.institution);
   const exam = pick(fields.exam, defaults.exam);
   const unit = pick(fields.unit, defaults.unit);
   const yearRaw = pick(fields.year, defaults.year);
   const year = yearRaw ? toEnglishDigits(yearRaw).replace(/\s+/g, '') : undefined;
-  const kind = (pick(defaults.kind) ?? 'admission').toLowerCase();
+  const kind = (pick(defaults.kind) ?? SOURCE_REFERENCE_KINDS[sourceType] ?? 'unknown').toLowerCase();
   const exam_references: Array<Record<string, string>> = [];
+
+  if (sourceType === 'admission') {
+    if (!institution) {
+      errors.push('Admission questions need an institution (use @institution).');
+    }
+    if (!unit) {
+      errors.push('Admission questions need an admission unit (use @unit, e.g. @unit: A).');
+    }
+  }
 
   if (institution) {
     if (!(IMPORT_REFERENCE_KINDS as readonly string[]).includes(kind)) {
@@ -380,12 +365,10 @@ const buildQuestion = (
       institution_name: institution,
       ...(exam ? { exam_name: exam } : {}),
       ...(unit ? { unit_name: unit } : {}),
-      // Transient: used by the reference check to find the unit, then removed.
-      ...(group ? { unit_group: group } : {}),
       ...(year ? { year } : {}),
     });
-  } else if (exam || unit || year || groupRaw) {
-    warnings.push('Exam/unit/group/year were ignored because no institution is set.');
+  } else if (exam || unit || year) {
+    warnings.push('Exam/unit/year were ignored because no institution is set.');
   }
 
   const explanationBn = pick(fields.exp_bn, fields.exp) ?? '';
@@ -420,10 +403,7 @@ const buildQuestion = (
  * `errors` with its question number and start line so only that block needs
  * fixing. `@key: value` lines set defaults for every later question.
  */
-export const parseQuestionText = (
-  input: unknown,
-  options: { defaultGroup?: unknown } = {}
-): TextParseResult => {
+export const parseQuestionText = (input: unknown): TextParseResult => {
   if (typeof input !== 'string' || input.trim() === '') {
     throw new TextParseValidationError('text is required.');
   }
@@ -432,18 +412,6 @@ export const parseQuestionText = (
     throw new TextParseValidationError(
       `text is too long; paste at most ${MAX_PARSE_TEXT_LENGTH} characters at a time.`
     );
-  }
-
-  let fallbackGroup: string | undefined;
-  const rawDefaultGroup = options.defaultGroup;
-  if (rawDefaultGroup !== undefined && rawDefaultGroup !== null && rawDefaultGroup !== '') {
-    fallbackGroup =
-      typeof rawDefaultGroup === 'string'
-        ? GROUP_ALIASES[rawDefaultGroup.trim().toLowerCase().replace(/[\s-]+/g, '_')]
-        : undefined;
-    if (!fallbackGroup) {
-      throw new TextParseValidationError(`default_group must be one of ${UNIT_GROUPS.join(', ')}.`);
-    }
   }
 
   const defaults: Bag = {};
@@ -456,21 +424,16 @@ export const parseQuestionText = (
     const line = block.lines.find((entry) => entry.text.trim() !== '')?.no ?? 1;
     const { headers, fields, problems } = parseBlock(block);
 
-    // A new institution starts a new section: the unit, group and exam of the
-    // previous one must not carry over unless this block sets them again.
+    // A new institution starts a new section: the unit and exam of the previous
+    // one must not carry over unless this block sets them again.
     if (
       headers.institution !== undefined &&
       headers.institution.trim().toLowerCase() !== (defaults.institution ?? '').trim().toLowerCase()
     ) {
-      for (const key of ['unit', 'group', 'exam']) {
+      for (const key of ['unit', 'exam']) {
         if (headers[key] === undefined) delete defaults[key];
       }
     }
-
-    // Unit and group are alternatives: setting one drops the inherited other,
-    // unless the same block sets both (then they are cross-checked later).
-    if (headers.unit !== undefined && headers.group === undefined) delete defaults.group;
-    if (headers.group !== undefined && headers.unit === undefined) delete defaults.unit;
 
     // An empty header value clears that default.
     Object.assign(defaults, headers);
@@ -488,7 +451,7 @@ export const parseQuestionText = (
       );
     }
 
-    const built = buildQuestion(fields, defaults, fallbackGroup);
+    const built = buildQuestion(fields, defaults);
     const messages = [...problems, ...built.errors];
 
     if (messages.length > 0 || !built.question) {

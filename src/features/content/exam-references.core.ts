@@ -156,6 +156,55 @@ export const referenceKindMatchesInstitutionType = (
   return typeof type === 'string' && allowed.includes(type);
 };
 
+const BN_DIGITS = '০১২৩৪৫৬৭৮৯';
+const toEnglishDigits = (value: string): string =>
+  value.replace(/[০-৯]/g, (digit) => String(BN_DIGITS.indexOf(digit)));
+
+/** "A Unit", "Unit A", "A" and "Unit A (Science)" all become "a". */
+const unitKey = (value: string): string =>
+  toEnglishDigits(value)
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/sub[\s-]*unit|unit|উপ[\s-]*ইউনিট|ইউনিট/g, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}]/gu, '');
+
+const plainKey = (value: string): string =>
+  toEnglishDigits(value)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{M}\p{N}]/gu, '');
+
+export type AdmissionUnitMatch =
+  | { status: 'matched'; unit: AdmissionUnitRecord }
+  | { status: 'ambiguous'; candidates: AdmissionUnitRecord[] }
+  | { status: 'not_found'; available: string[] };
+
+const unitLabel = (unit: AdmissionUnitRecord): string =>
+  unit.name_en || unit.name_bn || unit.id;
+
+/** Matches a printed unit label against the units of one institution. */
+export const matchAdmissionUnit = (
+  input: string,
+  units: AdmissionUnitRecord[]
+): AdmissionUnitMatch => {
+  const wanted = new Set([unitKey(input), plainKey(input)].filter(Boolean));
+
+  const hits = units.filter((unit) =>
+    [
+      plainKey(unit.code ?? ''),
+      unitKey(unit.name_en ?? ''),
+      unitKey(unit.name_bn ?? ''),
+      plainKey(unit.name_en ?? ''),
+      plainKey(unit.name_bn ?? ''),
+    ]
+      .filter(Boolean)
+      .some((key) => wanted.has(key))
+  );
+
+  if (hits.length === 1) return { status: 'matched', unit: hits[0] };
+  if (hits.length > 1) return { status: 'ambiguous', candidates: hits };
+  return { status: 'not_found', available: units.map(unitLabel) };
+};
+
 const assertKindMatchesInstitution = (
   kind: string | null,
   institution: InstitutionRecord
@@ -210,6 +259,9 @@ export const normalizeExamReference = (
   const kind = normalizeReferenceSourceKind(reference.source_kind);
   if (kind) reference.source_kind = kind;
 
+  // Group classification is retired; old payloads may still send it.
+  delete reference.unit_group;
+
   const institutionId = readId(reference.institution_id, 'institution_id');
   const unitId = readId(reference.unit_id, 'unit_id');
 
@@ -256,6 +308,17 @@ export const normalizeExamReference = (
     const unitName = preferredUnitName(unit);
     if (!asTrimmedString(reference.unit_name) && unitName) {
       reference.unit_name = unitName;
+    }
+  } else if (institutionId && asTrimmedString(reference.unit_name)) {
+    const units = Array.from(lookups.units.values()).filter(
+      (unit) => unit.institution_id === institutionId
+    );
+    const matched = matchAdmissionUnit(asTrimmedString(reference.unit_name), units);
+
+    if (matched.status === 'matched') {
+      reference.unit_id = matched.unit.id;
+      const unitName = preferredUnitName(matched.unit);
+      if (unitName) reference.unit_name = unitName;
     }
   } else if ('unit_id' in reference) {
     reference.unit_id = null;
