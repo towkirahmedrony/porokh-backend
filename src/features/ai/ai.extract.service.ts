@@ -45,7 +45,7 @@ const SYSTEM_INSTRUCTION = `You are a precise exam-paper digitisation engine for
 Read every supplied source (readable text and/or page images) and return the eligible multiple-choice questions as the Structured Plain Text format described below. Reply with plain text only: no JSON, no markdown, no code fences, no commentary.
 
 WHAT TO EXTRACT
-- Only complete university admission MCQs: public university, engineering, medical and dental, agricultural, GST, and private university admission tests, admission model tests and admission guidebooks.
+- Complete MCQs from university admission exams, model tests and guidebooks, including public university, engineering, medical and dental, agricultural, GST, and private university sources.
 - Skip HSC, SSC and board examination questions.
 - Skip non-MCQ content, instructions, headers, adverts and answer-key-only pages.
 - Skip a question when it is incomplete, unreadable, or depends on a diagram whose required information is missing.
@@ -64,8 +64,13 @@ Metadata (only when supported by the source):
 @institution: full official English institution name
 @exam: exam name
 @unit: unit label
-@year: academic year, for example 2022-23
+@session: academic/admission session, for example 2022-23 (@year is accepted as a legacy alias)
 @tags: comma separated common tags
+
+Classification rules:
+- For @source: admission, include both @institution and @unit when the source identifies them. Never infer either value; if unavailable, do not invent it.
+- For model_test, guidebook and unknown sources, institution and unit are optional. Include them only when supported by the source.
+- Do not use @group or classify admissions as science, humanities or commerce; group classification is retired.
 
 Question fields:
 Q_BN: Bengali question
@@ -80,13 +85,13 @@ TAGS: 3-8 lowercase English topic tags
 
 Rules for the format:
 - Do not number questions. Do not add Markdown or code fences. Do not add introductory or concluding commentary.
-- If institution, year or unit changes later in a document, write the new @ metadata before the questions it applies to.
+- If institution, session/year or unit changes later in a document, write the new @ metadata before the questions it applies to.
 - If a source contains no eligible question, reply with exactly NONE.
 
 EXAMPLE
 @source: guidebook
 @institution: Rajshahi University
-@year: 2022-23
+@session: 2022-23
 @tags: biology, cell biology
 
 Q_BN: কোষ ঝিল্লির মোট শুষ্ক ওজনের কত ভাগ লিপিড?
@@ -128,7 +133,7 @@ const buildParts = (
     {
       kind: 'text',
       text:
-        'Extract the eligible admission MCQs from the sources below and return only the Structured Plain Text document.' +
+        'Extract the eligible MCQs from the supported sources below and return only the Structured Plain Text document.' +
         (hintLines
           ? `\nThe uploader supplied these hints; use them only when the sources are consistent with them:\n${hintLines}`
           : '') +
@@ -206,8 +211,9 @@ export interface ExtractionServiceResult {
 }
 
 /**
- * Extracts the eligible admission MCQs from the supplied sources and returns
- * one Structured Plain Text document. Nothing is written to the database.
+ * Extracts eligible MCQs from the supplied admission, model-test and guidebook
+ * sources and returns one Structured Plain Text document. Nothing is written
+ * to the database.
  */
 export const extractQuestionsFromSources = async (
   body: unknown

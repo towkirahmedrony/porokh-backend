@@ -70,6 +70,23 @@ test('model_test and guidebook sources do not require an institution or unit', (
   }
 });
 
+test('@session is accepted as a backward-compatible alias for year metadata', () => {
+  const parsed = parseQuestionText(
+    `@source: admission\n@institution: DU\n@unit: A\n@session: 2025-26\n${Q}`
+  );
+
+  assert.equal(parsed.counts.valid, 1);
+  assert.equal(parsed.questions[0].exam_references[0].year, '2025-26');
+});
+
+test('optional model-test metadata without an institution remains non-blocking', () => {
+  const parsed = parseQuestionText(`@source: model_test\n@exam: Practice Set\n@session: 2025-26\n${Q}`);
+
+  assert.equal(parsed.counts.valid, 1);
+  assert.deepEqual(parsed.questions[0].exam_references, []);
+  assert.ok(parsed.warnings.length > 0);
+});
+
 test('the legacy @group header is rejected instead of being classified', () => {
   const parsed = parseQuestionText(`@institution: DU\n@group: science\n${Q}`);
 

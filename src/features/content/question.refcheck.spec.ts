@@ -227,3 +227,34 @@ ANS: A
   assert.equal(parsed.questions[2].exam_references[0].institution_id, 'du');
   assert.ok(!('unit_id' in parsed.questions[2].exam_references[0]));
 });
+
+test('identical unit labels resolve only within the explicitly selected institution', () => {
+  const parsed = parseQuestionText(`
+@source: admission
+@institution: DU
+@unit: A
+Q: Dhaka question
+A: x
+B: y
+ANS: A
+---
+@institution: RU
+@unit: A
+Q: Rajshahi question
+A: x
+B: y
+ANS: A
+`);
+
+  const checks = applyReferenceChecks(parsed.questions, INSTITUTIONS, UNITS);
+
+  assert.deepEqual(checks.map((check) => check.status), ['ok', 'ok']);
+  assert.deepEqual(
+    parsed.questions.map((question) => question.exam_references[0].unit_id),
+    ['du-a', 'ru-a']
+  );
+  assert.deepEqual(
+    parsed.questions.map((question) => question.exam_references[0].institution_id),
+    ['du', 'ru']
+  );
+});

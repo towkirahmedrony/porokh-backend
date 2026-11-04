@@ -202,7 +202,10 @@ const parseBlock = (
 
     if (match) {
       const isHeader = match[1] === '@';
-      const key = match[2].toLowerCase();
+      const rawKey = match[2].toLowerCase();
+      // @session is the preferred admission label; keep storing it in the
+      // existing `year` metadata field for backward compatibility.
+      const key = rawKey === 'session' ? 'year' : rawKey;
       const value = match[3].trim();
 
       if (isHeader) {
