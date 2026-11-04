@@ -1,8 +1,8 @@
 import { supabase } from '../../config/supabase';
-import type { InstitutionRecord } from './exam-references.core';
 import {
   applyReferenceChecks,
   type AdmissionUnitWithGroup,
+  type InstitutionWithAliases,
   type ReferenceCheck,
 } from './question.refcheck';
 import type { ParsedQuestion } from './question.textparse';
@@ -21,11 +21,7 @@ export const checkParsedReferences = async (
   if (!hasInstitution) return [];
 
   const [institutionResult, unitResult] = await Promise.all([
-    supabase
-      .from('institutions')
-      .select('id, name_bn, name_en, short_name, type, code, eiin, aliases, is_active')
-      .eq('is_active', true)
-      .limit(5000),
+    supabase.from('institutions').select('*').eq('is_active', true).limit(5000),
     supabase.from('admission_units').select('*').eq('is_active', true).limit(5000),
   ]);
 
@@ -41,7 +37,7 @@ export const checkParsedReferences = async (
 
   return applyReferenceChecks(
     questions,
-    (institutionResult.data ?? []) as InstitutionRecord[],
+    (institutionResult.data ?? []) as unknown as InstitutionWithAliases[],
     unitsByInstitution
   );
 };

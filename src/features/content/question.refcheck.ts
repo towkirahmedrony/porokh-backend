@@ -37,6 +37,9 @@ export interface ReferenceCheck {
   suggestions?: string[];
 }
 
+/** Institution row including the stored alternative names (institutions.aliases). */
+export type InstitutionWithAliases = InstitutionRecord & { aliases?: string[] | null };
+
 /** Admission unit row including the target HSC group (admission_units.group_type). */
 export type AdmissionUnitWithGroup = AdmissionUnitRecord & { group_type?: string | null };
 
@@ -72,6 +75,12 @@ const jaccard = (a: Set<string>, b: Set<string>): number => {
   return shared / (a.size + b.size - shared);
 };
 
+/** Every stored name of an institution: both names, the short name and all aliases. */
+const institutionNames = (row: InstitutionWithAliases): string[] =>
+  [row.name_bn, row.name_en, row.short_name, ...(row.aliases ?? [])].filter(
+    (value): value is string => typeof value === 'string' && value.trim() !== ''
+  );
+
 const institutionLabel = (row: InstitutionRecord): string => {
   const name = row.name_en || row.name_bn || row.id;
   return row.short_name ? `${name} (${row.short_name})` : name;
@@ -87,31 +96,43 @@ const unitInfo = (unit: AdmissionUnitWithGroup) => ({
 });
 
 type InstitutionMatch =
-  | { status: 'matched'; institution: InstitutionRecord }
-  | { status: 'ambiguous'; candidates: InstitutionRecord[] }
+  | { status: 'matched'; institution: InstitutionWithAliases; matchedByAlias: boolean }
+  | { status: 'ambiguous'; candidates: InstitutionWithAliases[] }
   | { status: 'not_found'; suggestions: string[] };
 
 export const matchInstitution = (
   input: string,
   kind: string | null,
-  rows: InstitutionRecord[]
+  rows: InstitutionWithAliases[]
 ): InstitutionMatch => {
   const needle = input.trim();
   const code = needle.toLowerCase();
   const inputVariants = new Set(referenceNameVariants(needle, kind));
   const eligible = rows.filter((row) => referenceKindMatchesInstitutionType(kind, row.type));
 
-  const hits = eligible.filter((row) => {
-    if (code && (lower(row.code) === code || lower(row.eiin) === code)) return true;
+  const sharesVariant = (value: string): boolean =>
+    referenceNameVariants(value, kind).some((variant) => inputVariants.has(variant));
 
-    return [row.name_bn, row.name_en, row.short_name]
-      .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
-      .some((value) =>
-        referenceNameVariants(value, kind).some((variant) => inputVariants.has(variant))
-      );
-  });
+  // Code/EIIN and the official names (both languages, short name) are the
+  // primary identity; `aliases` are stored alternative names and misspellings.
+  const matchesOfficially = (row: InstitutionWithAliases): boolean =>
+    (code !== '' && (lower(row.code) === code || lower(row.eiin) === code)) ||
+    [row.name_bn, row.name_en, row.short_name].some(
+      (value) => typeof value === 'string' && value.trim() !== '' && sharesVariant(value)
+    );
 
-  if (hits.length === 1) return { status: 'matched', institution: hits[0] };
+  const matchesByAlias = (row: InstitutionWithAliases): boolean =>
+    (row.aliases ?? []).some((value) => typeof value === 'string' && sharesVariant(value));
+
+  const hits = eligible.filter((row) => matchesOfficially(row) || matchesByAlias(row));
+
+  if (hits.length === 1) {
+    return {
+      status: 'matched',
+      institution: hits[0],
+      matchedByAlias: !matchesOfficially(hits[0]),
+    };
+  }
   if (hits.length > 1) return { status: 'ambiguous', candidates: hits };
 
   const wanted = new Set(tokens(needle));
@@ -119,9 +140,7 @@ export const matchInstitution = (
     .map((row) => ({
       row,
       score: Math.max(
-        ...[row.name_en, row.name_bn, row.short_name].map((value) =>
-          jaccard(wanted, new Set(tokens(value ?? '')))
-        ),
+        ...institutionNames(row).map((value) => jaccard(wanted, new Set(tokens(value)))),
         0
       ),
     }))
@@ -178,7 +197,7 @@ interface Resolved {
 
 const resolveReference = (
   reference: Record<string, string>,
-  institutions: InstitutionRecord[],
+  institutions: InstitutionWithAliases[],
   unitsByInstitution: Map<string, AdmissionUnitWithGroup[]>
 ): Resolved => {
   const institutionInput = reference.institution_name;
@@ -229,6 +248,7 @@ const resolveReference = (
   const units = unitsByInstitution.get(institution.id) ?? [];
   const group = reference.unit_group;
   const where = institutionLabel(institution);
+  const via = found.matchedByAlias ? ' (matched by alternative name)' : '';
 
   const linkUnit = (unit: AdmissionUnitWithGroup): Resolved => {
     link.unit_id = unit.id;
@@ -238,7 +258,7 @@ const resolveReference = (
       check: {
         ...base,
         status: 'ok',
-        message: `Linked to ${where}, ${unitLabel(unit)}${found.matchedByAlias ? ' (matched by alternative name)' : ''}.`,
+        message: `Linked to ${where}, ${unitLabel(unit)}${via}.`,
         institution: institutionInfo,
         unit: unitInfo(unit),
       },
@@ -324,7 +344,7 @@ const resolveReference = (
     check: {
       ...base,
       status: 'ok',
-      message: `Linked to ${where}${found.matchedByAlias ? ' (matched by alternative name)' : ''}.`,
+      message: `Linked to ${where}${via}.`,
       institution: institutionInfo,
     },
   };
@@ -344,7 +364,7 @@ export const stripUnitGroups = (questions: ParsedQuestion[]): void => {
  */
 export const applyReferenceChecks = (
   questions: ParsedQuestion[],
-  institutions: InstitutionRecord[],
+  institutions: InstitutionWithAliases[],
   unitsByInstitution: Map<string, AdmissionUnitWithGroup[]>
 ): ReferenceCheck[] => {
   const resolvedByKey = new Map<string, Resolved>();
