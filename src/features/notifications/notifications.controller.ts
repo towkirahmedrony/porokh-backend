@@ -19,6 +19,19 @@ const getClientIp = (req: Request): string | null => {
   return req.ip || req.socket.remoteAddress || null;
 };
 
+export const removeDeviceToken = catchAsync(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const deviceId = req.body?.device_id ?? req.query?.device_id ?? req.params?.deviceId;
+
+  await NotificationService.deactivateUserDeviceToken(userId, String(deviceId ?? ''));
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: 'Device token removed successfully',
+  });
+});
+
 export const updateDeviceToken = catchAsync(async (req: Request, res: Response) => {
   const userId = req.user!.id;
   const ipAddress = getClientIp(req);

@@ -5,7 +5,9 @@ import { parseLanguage } from '../lib/utils/language';
 import {
   notify,
   notifyPremiumExpiring,
+  sendPushToDevices,
 } from '../features/notifications/notifications.service';
+import { PushDeviceRow } from '../features/notifications/notifications.push';
 
 const chooseText = (language: 'bn' | 'en', bn?: string | null, en?: string | null): string => {
   const preferred = language === 'en' ? en : bn;
@@ -214,12 +216,11 @@ export const initNotificationCron = () => {
       for (const campaign of campaigns) {
         let successCount = 0;
         try {
-          let deviceQuery = supabaseAdmin.from('user_devices').select('user_id, fcm_token').not('fcm_token', 'is', null);
+          let deviceQuery = supabaseAdmin.from('user_devices').select('user_id, fcm_token, platform').not('fcm_token', 'is', null);
           if (campaign.target_user_id) deviceQuery = deviceQuery.eq('user_id', campaign.target_user_id);
           const { data: devices, error: deviceError } = await deviceQuery;
           if (deviceError) throw deviceError;
 
-          const { messaging } = await import('../config/firebaseAdmin');
           const userIds = [...new Set((devices || []).map((device) => device.user_id).filter(Boolean))] as string[];
           const { data: profiles, error: profileError } = userIds.length
             ? await supabaseAdmin.from('profiles').select('id, language_preference, settings').in('id', userIds)
@@ -227,27 +228,26 @@ export const initNotificationCron = () => {
           if (profileError) throw profileError;
           const languages = new Map((profiles || []).map((profile) => [profile.id, parseLanguage(profile.language_preference)]));
           const pushAllowed = new Set((profiles || []).filter((profile) => pushEnabled(profile.settings)).map((profile) => profile.id));
-          const tokensByLanguage: Record<'bn' | 'en', string[]> = { bn: [], en: [] };
+          const devicesByLanguage: Record<'bn' | 'en', PushDeviceRow[]> = { bn: [], en: [] };
           for (const device of devices || []) {
             if (device.fcm_token && pushAllowed.has(device.user_id)) {
-              tokensByLanguage[languages.get(device.user_id) || 'bn'].push(device.fcm_token);
+              devicesByLanguage[languages.get(device.user_id) || 'bn'].push(
+                device as PushDeviceRow
+              );
             }
           }
 
           for (const language of ['bn', 'en'] as const) {
-            const tokens = tokensByLanguage[language];
-            if (!tokens.length) continue;
-            const response = await messaging.sendEachForMulticast({
-              data: {
-                title: chooseText(language, campaign.title_bn, campaign.title_en) || 'New Notification',
-                body: chooseText(language, campaign.body_bn, campaign.body_en),
-                image_url: campaign.image_url || '',
-                action_link: campaign.action_link || '/',
-                type: 'campaign',
-              },
-              tokens,
+            const languageDevices = devicesByLanguage[language];
+            if (!languageDevices.length) continue;
+            const outcome = await sendPushToDevices(languageDevices, {
+              title: chooseText(language, campaign.title_bn, campaign.title_en) || 'New Notification',
+              body: chooseText(language, campaign.body_bn, campaign.body_en),
+              imageUrl: campaign.image_url || null,
+              actionLink: campaign.action_link || '/',
+              type: 'campaign',
             });
-            successCount += response.successCount;
+            successCount += outcome.sent;
           }
         } catch (pushError) {
           // Mark once after the attempt to avoid duplicate sends on the next cron tick.

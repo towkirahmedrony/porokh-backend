@@ -2,6 +2,8 @@ import { supabase } from '../../config/supabase';
 import { supabaseAdmin } from '../../config/supabaseAdmin';
 import { parseLanguage } from '../../lib/utils/language';
 import { NOTIFICATION_TYPES, NotificationType } from './notifications.types';
+import { PushDeviceRow } from './notifications.push';
+import { sendPushToDevices } from './notifications.service';
 
 const LEGACY_TYPE_MAP: Record<string, NotificationType> = {
   system: 'security',
@@ -49,46 +51,44 @@ export const createCampaign = async (campaignData: any, adminId: string) => {
     // সব ইউজারের ফায়ারবেস টোকেন নিয়ে আসা (যাদের টোকেন null নয়)
     const { data: userDevices } = await supabaseAdmin
       .from('user_devices')
-      .select('user_id, fcm_token')
+      .select('user_id, fcm_token, platform')
       .not('fcm_token', 'is', null);
 
     if (userDevices && userDevices.length > 0) {
-      const { messaging } = await import('../../config/firebaseAdmin');
       const userIds = [...new Set(userDevices.map(device => device.user_id).filter(Boolean))] as string[];
       const { data: profiles } = userIds.length
         ? await supabaseAdmin.from('profiles').select('id, language_preference, settings').in('id', userIds)
         : { data: [] };
       const languageByUser = new Map((profiles || []).map(profile => [profile.id, parseLanguage(profile.language_preference)]));
       const pushAllowed = new Set((profiles || []).filter(profile => pushEnabled(profile.settings)).map(profile => profile.id));
-      const tokensByLanguage: Record<'bn' | 'en', string[]> = { bn: [], en: [] };
+      const devicesByLanguage: Record<'bn' | 'en', PushDeviceRow[]> = { bn: [], en: [] };
       for (const device of userDevices) {
         if (device.fcm_token && pushAllowed.has(device.user_id)) {
-          tokensByLanguage[languageByUser.get(device.user_id) || 'bn'].push(device.fcm_token);
+          devicesByLanguage[languageByUser.get(device.user_id) || 'bn'].push(
+            device as PushDeviceRow
+          );
         }
       }
       let successCount = 0;
       let failureCount = 0;
       for (const language of ['bn', 'en'] as const) {
-        const tokens = tokensByLanguage[language];
-        if (tokens.length === 0) continue;
+        const devices = devicesByLanguage[language];
+        if (devices.length === 0) continue;
         const title = language === 'en'
           ? campaignData.title_en || campaignData.title_bn || 'New Notification'
           : campaignData.title_bn || campaignData.title_en || 'নতুন বিজ্ঞপ্তি';
         const body = language === 'en'
           ? campaignData.body_en || campaignData.body_bn || ''
           : campaignData.body_bn || campaignData.body_en || '';
-        const response = await messaging.sendEachForMulticast({
-          data: {
-            title,
-            body,
-            image_url: campaignData.image_url || '',
-            action_link: campaignData.action_link || '/',
-            type: 'campaign'
-          },
-          tokens
+        const outcome = await sendPushToDevices(devices, {
+          title,
+          body,
+          imageUrl: campaignData.image_url || null,
+          actionLink: campaignData.action_link || '/',
+          type: 'campaign',
         });
-        successCount += response.successCount;
-        failureCount += response.failureCount;
+        successCount += outcome.sent;
+        failureCount += devices.length - outcome.sent;
       }
       // কতজনকে পাঠানো হলো সেই সংখ্যাটি ডাটাবেসে আপডেট করা
       await supabase.from('notifications').update({ total_sent: successCount }).eq('id', data.id);

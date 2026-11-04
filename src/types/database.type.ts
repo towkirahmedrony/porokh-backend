@@ -3373,6 +3373,7 @@ export type Database = {
           is_trusted: boolean | null
           last_active_at: string | null
           os_or_browser: string | null
+          platform: string
           user_id: string | null
         }
         Insert: {
@@ -3384,6 +3385,7 @@ export type Database = {
           is_trusted?: boolean | null
           last_active_at?: string | null
           os_or_browser?: string | null
+          platform?: string
           user_id?: string | null
         }
         Update: {
@@ -3395,6 +3397,7 @@ export type Database = {
           is_trusted?: boolean | null
           last_active_at?: string | null
           os_or_browser?: string | null
+          platform?: string
           user_id?: string | null
         }
         Relationships: [

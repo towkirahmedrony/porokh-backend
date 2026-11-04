@@ -11,6 +11,14 @@ import {
   NotifyResult,
 } from './notifications.types';
 import { Language, parseLanguage } from '../../lib/utils/language';
+import {
+  PUSH_PLATFORM_ORDER,
+  PushCopy,
+  PushDeviceRow,
+  buildPushMessage,
+  groupTokensByPlatform,
+  normalizeDevicePlatform,
+} from './notifications.push';
 
 type AnyObject = Record<string, any>;
 
@@ -221,6 +229,38 @@ const cleanupInvalidTokens = async (tokens: string[], responses: AnyObject[]): P
   if (error) console.error('[notify] stale token cleanup failed:', error.message);
 };
 
+/**
+ * Sends one payload to a set of devices, splitting by transport because a
+ * multicast message can only carry one shape.
+ */
+export const sendPushToDevices = async (
+  devices: PushDeviceRow[],
+  copy: PushCopy
+): Promise<PushOutcome> => {
+  const grouped = groupTokensByPlatform(devices);
+  let sent = 0;
+  let lastError: string | null = null;
+
+  for (const platform of PUSH_PLATFORM_ORDER) {
+    for (const tokenChunk of chunk(grouped[platform], TOKEN_CHUNK_SIZE)) {
+      try {
+        const { messaging } = await import('../../config/firebaseAdmin');
+        const response = await messaging.sendEachForMulticast(
+          buildPushMessage(tokenChunk, platform, copy)
+        );
+
+        sent += response.successCount;
+        await cleanupInvalidTokens(tokenChunk, response.responses as AnyObject[]);
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : 'push failed';
+        console.error('[notify] FCM push failed:', lastError);
+      }
+    }
+  }
+
+  return { sent, error: lastError };
+};
+
 const deliverPushForUser = async (
   userId: string,
   copy: { title: BilingualCopy; body: BilingualCopy },
@@ -244,7 +284,7 @@ const deliverPushForUser = async (
 
   const { data: devices, error } = await getAdmin()
     .from('user_devices')
-    .select('fcm_token')
+    .select('fcm_token, platform')
     .eq('user_id', userId)
     .not('fcm_token', 'is', null);
 
@@ -252,39 +292,14 @@ const deliverPushForUser = async (
     return { sent: 0, error: error?.message ?? null };
   }
 
-  const tokens = Array.from(
-    new Set(devices.map((device) => String(device.fcm_token ?? '')).filter(Boolean))
-  );
-
-  if (tokens.length === 0) return { sent: 0, error: null };
-
-  let sent = 0;
-  let lastError: string | null = null;
-
-  for (const tokenChunk of chunk(tokens, TOKEN_CHUNK_SIZE)) {
-    try {
-      const { messaging } = await import('../../config/firebaseAdmin');
-      const response = await messaging.sendEachForMulticast({
-        data: {
-          title: localizedCopy(copy.title, language) || 'Porokh',
-          body: localizedCopy(copy.body, language),
-          image_url: options.imageUrl || '',
-          action_link: options.actionLink || '/',
-          type: options.type,
-          notification_id: options.notificationId || '',
-        },
-        tokens: tokenChunk,
-      });
-
-      sent += response.successCount;
-      await cleanupInvalidTokens(tokenChunk, response.responses as AnyObject[]);
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : 'push failed';
-      console.error('[notify] FCM push failed:', lastError);
-    }
-  }
-
-  return { sent, error: lastError };
+  return sendPushToDevices(devices as PushDeviceRow[], {
+    title: localizedCopy(copy.title, language) || 'Porokh',
+    body: localizedCopy(copy.body, language),
+    imageUrl: options.imageUrl,
+    actionLink: options.actionLink,
+    type: options.type,
+    notificationId: options.notificationId,
+  });
 };
 
 // --- Core entry point --------------------------------------------------------
@@ -659,22 +674,41 @@ export const saveUserDeviceToken = async (userId: string, payload: IDeviceTokenP
   if (!userId) throw new Error('User ID is required');
   if (!payload.device_id) throw new Error('Device ID is required');
 
+  const deviceId = String(payload.device_id).trim();
+  const fcmToken = payload.fcm_token ? String(payload.fcm_token).trim() : null;
+  const platform = normalizeDevicePlatform(payload.platform);
+
   const { data: existing } = await getAdmin()
     .from('user_devices')
     .select('id')
     .eq('user_id', userId)
-    .eq('device_id', payload.device_id)
+    .eq('device_id', deviceId)
     .maybeSingle();
+
+  // One installation holds one active token. Releasing it from other rows stops
+  // a previous account on a shared phone from receiving this device's pushes.
+  if (fcmToken) {
+    const { error: releaseError } = await getAdmin()
+      .from('user_devices')
+      .update({ fcm_token: null })
+      .eq('fcm_token', fcmToken)
+      .neq('device_id', deviceId);
+
+    if (releaseError) {
+      console.error('Device token release failed:', releaseError.message);
+    }
+  }
 
   const { data, error } = await getAdmin()
     .from('user_devices')
     .upsert(
       {
         user_id: userId,
-        device_id: payload.device_id,
+        device_id: deviceId,
         device_name: payload.device_name || 'Web Client',
         os_or_browser: payload.os_or_browser || 'Unknown',
-        fcm_token: payload.fcm_token,
+        fcm_token: fcmToken,
+        platform,
         ip_address: payload.ip_address || null,
         last_active_at: new Date().toISOString(),
         is_trusted: true,
@@ -688,7 +722,7 @@ export const saveUserDeviceToken = async (userId: string, payload: IDeviceTokenP
     throw new Error(error.message);
   }
 
-  if (!existing && payload.fcm_token) {
+  if (!existing && fcmToken) {
     notifySafe({
       userIds: userId,
       type: 'security',
@@ -700,12 +734,32 @@ export const saveUserDeviceToken = async (userId: string, payload: IDeviceTokenP
       channels: ['in_app', 'push'],
       priority: 'high',
       actionLink: '/change-password',
-      dedupeKey: `new_device:${userId}:${payload.device_id}`,
-      metaData: { device_id: payload.device_id },
+      dedupeKey: `new_device:${userId}:${deviceId}`,
+      metaData: { device_id: deviceId },
     });
   }
 
   return data;
+};
+
+/**
+ * Deactivates this installation's token on sign-out or account switch. The row
+ * is kept so the security history and the "new device login" dedupe survive.
+ */
+export const deactivateUserDeviceToken = async (
+  userId: string,
+  deviceId: string
+): Promise<void> => {
+  const id = String(deviceId ?? '').trim();
+  if (!id) throw new Error('Device ID is required');
+
+  const { error } = await getAdmin()
+    .from('user_devices')
+    .update({ fcm_token: null, last_active_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('device_id', id);
+
+  if (error) throw new Error(error.message);
 };
 
 // --- Legacy helpers kept for existing call sites -----------------------------

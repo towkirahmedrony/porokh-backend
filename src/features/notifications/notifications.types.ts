@@ -3,11 +3,16 @@ export interface IMarkReadPayload {
   is_clicked?: boolean;
 }
 
+/** Push transport registered for an installation. */
+export type DevicePlatform = 'web' | 'android';
+
 export interface IDeviceTokenPayload {
   device_id: string;
   device_name?: string;
   os_or_browser?: string;
   fcm_token: string | null;
+  /** Defaults to `web` so existing web clients keep their behaviour. */
+  platform?: DevicePlatform;
   ip_address?: string | null;
 }
 
