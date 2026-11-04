@@ -5,6 +5,9 @@ import {
 } from './admissions.errors';
 import { ADMISSION_PRACTICE_MAX_QUESTIONS } from './admissions.practice';
 
+/** Which HSC group a unit is meant for; NULL means not recorded. */
+export const UNIT_GROUP_TYPES = ['science', 'humanities', 'commerce', 'fine_arts', 'all'] as const;
+
 const optionalText = (max: number) =>
   z.string().trim().max(max).nullable().optional();
 
@@ -15,6 +18,7 @@ const unitFields = {
   description: optionalText(2000),
   is_active: z.boolean().optional(),
   display_order: z.number().int().min(0).max(1_000_000).optional(),
+  group_type: z.enum(UNIT_GROUP_TYPES).nullable().optional(),
 };
 
 const createUnitSchema = z.object(unitFields).strict();
@@ -56,6 +60,7 @@ export interface CreateAdmissionUnitInput {
   description: string | null;
   is_active: boolean;
   display_order: number;
+  group_type?: (typeof UNIT_GROUP_TYPES)[number] | null;
 }
 
 export interface UpdateAdmissionUnitInput {
@@ -65,6 +70,7 @@ export interface UpdateAdmissionUnitInput {
   description?: string | null;
   is_active?: boolean;
   display_order?: number;
+  group_type?: (typeof UNIT_GROUP_TYPES)[number] | null;
 }
 
 const parseOrThrow = <T>(
@@ -117,6 +123,7 @@ export const parseCreateAdmissionUnit = (input: unknown): CreateAdmissionUnitInp
     description: normalizeOptionalText(data.description) ?? null,
     is_active: data.is_active ?? true,
     display_order: data.display_order ?? 0,
+    ...(data.group_type !== undefined ? { group_type: data.group_type } : {}),
   };
 };
 
@@ -133,6 +140,7 @@ export const parseUpdateAdmissionUnit = (input: unknown): UpdateAdmissionUnitInp
   }
   if (data.is_active !== undefined) patch.is_active = data.is_active;
   if (data.display_order !== undefined) patch.display_order = data.display_order;
+  if (data.group_type !== undefined) patch.group_type = data.group_type;
 
   return patch;
 };

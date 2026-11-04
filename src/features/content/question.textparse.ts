@@ -258,7 +258,8 @@ const parseAnswer = (raw: string): number | null => {
 
 const buildQuestion = (
   fields: Bag,
-  defaults: Bag
+  defaults: Bag,
+  fallbackGroup?: string
 ): { question: ParsedQuestion | null; errors: string[]; warnings: string[] } => {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -356,6 +357,11 @@ const buildQuestion = (
     }
   }
 
+  // The importer's default group only fills in when neither a unit nor a group was written.
+  if (!group && !groupRaw && !pick(fields.unit, defaults.unit) && fallbackGroup) {
+    group = fallbackGroup;
+  }
+
   // Exam reference: only built when an institution is given.
   const institution = pick(fields.inst, defaults.institution);
   const exam = pick(fields.exam, defaults.exam);
@@ -414,7 +420,10 @@ const buildQuestion = (
  * `errors` with its question number and start line so only that block needs
  * fixing. `@key: value` lines set defaults for every later question.
  */
-export const parseQuestionText = (input: unknown): TextParseResult => {
+export const parseQuestionText = (
+  input: unknown,
+  options: { defaultGroup?: unknown } = {}
+): TextParseResult => {
   if (typeof input !== 'string' || input.trim() === '') {
     throw new TextParseValidationError('text is required.');
   }
@@ -423,6 +432,18 @@ export const parseQuestionText = (input: unknown): TextParseResult => {
     throw new TextParseValidationError(
       `text is too long; paste at most ${MAX_PARSE_TEXT_LENGTH} characters at a time.`
     );
+  }
+
+  let fallbackGroup: string | undefined;
+  const rawDefaultGroup = options.defaultGroup;
+  if (rawDefaultGroup !== undefined && rawDefaultGroup !== null && rawDefaultGroup !== '') {
+    fallbackGroup =
+      typeof rawDefaultGroup === 'string'
+        ? GROUP_ALIASES[rawDefaultGroup.trim().toLowerCase().replace(/[\s-]+/g, '_')]
+        : undefined;
+    if (!fallbackGroup) {
+      throw new TextParseValidationError(`default_group must be one of ${UNIT_GROUPS.join(', ')}.`);
+    }
   }
 
   const defaults: Bag = {};
@@ -467,7 +488,7 @@ export const parseQuestionText = (input: unknown): TextParseResult => {
       );
     }
 
-    const built = buildQuestion(fields, defaults);
+    const built = buildQuestion(fields, defaults, fallbackGroup);
     const messages = [...problems, ...built.errors];
 
     if (messages.length > 0 || !built.question) {

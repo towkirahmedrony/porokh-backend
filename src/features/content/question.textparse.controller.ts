@@ -14,7 +14,7 @@ export const parseQuestionTextHandler = catchAsync(async (req: Request, res: Res
   const body = (req.body ?? {}) as Record<string, unknown>;
 
   try {
-    const result = parseQuestionText(body.text);
+    const result = parseQuestionText(body.text, { defaultGroup: body.default_group });
     const warnings = [...result.warnings];
     let referenceChecks: ReferenceCheck[] = [];
 

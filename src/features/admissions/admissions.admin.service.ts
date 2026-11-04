@@ -16,7 +16,7 @@ type AdmissionDb = typeof supabase;
 const UNIVERSITY_COLUMNS =
   'id, name_bn, name_en, code, type, is_active, display_order';
 const UNIT_COLUMNS =
-  'id, institution_id, name_bn, name_en, code, description, is_active, display_order, created_at, updated_at';
+  'id, institution_id, name_bn, name_en, code, description, is_active, display_order, group_type, created_at, updated_at';
 const PAGE_SIZE = 1000;
 
 interface DbError {

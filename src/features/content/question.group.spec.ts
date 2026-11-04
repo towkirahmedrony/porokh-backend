@@ -127,3 +127,45 @@ test('Bengali group names are accepted and unknown ones are rejected', () => {
   assert.equal(bad.counts.valid, 0);
   assert.match(bad.errors[0].messages.join(' '), /GROUP "engineering"/);
 });
+
+const runWithDefault = (text: string, defaultGroup?: string) => {
+  const parsed = parseQuestionText(text, { defaultGroup });
+  const checks = applyReferenceChecks(parsed.questions, INSTITUTIONS, UNITS);
+  return { parsed, checks };
+};
+
+test('a default group links each university to its unit for that group', () => {
+  const { parsed, checks } = runWithDefault(
+    `@institution: DU\n${Q}---\n@institution: RU\n${Q}---\n@institution: CU\n${Q}`,
+    'science'
+  );
+
+  assert.deepEqual(checks.map((check) => check.status), ['ok', 'ok', 'ok']);
+  assert.deepEqual(
+    parsed.questions.map((question) => question.exam_references[0].unit_id),
+    ['du-a', 'ru-c', 'cu-a']
+  );
+});
+
+test('a default group never overrides a written unit or group, and ambiguity is reported', () => {
+  const unitWins = runWithDefault(`@institution: RU\n@unit: A\n${Q}`, 'science');
+  assert.equal(unitWins.checks[0].status, 'ok');
+  assert.equal(unitWins.parsed.questions[0].exam_references[0].unit_id, 'ru-a');
+
+  const groupWins = runWithDefault(`@institution: DU\n@group: commerce\n${Q}`, 'science');
+  assert.equal(groupWins.parsed.questions[0].exam_references[0].unit_id, 'du-c');
+
+  const ambiguous = runWithDefault(`@institution: JU\n${Q}`, 'science');
+  assert.equal(ambiguous.checks[0].status, 'unit_ambiguous');
+});
+
+test('no default group changes nothing, and an unknown default group is rejected', () => {
+  const none = runWithDefault(`@institution: DU\n${Q}`);
+  assert.ok(!('unit_id' in none.parsed.questions[0].exam_references[0]));
+  assert.throws(() => parseQuestionText(`@institution: DU\n${Q}`, { defaultGroup: 'engineering' }));
+  assert.equal(
+    parseQuestionText(`@institution: DU\n${Q}`, { defaultGroup: 'বিজ্ঞান' }).questions[0].exam_references[0]
+      .unit_group,
+    'science'
+  );
+});
