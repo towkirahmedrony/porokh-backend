@@ -1,4 +1,5 @@
 import { buildQuestionContentHash, decideQuestionWrite } from './question.policy';
+import { parsePreparationCategory, type PreparationCategory } from './question.preparation';
 
 /**
  * Validation and duplicate planning for the AI Question Importer.
@@ -109,6 +110,9 @@ export interface NormalizedImportQuestion {
   errors: string[];
   warnings: string[];
   content_hash?: string;
+  /** True when the request explicitly asked to set or clear the category. */
+  preparation_present: boolean;
+  preparation_category: PreparationCategory | null;
 }
 
 export interface ImportPlanRow {
@@ -405,8 +409,13 @@ export const normalizeImportQuestion = (
       payload: {},
       errors: ['Question must be an object.'],
       warnings,
+      preparation_present: false,
+      preparation_category: null,
     };
   }
+
+  const preparation = parsePreparationCategory(record.preparation_category);
+  if (preparation.error) errors.push(preparation.error);
 
   const type = asText(record.type).toLowerCase() || 'mcq';
   if (type !== 'mcq') {
@@ -466,7 +475,14 @@ export const normalizeImportQuestion = (
   // from the verified role, exactly as the single-question endpoint does.
   const { payload } = decideQuestionWrite({ role, body: candidate, mode: 'create' });
 
-  return { index, payload, errors, warnings };
+  return {
+    index,
+    payload,
+    errors,
+    warnings,
+    preparation_present: preparation.present,
+    preparation_category: preparation.category,
+  };
 };
 
 export const normalizeImportQuestions = (

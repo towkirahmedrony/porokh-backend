@@ -3,6 +3,11 @@ import { supabase } from '../../config/supabase';
 import { CurriculumNode, QuestionPayload, ComprehensionPayload, NodeType, AuditFilterParams } from './content.types';
 import { buildQuestionContentHash, canEditQuestion, decideQuestionWrite, isPrivilegedContentRole } from './question.policy';
 import { withResolvedExamReferences } from './exam-references';
+import { assertPreparationCategory } from './question.preparation';
+import {
+  attachPreparationCategories,
+  setPreparationCategories,
+} from './question.preparation.service';
 import { buildIdMatchClause, joinOrClauses, normalizeSearchTerm } from '../../lib/utils/search';
 
 const writeContentAudit = async (actorId: string, action: string, targetId: string) => {
@@ -253,6 +258,9 @@ export const saveSmartQuestion = async (
   const bodyWithReferences = await withResolvedExamReferences(
     questionData as unknown as Record<string, unknown>
   );
+  const preparation = assertPreparationCategory(
+    (questionData as unknown as Record<string, unknown>).preparation_category
+  );
 
   const { payload, status } = decideQuestionWrite({
     role: options.role,
@@ -303,7 +311,15 @@ export const saveSmartQuestion = async (
     throw new Error(error.message);
   }
 
-  return { ...data, review_status: status ?? data?.status };
+  if (preparation.present) {
+    await setPreparationCategories([
+      { questionId: String(data.id), category: preparation.category },
+    ]);
+  }
+
+  const [created] = await attachPreparationCategories([data as { id: unknown }]);
+
+  return { ...created, review_status: status ?? data?.status };
 };
 
 /**
@@ -318,6 +334,9 @@ export const updateQuestion = async (
   const bodyWithReferences = await withResolvedExamReferences(
     questionData as unknown as Record<string, unknown>
   );
+  const preparation = assertPreparationCategory(
+    (questionData as unknown as Record<string, unknown>).preparation_category
+  );
 
   const { payload } = decideQuestionWrite({
     role: options.role,
@@ -325,7 +344,7 @@ export const updateQuestion = async (
     mode: 'update',
   });
 
-  if (Object.keys(payload).length === 0) {
+  if (Object.keys(payload).length === 0 && !preparation.present) {
     throw new Error('No editable fields provided for update');
   }
 
@@ -356,11 +375,28 @@ export const updateQuestion = async (
     payload.content_hash = buildQuestionContentHash({ ...(existingData ?? {}), ...payload });
   }
 
-  let updateQuery = supabase.from('questions').update(payload).eq('id', id);
-  if (!privileged && options.userId) updateQuery = updateQuery.eq('created_by', options.userId);
-  const { data, error } = await updateQuery.select().single();
-  if (error) throw new Error(error.message);
-  return data;
+  let data: Record<string, unknown> | null = null;
+
+  if (Object.keys(payload).length > 0) {
+    let updateQuery = supabase.from('questions').update(payload).eq('id', id);
+    if (!privileged && options.userId) updateQuery = updateQuery.eq('created_by', options.userId);
+    const result = await updateQuery.select().single();
+    if (result.error) throw new Error(result.error.message);
+    data = result.data as Record<string, unknown>;
+  } else {
+    const result = await supabase.from('questions').select().eq('id', id).single();
+    if (result.error) throw new Error(result.error.message);
+    data = result.data as Record<string, unknown>;
+  }
+
+  if (!data) throw new Error('Question not found');
+
+  if (preparation.present) {
+    await setPreparationCategories([{ questionId: id, category: preparation.category }]);
+  }
+
+  const [updated] = await attachPreparationCategories([data as { id: unknown }]);
+  return updated;
 };
 
 export const deleteQuestion = async (id: string) => {

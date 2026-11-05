@@ -35,7 +35,8 @@ export const importQuestionText = async (
   body: unknown,
   options: TextImportOptions
 ): Promise<TextImportResult> => {
-  const { text, taxonomy } = readTextImportRequest(body);
+  const request = readTextImportRequest(body);
+  const { text, taxonomy } = request;
   const record = (body ?? {}) as Record<string, unknown>;
 
   const parsed = parseQuestionText(text);
@@ -55,7 +56,10 @@ export const importQuestionText = async (
   }
 
   const result = await questionImportService.importQuestions(
-    applyTextImportTaxonomy(parsed.questions, taxonomy),
+    applyTextImportTaxonomy(parsed.questions, taxonomy, {
+      present: request.preparation_present === true,
+      category: request.preparation_category ?? null,
+    }),
     {
       userId: options.userId,
       role: options.role,

@@ -11,6 +11,10 @@ import {
   type ImportPlanRow,
   type NormalizedImportQuestion,
 } from './question.import';
+import {
+  setPreparationCategories,
+  type PreparationCategoryAssignment,
+} from './question.preparation.service';
 
 /**
  * Import service for the standalone AI Question Importer.
@@ -353,6 +357,31 @@ export const importQuestions = async (
       const { row: singleResult } = await insertOne(item, planRow, options);
       const resultIndex = results.findIndex((result) => result.index === row.index);
       if (resultIndex !== -1) results[resultIndex] = singleResult;
+    }
+  }
+
+  const assignments: PreparationCategoryAssignment[] = [];
+  for (const result of results) {
+    if (result.status !== 'imported' || !result.question_id) continue;
+    const item = itemsByIndex.get(result.index);
+    if (!item?.preparation_present) continue;
+    assignments.push({
+      questionId: result.question_id,
+      category: item.preparation_category,
+    });
+  }
+
+  if (assignments.length > 0) {
+    try {
+      await setPreparationCategories(assignments);
+    } catch (error) {
+      console.error('[question-import] preparation category could not be saved');
+      const failedIds = new Set(assignments.map((entry) => entry.questionId));
+      for (const result of results) {
+        if (result.question_id && failedIds.has(result.question_id)) {
+          result.warnings.push('Question imported, but its preparation category could not be saved.');
+        }
+      }
     }
   }
 

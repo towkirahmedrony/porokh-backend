@@ -5,6 +5,13 @@ import { autoCreateMissingInstitutions } from './institution.service';
 import { buildQuestionContentHash, decideQuestionWrite } from './question.policy';
 import { resolveExamReferenceLists, withResolvedExamReferences } from './exam-references';
 import { buildIdMatchClause, joinOrClauses, normalizeSearchTerm } from '../../lib/utils/search';
+import { assertPreparationCategory } from './question.preparation';
+import {
+  attachPreparationCategories,
+  resolvePreparationQuestionIds,
+  setPreparationCategories,
+  type PreparationCategoryAssignment,
+} from './question.preparation.service';
 
 export interface QuestionBankFilters {
   subject_id?: string;
@@ -17,6 +24,9 @@ export interface QuestionBankFilters {
   institution_type?: string;
   institution_id?: string;
   year?: string;
+  preparation_category?: string;
+  /** Internal id scope resolved from the preparation junction table. */
+  question_ids?: string[];
 }
 
 export interface QuestionBankStats {
@@ -66,6 +76,12 @@ const applyQuestionBankFilters = <T extends any>(
   if (filters.topic_id) nextQuery = nextQuery.eq('topic_id', filters.topic_id);
   if (filters.difficulty) nextQuery = nextQuery.eq('difficulty_level', filters.difficulty);
   if (filters.type) nextQuery = nextQuery.eq('type', filters.type);
+
+  if (filters.question_ids !== undefined) {
+    nextQuery = filters.question_ids.length > 0
+      ? nextQuery.in('id', filters.question_ids)
+      : nextQuery.eq('id', '00000000-0000-0000-0000-000000000000');
+  }
 
   if (options.includeStatus !== false && filters.status) {
     if (filters.status === 'active') {
@@ -164,6 +180,9 @@ export const saveSmartQuestion = async (
   const bodyWithReferences = await withResolvedExamReferences(
     questionData as unknown as Record<string, unknown>
   );
+  const preparation = assertPreparationCategory(
+    (questionData as unknown as Record<string, unknown>).preparation_category
+  );
 
   const { payload } = decideQuestionWrite({
     role: options.role,
@@ -183,7 +202,15 @@ export const saveSmartQuestion = async (
     if (error.code === '23505') throw new Error('Duplicate question found.');
     throw new Error(error.message);
   }
-  return data;
+
+  if (preparation.present) {
+    await setPreparationCategories([
+      { questionId: String(data.id), category: preparation.category },
+    ]);
+  }
+
+  const [created] = await attachPreparationCategories([data as { id: unknown }]);
+  return created;
 };
 
 export const updateQuestion = async (
@@ -193,6 +220,9 @@ export const updateQuestion = async (
 ) => {
   const bodyWithReferences = await withResolvedExamReferences(
     questionData as unknown as Record<string, unknown>
+  );
+  const preparation = assertPreparationCategory(
+    (questionData as unknown as Record<string, unknown>).preparation_category
   );
 
   const { payload } = decideQuestionWrite({
@@ -216,9 +246,26 @@ export const updateQuestion = async (
     });
   }
 
-  const { data, error } = await supabase.from('questions').update(safeData).eq('id', id).select().single();
-  if (error) throw new Error(error.message);
-  return data;
+  let data: Record<string, unknown> | null = null;
+
+  if (Object.keys(safeData).length > 0) {
+    const result = await supabase.from('questions').update(safeData).eq('id', id).select().single();
+    if (result.error) throw new Error(result.error.message);
+    data = result.data as Record<string, unknown>;
+  } else if (preparation.present) {
+    const result = await supabase.from('questions').select().eq('id', id).single();
+    if (result.error) throw new Error(result.error.message);
+    data = result.data as Record<string, unknown>;
+  } else {
+    throw new Error('No editable fields provided for update');
+  }
+
+  if (preparation.present) {
+    await setPreparationCategories([{ questionId: id, category: preparation.category }]);
+  }
+
+  const [updated] = await attachPreparationCategories([data as { id: unknown }]);
+  return updated;
 };
 
 export const deleteQuestion = async (id: string) => {
@@ -241,6 +288,11 @@ export const saveBulkQuestions = async (
   const BATCH_SIZE = 500;
   const allInsertedData: unknown[] = [];
   const flatQuestionsToInsert: TablesInsert<'questions'>[] = [];
+  const preparationByHash: Array<{
+    contentHash: string;
+    present: boolean;
+    category: 'hsc' | 'admission' | 'both' | null;
+  }> = [];
 
   // Resolve every reference list in one pass so a bulk import does not run a
   // pair of lookup queries per question. Validation happens before any
@@ -277,6 +329,7 @@ export const saveBulkQuestions = async (
 
       if (Array.isArray(item.questions)) {
         for (const question of item.questions as Record<string, unknown>[]) {
+          const preparation = assertPreparationCategory(question.preparation_category);
           const { payload } = decideQuestionWrite({
             role: options.role,
             body: question,
@@ -290,6 +343,12 @@ export const saveBulkQuestions = async (
             topic_id: (question.topic_id as string) || (item.topic_id as string),
             comprehension_id: compResult.id,
           };
+          const contentHash = buildQuestionContentHash(scoped);
+          preparationByHash.push({
+            contentHash,
+            present: preparation.present,
+            category: preparation.category,
+          });
 
           flatQuestionsToInsert.push({
             ...(scoped as unknown as TablesInsert<'questions'>),
@@ -298,15 +357,23 @@ export const saveBulkQuestions = async (
             created_by: userId,
             // Same canonicalisation as the single-question path, computed after
             // the comprehension/scope fields are resolved.
-            content_hash: buildQuestionContentHash(scoped),
+            content_hash: contentHash,
           });
         }
       }
     } else {
+      const preparation = assertPreparationCategory(item.preparation_category);
       const { payload } = decideQuestionWrite({
         role: options.role,
         body: item,
         mode: 'create',
+      });
+
+      const contentHash = buildQuestionContentHash(payload);
+      preparationByHash.push({
+        contentHash,
+        present: preparation.present,
+        category: preparation.category,
       });
 
       flatQuestionsToInsert.push({
@@ -314,7 +381,7 @@ export const saveBulkQuestions = async (
         explanation: payload.explanation as unknown as any,
         is_embedding_stale: true,
         created_by: userId,
-        content_hash: buildQuestionContentHash(payload),
+        content_hash: contentHash,
       });
     }
   }
@@ -326,11 +393,41 @@ export const saveBulkQuestions = async (
     if (data) allInsertedData.push(...data);
   }
 
-  return allInsertedData;
+  const idByHash = new Map<string, string>();
+  for (const row of allInsertedData as Array<Record<string, unknown>>) {
+    if (typeof row.id === 'string' && typeof row.content_hash === 'string') {
+      idByHash.set(row.content_hash, row.id);
+    }
+  }
+
+  const assignments: PreparationCategoryAssignment[] = [];
+  for (const entry of preparationByHash) {
+    if (!entry.present) continue;
+    const questionId = idByHash.get(entry.contentHash);
+    if (questionId) assignments.push({ questionId, category: entry.category });
+  }
+  await setPreparationCategories(assignments);
+
+  return attachPreparationCategories(
+    allInsertedData as Array<Record<string, unknown> & { id: unknown }>
+  );
 };
 
 export const getFilteredQuestions = async (filters: QuestionBankFilters, page: number = 1, limit: number = 20): Promise<QuestionBankResult> => {
-  
+  const requestedPreparation = filters.preparation_category;
+  const preparation =
+    requestedPreparation && requestedPreparation !== 'all'
+      ? assertPreparationCategory(requestedPreparation)
+      : { present: false, category: null };
+
+  const preparationIds = preparation.present
+    ? await resolvePreparationQuestionIds(preparation.category)
+    : null;
+
+  if (preparationIds !== null) {
+    filters = { ...filters, question_ids: preparationIds };
+  }
+
   let query = supabase.from('questions').select(QUESTION_BANK_SELECT, { count: 'exact' });
 
   // 🚀 1. Institution Dynamic Resolving & JSONB Filtering
@@ -404,13 +501,14 @@ export const getFilteredQuestions = async (filters: QuestionBankFilters, page: n
   const { data, count, error } = await query.order('created_at', { ascending: false }).range(from, to);
   if (error) throw new Error(error.message);
 
-  const rows = (data || []) as unknown[];
+  const rows = (data || []) as Array<Record<string, unknown> & { id: unknown }>;
   const total = count || 0;
   const totalPages = Math.max(1, Math.ceil(total / safeLimit));
-  const stats = await buildQuestionBankStats(filters, rows as Record<string, unknown>[], total);
+  const stats = await buildQuestionBankStats(filters, rows, total);
+  const withPreparation = await attachPreparationCategories(rows);
 
   return {
-    data: rows,
+    data: withPreparation,
     pagination: { page: safePage, limit: safeLimit, total, totalPages, hasNextPage: safePage < totalPages, hasPreviousPage: safePage > 1 },
     stats,
   };

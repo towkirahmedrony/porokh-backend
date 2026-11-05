@@ -33,6 +33,8 @@ export interface QuestionPayload {
   explanation_media_id?: string | null;
   tags?: string[];
   exam_references?: Record<string, any>[];
+  /** HSC, Admission, or both. Omitted means leave the placement unchanged. */
+  preparation_category?: 'hsc' | 'admission' | 'both' | null;
   status: 'draft' | 'review' | 'approved' | 'rejected' | 'published' | 'deleted' | 'flagged' | 'pending';
   created_by?: string;
   is_embedding_stale?: boolean;

@@ -2384,6 +2384,30 @@ export type Database = {
         }
         Relationships: []
       }
+      preparation_tracks: {
+        Row: {
+          created_at: string
+          display_order: number
+          id: string
+          is_active: boolean
+          name: string
+        }
+        Insert: {
+          created_at?: string
+          display_order?: number
+          id: string
+          is_active?: boolean
+          name: string
+        }
+        Update: {
+          created_at?: string
+          display_order?: number
+          id?: string
+          is_active?: boolean
+          name?: string
+        }
+        Relationships: []
+      }
       profiles: {
         Row: {
           account_status: Database["public"]["Enums"]["user_status"] | null
@@ -2699,6 +2723,39 @@ export type Database = {
             columns: ["question_id"]
             isOneToOne: false
             referencedRelation: "questions"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      question_preparation_tracks: {
+        Row: {
+          created_at: string
+          question_id: string
+          track_id: string
+        }
+        Insert: {
+          created_at?: string
+          question_id: string
+          track_id: string
+        }
+        Update: {
+          created_at?: string
+          question_id?: string
+          track_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "question_preparation_tracks_question_id_fkey"
+            columns: ["question_id"]
+            isOneToOne: false
+            referencedRelation: "questions"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "question_preparation_tracks_track_id_fkey"
+            columns: ["track_id"]
+            isOneToOne: false
+            referencedRelation: "preparation_tracks"
             referencedColumns: ["id"]
           },
         ]

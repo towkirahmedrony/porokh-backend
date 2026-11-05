@@ -1,4 +1,8 @@
 import { MAX_PARSE_TEXT_LENGTH, type ParsedQuestion } from './question.textparse';
+import {
+  parsePreparationCategory,
+  type PreparationCategory,
+} from './question.preparation';
 
 /**
  * Plain-text import contract.
@@ -30,6 +34,8 @@ export interface TextImportTaxonomy {
 export interface TextImportRequest {
   text: string;
   taxonomy: TextImportTaxonomy;
+  preparation_present?: boolean;
+  preparation_category?: PreparationCategory | null;
 }
 
 const asText = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
@@ -61,9 +67,11 @@ export const readTextImportRequest = (body: unknown): TextImportRequest => {
   const subject_id = asText(record.subject_id);
   const chapter_id = asText(record.chapter_id);
   const topic_id = asText(record.topic_id);
+  const preparation = parsePreparationCategory(record.preparation_category);
 
   if (!subject_id) throw new TextImportValidationError('subject_id is required.');
   if (!chapter_id) throw new TextImportValidationError('chapter_id is required.');
+  if (preparation.error) throw new TextImportValidationError(preparation.error);
 
   return {
     text,
@@ -72,6 +80,12 @@ export const readTextImportRequest = (body: unknown): TextImportRequest => {
       chapter_id,
       ...(topic_id ? { topic_id } : {}),
     },
+    ...(preparation.present
+      ? {
+          preparation_present: true,
+          preparation_category: preparation.category,
+        }
+      : {}),
   };
 };
 
@@ -81,11 +95,13 @@ export const readTextImportRequest = (body: unknown): TextImportRequest => {
  */
 export const applyTextImportTaxonomy = (
   questions: ParsedQuestion[],
-  taxonomy: TextImportTaxonomy
+  taxonomy: TextImportTaxonomy,
+  preparation?: { present: boolean; category: PreparationCategory | null }
 ): Array<Record<string, unknown>> =>
   questions.map((question) => ({
     ...question,
     subject_id: taxonomy.subject_id,
     chapter_id: taxonomy.chapter_id,
     ...(taxonomy.topic_id ? { topic_id: taxonomy.topic_id } : {}),
+    ...(preparation?.present ? { preparation_category: preparation.category } : {}),
   }));

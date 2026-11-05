@@ -191,6 +191,7 @@ export const getQuestionsBank = catchAsync(async (req: Request, res: Response) =
     institution_type: req.query.institution_type as string, // 🚀 Added
     institution_id: req.query.institution_id as string,
     year: req.query.year as string,
+    preparation_category: req.query.preparation_category as string,
   };
 
   const result = await questionService.getFilteredQuestions(filters, page, limit);

@@ -101,3 +101,36 @@ test('a question without a topic never carries a topic_id key', () => {
 
   assert.equal('topic_id' in question, false);
 });
+
+test('readTextImportRequest carries an explicitly selected preparation category', () => {
+  const request = readTextImportRequest({
+    text: VALID_TEXT,
+    ...TAXONOMY,
+    preparation_category: 'both',
+  });
+
+  assert.equal(request.preparation_present, true);
+  assert.equal(request.preparation_category, 'both');
+});
+
+test('readTextImportRequest rejects an unknown preparation category', () => {
+  assert.throws(
+    () =>
+      readTextImportRequest({
+        text: VALID_TEXT,
+        ...TAXONOMY,
+        preparation_category: 'varsity',
+      }),
+    /preparation_category/
+  );
+});
+
+test('applyTextImportTaxonomy places every parsed question in the selected bank', () => {
+  const parsed = parseQuestionText(VALID_TEXT);
+  const [question] = applyTextImportTaxonomy(parsed.questions, TAXONOMY, {
+    present: true,
+    category: 'admission',
+  });
+
+  assert.equal(question.preparation_category, 'admission');
+});

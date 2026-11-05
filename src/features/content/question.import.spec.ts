@@ -293,6 +293,42 @@ test('admission imports need a resolved institution and unit, other sources do n
   assert.deepEqual(modelTest.errors, []);
 });
 
+test('normalize records preparation placement without adding it to the question payload', () => {
+  const hsc = normalizeImportQuestion(
+    { ...baseQuestion(), preparation_category: 'hsc' },
+    0
+  );
+
+  assert.equal(hsc.preparation_present, true);
+  assert.equal(hsc.preparation_category, 'hsc');
+  assert.equal('preparation_category' in hsc.payload, false);
+
+  const both = normalizeImportQuestion(
+    { ...baseQuestion(), preparation_category: 'hsc + admission' },
+    0
+  );
+  assert.equal(both.preparation_category, 'both');
+
+  const cleared = normalizeImportQuestion(
+    { ...baseQuestion(), preparation_category: null },
+    0
+  );
+  assert.equal(cleared.preparation_present, true);
+  assert.equal(cleared.preparation_category, null);
+
+  const absent = normalizeImportQuestion(baseQuestion(), 0);
+  assert.equal(absent.preparation_present, false);
+});
+
+test('normalize rejects an unknown preparation category', () => {
+  const result = normalizeImportQuestion(
+    { ...baseQuestion(), preparation_category: 'varsity' },
+    0
+  );
+
+  assert.ok(result.errors.some((error) => error.includes('preparation_category')));
+});
+
 /**
  * The guards are behaviour the suite cannot observe without a live project, so
  * they are asserted against the route table exactly as other route specs do.
