@@ -1,112 +1,531 @@
-import { supabase } from '../../config/supabase';
-import { NOTIFICATION_TYPES, NotificationType } from './notifications.types';
-import { sendCampaignPush } from './notifications.service';
+import { supabaseAdmin } from '../../config/supabaseAdmin';
+import { fetchOneSignalMessageReport } from '../../config/onesignal';
+import {
+  loadDevicePlatforms,
+  normalizePreferences,
+  sendCampaignPush,
+} from './notifications.service';
+import {
+  AudienceRules,
+  NotificationAdminError,
+  NotificationStats,
+  isUuid,
+  matchesAudienceRules,
+  normalizeNotificationType,
+  normalizeStats,
+  parseAudienceRules,
+  parseListFilters,
+  validateCampaignInput,
+} from './notifications.admin.rules';
+import { NotificationType } from './notifications.types';
 
-const LEGACY_TYPE_MAP: Record<string, NotificationType> = {
-  system: 'security',
-  exam_alert: 'exam',
-  promo: 'reward',
-  group_invite: 'social',
-  battle_challenge: 'social',
-  focus_request: 'social',
-  nudge_alert: 'social',
-  global_notice: 'social',
-  campaign: 'social',
+type AnyObject = Record<string, any>;
+
+/** One retry may be attempted this many times before an admin must resend. */
+const MAX_PUSH_ATTEMPTS = 3;
+
+const AUDIENCE_PAGE = 500;
+const AUDIENCE_MAX_PAGES = 100;
+
+// --- Shared helpers ----------------------------------------------------------
+
+const loadNotification = async (id: string): Promise<AnyObject> => {
+  if (!isUuid(id)) throw new NotificationAdminError('Invalid notification id');
+
+  const { data, error } = await supabaseAdmin
+    .from('notifications')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error) throw new NotificationAdminError(error.message, 500);
+  if (!data) throw new NotificationAdminError('Notification not found', 404);
+
+  return data as AnyObject;
 };
 
-const normalizeCampaignType = (value: unknown): NotificationType => {
-  const raw = String(value ?? '').trim();
-  if (NOTIFICATION_TYPES.includes(raw as NotificationType)) return raw as NotificationType;
-  return LEGACY_TYPE_MAP[raw] ?? 'social';
+/**
+ * Audit writes never fail a request: the notification itself already happened,
+ * and losing the trail entry is preferable to reporting a failed send.
+ */
+const recordAudit = async (
+  notificationId: string | null,
+  actorId: string | null,
+  action:
+    | 'created'
+    | 'updated'
+    | 'scheduled'
+    | 'sent'
+    | 'cancelled'
+    | 'retried'
+    | 'delivery_refreshed'
+    | 'deleted',
+  details: Record<string, unknown> = {}
+): Promise<void> => {
+  const { error } = await supabaseAdmin
+    .from('notification_admin_audit')
+    .insert({ notification_id: notificationId, actor_id: actorId, action, details });
+
+  if (error) {
+    console.error('[notify:admin] audit write failed:', error.message);
+  }
 };
 
-const parseCampaignDate = (value: unknown, field: string): Date | null => {
-  if (value === null || value === undefined || value === '') return null;
-  const date = new Date(String(value));
-  if (Number.isNaN(date.getTime())) throw new Error(`Invalid ${field}`);
-  return date;
+/**
+ * Pushes one stored notification and records exactly what the provider
+ * reported. The row is published (status `sent`) even when the push fails: the
+ * in-app record is valid, and the delivery problem is kept in `push_error`
+ * instead of hiding the notification from every inbox.
+ */
+const deliverStoredNotification = async (
+  row: AnyObject,
+  actorId: string,
+  attempt: number,
+  idempotencyKey?: string
+): Promise<AnyObject> => {
+  const result = await sendCampaignPush({
+    id: String(row.id),
+    title_bn: row.title_bn,
+    title_en: row.title_en,
+    body_bn: row.body_bn,
+    body_en: row.body_en,
+    imageUrl: row.image_url,
+    actionLink: row.action_link,
+    targetRules: row.target_rules,
+    type: row.type,
+    priority: row.priority === 'high' || row.priority === 'low' ? row.priority : 'normal',
+    idempotencyKey: idempotencyKey ?? (attempt > 1 ? `campaign:${row.id}:retry:${attempt}` : null),
+  });
+
+  const now = new Date().toISOString();
+  const { data, error } = await supabaseAdmin
+    .from('notifications')
+    .update({
+      status: 'sent',
+      sent_at: row.sent_at ?? now,
+      total_sent: result.accepted,
+      onesignal_message_id: result.messageId,
+      provider_accepted_at: result.accepted > 0 ? now : null,
+      push_error: result.error ? result.error.slice(0, 500) : null,
+      push_attempts: attempt,
+    })
+    .eq('id', row.id)
+    .select()
+    .single();
+
+  if (error) throw new NotificationAdminError(error.message, 500);
+
+  await recordAudit(row.id, actorId, attempt > 1 ? 'retried' : 'sent', {
+    attempt,
+    provider_accepted: result.accepted,
+    provider_error: result.error,
+    onesignal_message_id: result.messageId,
+  });
+
+  return data as AnyObject;
 };
 
-// --- CAMPAIGNS ---
-export const createCampaign = async (campaignData: any, adminId: string) => {
-  const scheduledFor = parseCampaignDate(campaignData.scheduled_at, 'scheduled_at');
-  const expiresAt = parseCampaignDate(campaignData.expires_at, 'expires_at');
-  const shouldSchedule = Boolean(
-    scheduledFor && scheduledFor.getTime() > Date.now()
-  );
+// --- Create / list ------------------------------------------------------------
 
-  const { data, error } = await supabase
+export const createCampaign = async (body: unknown, actorId: string): Promise<AnyObject> => {
+  const { record, mode } = validateCampaignInput(body);
+  const status = mode === 'draft' ? 'draft' : mode === 'schedule' ? 'scheduled' : 'sent';
+  const now = new Date().toISOString();
+
+  const { data, error } = await supabaseAdmin
     .from('notifications')
     .insert({
-      ...campaignData,
-      type: normalizeCampaignType(campaignData.type),
-      meta_data: {
-        ...(campaignData.meta_data ?? {}),
-        legacy_type: campaignData.type ?? null,
-      },
-      created_by: adminId,
-      status: shouldSchedule ? 'scheduled' : 'sent',
-      scheduled_at: scheduledFor?.toISOString() ?? null,
-      expires_at: expiresAt?.toISOString() ?? null,
-      sent_at: shouldSchedule ? null : new Date().toISOString(),
+      ...record,
+      status,
+      created_by: actorId,
+      sent_at: mode === 'send' ? now : null,
       total_sent: 0,
       total_clicks: 0,
+      push_attempts: 0,
     })
     .select()
     .single();
 
-  if (error) throw new Error(error.message);
+  if (error) throw new NotificationAdminError(error.message, 500);
 
-  if (shouldSchedule) return data;
+  await recordAudit(data.id, actorId, mode === 'schedule' ? 'scheduled' : 'created', {
+    mode,
+    type: record.type,
+    priority: record.priority,
+    title: record.title_en,
+  });
 
-  // OneSignal delivery is attempted after the inbox record exists, so a push
-  // failure can never erase the notification.
-  try {
-    const recipients = await sendCampaignPush({
-      id: data.id,
-      title_bn: campaignData.title_bn,
-      title_en: campaignData.title_en,
-      body_bn: campaignData.body_bn,
-      body_en: campaignData.body_en,
-      imageUrl: campaignData.image_url || null,
-      actionLink: campaignData.action_link || '/',
-      targetUserId: campaignData.target_user_id ?? null,
-      targetRules: campaignData.target_rules ?? null,
-      priority: campaignData.priority,
-    });
+  if (mode !== 'send') return data as AnyObject;
 
-    await supabase
-      .from('notifications')
-      .update({ total_sent: recipients })
-      .eq('id', data.id);
-    console.log(`Campaign broadcasted through OneSignal. Recipients: ${recipients}`);
-  } catch (pushError) {
-    console.error('Error broadcasting push notification:', pushError);
+  return deliverStoredNotification(data as AnyObject, actorId, 1);
+};
+
+export const listCampaigns = async (query: unknown) => {
+  const filters = parseListFilters(query);
+  const offset = (filters.page - 1) * filters.limit;
+
+  let request = supabaseAdmin
+    .from('notifications')
+    .select(
+      'id, title_en, title_bn, body_en, body_bn, image_url, action_link, type, channel, priority, status, target_user_id, target_rules, meta_data, total_sent, total_clicks, delivered_count, failed_count, push_error, push_attempts, onesignal_message_id, delivery_checked_at, scheduled_at, sent_at, expires_at, created_at, created_by, event_code',
+      { count: 'exact' }
+    )
+    .or('created_by.not.is.null,target_user_id.is.null')
+    .gte('created_at', filters.from)
+    .lt('created_at', filters.to)
+    .order('created_at', { ascending: false });
+
+  if (filters.status) request = request.eq('status', filters.status);
+  if (filters.type) request = request.eq('type', filters.type);
+
+  if (filters.search) {
+    const term = `%${filters.search}%`;
+    request = request.or(
+      `title_en.ilike.${term},title_bn.ilike.${term},body_en.ilike.${term},body_bn.ilike.${term}`
+    );
   }
 
-  return data;
+  const { data, error, count } = await request.range(offset, offset + filters.limit - 1);
+
+  if (error) throw new NotificationAdminError(error.message, 500);
+
+  return {
+    items: data ?? [],
+    page: filters.page,
+    limit: filters.limit,
+    total: count ?? 0,
+  };
 };
 
-export const getCampaigns = async () => {
-  const { data, error } = await supabase.from('notifications').select('*').order('created_at', { ascending: false });
-  if (error) throw new Error(error.message); return data;
+export const getCampaignDetail = async (id: string): Promise<AnyObject> => {
+  const notification = await loadNotification(id);
+
+  const { data: audit, error: auditError } = await supabaseAdmin
+    .from('notification_admin_audit')
+    .select('id, action, actor_id, details, created_at')
+    .eq('notification_id', id)
+    .order('created_at', { ascending: false })
+    .limit(50);
+
+  if (auditError) {
+    console.error('[notify:admin] audit lookup failed:', auditError.message);
+  }
+
+  const actorIds = Array.from(
+    new Set((audit ?? []).map((row) => row.actor_id).filter(Boolean))
+  ) as string[];
+
+  const actorNames = new Map<string, string>();
+
+  if (actorIds.length > 0) {
+    const { data: profiles } = await supabaseAdmin
+      .from('profiles')
+      .select('id, full_name')
+      .in('id', actorIds);
+
+    (profiles ?? []).forEach((profile) => {
+      actorNames.set(String(profile.id), String(profile.full_name ?? ''));
+    });
+  }
+
+  return {
+    ...notification,
+    audit_trail: (audit ?? []).map((row) => ({
+      ...row,
+      actor_name: row.actor_id ? actorNames.get(String(row.actor_id)) ?? null : null,
+    })),
+  };
 };
 
-export const cancelCampaign = async (id: string) => {
-  const { data, error } = await supabase.from('notifications').update({ status: 'cancelled' }).eq('id', id).select().single();
-  if (error) throw new Error(error.message); return data;
+// --- Update / lifecycle -------------------------------------------------------
+
+export const updateCampaign = async (
+  id: string,
+  body: unknown,
+  actorId: string
+): Promise<AnyObject> => {
+  const current = await loadNotification(id);
+
+  if (!['draft', 'scheduled'].includes(String(current.status))) {
+    throw new NotificationAdminError(
+      'Only drafts and scheduled notifications can be edited',
+      409
+    );
+  }
+
+  const patch = body && typeof body === 'object' ? (body as AnyObject) : {};
+  const { record, mode } = validateCampaignInput({
+    title_en: current.title_en,
+    title_bn: current.title_bn,
+    body_en: current.body_en,
+    body_bn: current.body_bn,
+    image_url: current.image_url,
+    action_link: current.action_link,
+    type: current.type,
+    priority: current.priority,
+    target_rules: current.target_rules,
+    meta_data: current.meta_data,
+    scheduled_at: current.scheduled_at,
+    expires_at: current.expires_at,
+    ...patch,
+  });
+
+  if (current.status === 'scheduled' && mode !== 'schedule') {
+    throw new NotificationAdminError(
+      'A scheduled notification needs a future scheduled_at',
+      400
+    );
+  }
+
+  const status = mode === 'draft' ? 'draft' : mode === 'schedule' ? 'scheduled' : 'sent';
+
+  const { data, error } = await supabaseAdmin
+    .from('notifications')
+    .update({
+      ...record,
+      status,
+      sent_at: mode === 'send' ? current.sent_at ?? new Date().toISOString() : null,
+    })
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) throw new NotificationAdminError(error.message, 500);
+
+  await recordAudit(id, actorId, status === 'scheduled' ? 'scheduled' : 'updated', {
+    mode,
+    title: record.title_en,
+  });
+
+  if (mode !== 'send') return data as AnyObject;
+
+  return deliverStoredNotification(data as AnyObject, actorId, Number(current.push_attempts ?? 0) + 1);
 };
 
-export const updateCampaign = async (id: string, payload: any) => {
-  const nextPayload =
-    payload && Object.prototype.hasOwnProperty.call(payload, 'type')
-      ? { ...payload, type: normalizeCampaignType(payload.type) }
-      : payload;
-  const { data, error } = await supabase.from('notifications').update(nextPayload).eq('id', id).select().single();
-  if (error) throw new Error(error.message); return data;
+export const cancelCampaign = async (id: string, actorId: string): Promise<AnyObject> => {
+  const current = await loadNotification(id);
+
+  if (!['draft', 'scheduled'].includes(String(current.status))) {
+    throw new NotificationAdminError(
+      'Only drafts and scheduled notifications can be cancelled',
+      409
+    );
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from('notifications')
+    .update({ status: 'cancelled' })
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) throw new NotificationAdminError(error.message, 500);
+
+  await recordAudit(id, actorId, 'cancelled', { previous_status: current.status });
+
+  return data as AnyObject;
 };
 
-export const deleteCampaign = async (id: string) => {
-  const { data, error } = await supabase.from('notifications').delete().eq('id', id).select().single();
-  if (error) throw new Error(error.message); return data;
+export const sendCampaign = async (id: string, actorId: string): Promise<AnyObject> => {
+  const current = await loadNotification(id);
+
+  if (!['draft', 'scheduled'].includes(String(current.status))) {
+    throw new NotificationAdminError('This notification has already been sent', 409);
+  }
+
+  return deliverStoredNotification(
+    current,
+    actorId,
+    Number(current.push_attempts ?? 0) + 1
+  );
+};
+
+/**
+ * A retry re-sends the same stored notification with a fresh idempotency key,
+ * so OneSignal does not drop it as a duplicate of the first attempt.
+ */
+export const retryCampaign = async (id: string, actorId: string): Promise<AnyObject> => {
+  const current = await loadNotification(id);
+  const attempts = Number(current.push_attempts ?? 0);
+
+  if (current.status !== 'sent') {
+    throw new NotificationAdminError('Only a published notification can be retried', 409);
+  }
+  if (attempts >= MAX_PUSH_ATTEMPTS) {
+    throw new NotificationAdminError(
+      `Retry limit reached (${MAX_PUSH_ATTEMPTS} attempts)`,
+      409
+    );
+  }
+  if (!current.push_error && !Number(current.failed_count ?? 0)) {
+    throw new NotificationAdminError(
+      'There is no failed delivery to retry for this notification',
+      409
+    );
+  }
+
+  return deliverStoredNotification(current, actorId, attempts + 1);
+};
+
+/**
+ * Refreshes the provider's delivery report. A notification without a stored
+ * OneSignal message id has no report yet, which is reported as a conflict
+ * rather than a fabricated 0.
+ */
+export const refreshDeliveryStats = async (
+  id: string,
+  actorId: string
+): Promise<AnyObject> => {
+  const current = await loadNotification(id);
+  const messageId = String(current.onesignal_message_id ?? '').trim();
+
+  if (!messageId) {
+    throw new NotificationAdminError(
+      'No provider message id yet; send the notification first',
+      409
+    );
+  }
+
+  const report = await fetchOneSignalMessageReport(messageId);
+  const now = new Date().toISOString();
+
+  const { data, error } = await supabaseAdmin
+    .from('notifications')
+    .update({
+      delivered_count: report.delivered,
+      failed_count: report.failed,
+      delivery_checked_at: now,
+    })
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) throw new NotificationAdminError(error.message, 500);
+
+  await recordAudit(id, actorId, 'delivery_refreshed', {
+    delivered: report.delivered,
+    failed: report.failed,
+    onesignal_message_id: messageId,
+  });
+
+  return data as AnyObject;
+};
+
+/**
+ * Only an unusable row may be deleted: a published notification is delivery
+ * history, and deleting it would remove the audit trail it points at.
+ */
+export const deleteCampaign = async (id: string, actorId: string): Promise<{ id: string }> => {
+  const current = await loadNotification(id);
+
+  if (!['draft', 'cancelled', 'failed'].includes(String(current.status))) {
+    throw new NotificationAdminError(
+      'Published notifications cannot be deleted; cancel or retry them instead',
+      409
+    );
+  }
+
+  const { error } = await supabaseAdmin.from('notifications').delete().eq('id', id);
+  if (error) throw new NotificationAdminError(error.message, 500);
+
+  await recordAudit(null, actorId, 'deleted', {
+    notification_id: id,
+    title: current.title_en,
+    status: current.status,
+  });
+
+  return { id };
+};
+
+// --- Audience -----------------------------------------------------------------
+
+export interface AudiencePreview {
+  eligibleAccounts: number;
+  pushReachable: number;
+  inAppVisible: number;
+  excludedByPreference: number;
+  devices: { total: number; android: number; web: number };
+}
+
+/**
+ * Counts the audience for the rules the admin is editing, using the same
+ * matcher as the send path. Only aggregate counts leave the service: no user
+ * id, name or contact detail is returned.
+ */
+export const previewAudience = async (body: unknown): Promise<AudiencePreview> => {
+  const source = body && typeof body === 'object' ? (body as AnyObject) : {};
+  const rules = parseAudienceRules(source.target_rules ?? {});
+  const type = normalizeNotificationType(source.type) as NotificationType;
+
+  const devicePlatforms = await loadDevicePlatforms();
+  const devices = { total: 0, android: 0, web: 0 };
+  devicePlatforms.forEach((platforms) => {
+    devices.total += platforms.size;
+    if (platforms.has('android')) devices.android += 1;
+    if (platforms.has('web')) devices.web += 1;
+  });
+
+  const candidates = Array.from(devicePlatforms.keys());
+  let eligibleAccounts = 0;
+  let pushReachable = 0;
+  let inAppVisible = 0;
+  let excludedByPreference = 0;
+
+  for (let page = 0; page * AUDIENCE_PAGE < candidates.length; page += 1) {
+    if (page >= AUDIENCE_MAX_PAGES) break;
+    const userChunk = candidates.slice(page * AUDIENCE_PAGE, (page + 1) * AUDIENCE_PAGE);
+
+    const { data, error } = await supabaseAdmin
+      .from('profiles')
+      .select(
+        'id, settings, class_level, education_board, subscription_status, last_active_at, account_status'
+      )
+      .in('id', userChunk);
+
+    if (error) {
+      throw new NotificationAdminError(error.message, 503);
+    }
+
+    (data ?? []).forEach((profile: AnyObject) => {
+      if (String(profile.account_status ?? 'active') !== 'active') return;
+
+      const platforms = Array.from(devicePlatforms.get(String(profile.id)) ?? []);
+      if (!matchesAudienceRules(rules, profile, platforms)) return;
+
+      eligibleAccounts += 1;
+
+      const preferences = normalizePreferences(
+        (profile.settings as AnyObject | null)?.notification_preferences
+      );
+      const typeEnabled = preferences.types[type] !== false;
+
+      if (preferences.push && typeEnabled) pushReachable += 1;
+      if (preferences.in_app && typeEnabled) inAppVisible += 1;
+      if (!preferences.push && !preferences.in_app) excludedByPreference += 1;
+    });
+  }
+
+  return { eligibleAccounts, pushReachable, inAppVisible, excludedByPreference, devices };
+};
+
+// --- Analytics ----------------------------------------------------------------
+
+export const getStats = async (
+  query: unknown
+): Promise<{ stats: NotificationStats; from: string; to: string }> => {
+  const filters = parseListFilters(query);
+
+  const { data, error } = await supabaseAdmin.rpc('notification_admin_stats', {
+    p_from: filters.from,
+    p_to: filters.to,
+  });
+
+  if (error) {
+    throw new NotificationAdminError(
+      `Notification analytics unavailable: ${error.message}`,
+      503
+    );
+  }
+
+  return { stats: normalizeStats(data), from: filters.from, to: filters.to };
 };

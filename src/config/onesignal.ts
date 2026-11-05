@@ -47,6 +47,59 @@ const describeError = (error: unknown): string => {
 };
 
 /**
+ * Reads the provider's own count for a sent message.
+ *
+ * Acceptance (the create-message response) is not delivery, so the dashboard
+ * only shows a delivery rate after this report has been fetched at least once.
+ */
+export type OneSignalMessageReport = {
+  /** Devices the provider reports as delivered, or null when it reports none. */
+  delivered: number | null;
+  failed: number | null;
+};
+
+export const fetchOneSignalMessageReport = async (
+  messageId: string
+): Promise<OneSignalMessageReport> => {
+  const id = String(messageId ?? '').trim();
+  if (!id) throw new Error('OneSignal message id is required');
+
+  const appId = getOneSignalAppId();
+  const restKey = readEnv('ONESIGNAL_REST_API_KEY');
+
+  if (!appId || !restKey) {
+    throw new Error(
+      'OneSignal is not configured (ONESIGNAL_APP_ID / ONESIGNAL_REST_API_KEY)'
+    );
+  }
+
+  try {
+    const response = await axios.get(
+      `${ONESIGNAL_MESSAGE_URL}/${encodeURIComponent(id)}`,
+      {
+        params: { app_id: appId },
+        headers: { Authorization: `Key ${restKey}` },
+        timeout: REQUEST_TIMEOUT_MS,
+      }
+    );
+
+    const body = response.data as
+      | { successful?: unknown; failed?: unknown; errored?: unknown }
+      | null;
+
+    const delivered =
+      body?.successful === undefined ? null : Number(body.successful) || 0;
+    const failed = (Number(body?.failed) || 0) + (Number(body?.errored) || 0);
+
+    return { delivered, failed };
+  } catch (error) {
+    throw new Error(
+      `OneSignal report failed: ${describeError(error)}`.slice(0, 500)
+    );
+  }
+};
+
+/**
  * Sends one create-message request. Never logs or rethrows the Authorization
  * header, so a failure cannot leak the REST key into Render's log stream.
  */

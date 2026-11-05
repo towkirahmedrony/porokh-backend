@@ -1,5 +1,4 @@
 import cron from 'node-cron';
-import { supabase } from '../config/supabase';
 import { supabaseAdmin } from '../config/supabaseAdmin';
 import {
   notify,
@@ -193,13 +192,15 @@ export const initNotificationCron = () => {
   cron.schedule('* * * * *', async () => {
     try {
       const now = new Date();
-      const { data: campaigns, error } = await supabase
+      const { data: campaigns, error } = await supabaseAdmin
         .from('notifications')
         .select(
-          'id, title_bn, title_en, body_bn, body_en, image_url, action_link, target_user_id, target_rules, expires_at, priority'
+          'id, title_bn, title_en, body_bn, body_en, image_url, action_link, target_rules, expires_at, priority, type, push_attempts'
         )
         .eq('status', 'scheduled')
-        .lte('scheduled_at', now.toISOString());
+        .lte('scheduled_at', now.toISOString())
+        .order('scheduled_at', { ascending: true })
+        .limit(50);
       if (error) throw error;
       if (!campaigns?.length) return;
 
@@ -209,38 +210,55 @@ export const initNotificationCron = () => {
           ? new Date(campaign.expires_at)
           : null;
 
+        // An expired notification is dropped instead of pushed late.
         if (expiresAt && expiresAt.getTime() <= now.getTime()) {
-          await supabase
+          await supabaseAdmin
             .from('notifications')
             .update({ status: 'cancelled' })
-            .eq('id', campaign.id);
+            .eq('id', campaign.id)
+            .eq('status', 'scheduled');
           continue;
         }
 
-        let successCount = 0;
-        try {
-          successCount = await sendCampaignPush({
-            id: campaign.id,
-            title_bn: campaign.title_bn,
-            title_en: campaign.title_en,
-            body_bn: campaign.body_bn,
-            body_en: campaign.body_en,
-            imageUrl: campaign.image_url || null,
-            actionLink: campaign.action_link || '/',
-            targetUserId: campaign.target_user_id,
-            targetRules: campaign.target_rules,
-            priority: campaign.priority === 'high' ? 'high' : 'normal',
-          });
-        } catch (pushError) {
-          // Mark once after the attempt to avoid duplicate sends on the next cron tick.
-          console.error(`Failed to deliver scheduled campaign ${campaign.id}:`, pushError);
-        }
+        const attempt = Number(campaign.push_attempts ?? 0) + 1;
+        // Any tick that repeats this delivery is stopped by the provider-side
+        // idempotency key, so an overlapping or restarted worker cannot double
+        // send a scheduled notification.
+        const result = await sendCampaignPush({
+          id: campaign.id,
+          title_bn: campaign.title_bn,
+          title_en: campaign.title_en,
+          body_bn: campaign.body_bn,
+          body_en: campaign.body_en,
+          imageUrl: campaign.image_url || null,
+          actionLink: campaign.action_link || '/',
+          targetRules: campaign.target_rules,
+          type: campaign.type,
+          priority: campaign.priority === 'high' ? 'high' : 'normal',
+        });
 
-        const { error: updateError } = await supabase.from('notifications')
-          .update({ status: 'sent', sent_at: new Date().toISOString(), total_sent: successCount })
-          .eq('id', campaign.id);
-        if (updateError) console.error(`Failed to mark campaign ${campaign.id} as sent:`, updateError);
-        else console.log(`✅ Campaign "${campaign.title_en || campaign.title_bn}" sent to ${successCount} devices.`);
+        const deliveredAt = new Date().toISOString();
+        const { error: updateError } = await supabaseAdmin
+          .from('notifications')
+          .update({
+            status: 'sent',
+            sent_at: deliveredAt,
+            total_sent: result.accepted,
+            onesignal_message_id: result.messageId,
+            provider_accepted_at: result.accepted > 0 ? deliveredAt : null,
+            push_error: result.error ? result.error.slice(0, 500) : null,
+            push_attempts: attempt,
+          })
+          .eq('id', campaign.id)
+          .eq('status', 'scheduled');
+
+        if (updateError) {
+          console.error(`Failed to mark campaign ${campaign.id} as sent:`, updateError);
+        } else {
+          console.log(
+            `✅ Campaign "${campaign.title_en || campaign.title_bn}" accepted for ${result.accepted} devices.`
+          );
+        }
       }
     } catch (error) {
       console.error('🔥 Error in Notification Cron Job:', error);

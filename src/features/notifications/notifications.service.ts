@@ -19,6 +19,7 @@ import {
   normalizeExternalIds,
 } from './notifications.push';
 import { sendOneSignalMessage } from '../../config/onesignal';
+import { AudienceRules, matchesAudienceRules } from './notifications.admin.rules';
 
 type AnyObject = Record<string, any>;
 
@@ -190,7 +191,7 @@ export const updateNotificationPreferences = async (
 
 // --- Push --------------------------------------------------------------------
 
-type PushOutcome = { sent: number; error: string | null };
+type PushOutcome = { sent: number; messageId: string | null; error: string | null };
 
 const getPushCapReached = async (userId: string): Promise<boolean> => {
   const { count, error } = await getAdmin()
@@ -220,9 +221,10 @@ export const sendPushToUsers = async (
   const externalIds = normalizeExternalIds(
     Array.isArray(userIds) ? userIds : [userIds]
   );
-  if (externalIds.length === 0) return { sent: 0, error: null };
+  if (externalIds.length === 0) return { sent: 0, messageId: null, error: null };
 
   let sent = 0;
+  let messageId: string | null = null;
   let lastError: string | null = null;
 
   for (const [index, aliasChunk] of chunkExternalIds(externalIds).entries()) {
@@ -238,13 +240,14 @@ export const sendPushToUsers = async (
       );
 
       sent += result.recipients;
+      messageId = messageId ?? result.id;
     } catch (error) {
       lastError = error instanceof Error ? error.message : 'push failed';
       console.error('[notify] OneSignal push failed:', lastError);
     }
   }
 
-  return { sent, error: lastError };
+  return { sent, messageId, error: lastError };
 };
 
 const deliverPushForUser = async (
@@ -276,109 +279,81 @@ const deliverPushForUser = async (
 
 // --- Campaign broadcasts -----------------------------------------------------
 
-const PUSH_AUDIENCE_PAGE = 1000;
-const PUSH_AUDIENCE_MAX_PAGES = 100;
-
-const isPremiumProfile = (profile: AnyObject): boolean =>
-  profile.subscription_status === 'premium' ||
-  profile.subscription_status === 'active';
-
 /**
- * Campaign targeting is applied to the profile, not to the device: a user with
- * two Android phones must match or miss the campaign as one person.
+ * Campaign targeting is applied to the profile, not to a device: a user with
+ * two phones must match or miss the campaign as one person. The matcher lives in
+ * notifications.admin.rules so the dashboard preview and the send path cannot
+ * drift apart.
  */
 export const matchesCampaignTargetRules = (
   rules: unknown,
-  profile: AnyObject
-): boolean => {
-  if (!rules || typeof rules !== 'object' || Array.isArray(rules)) return true;
+  profile: AnyObject,
+  platforms: string[] = []
+): boolean =>
+  matchesAudienceRules(
+    (rules && typeof rules === 'object' && !Array.isArray(rules)
+      ? rules
+      : null) as AudienceRules | null,
+    profile,
+    platforms
+  );
 
-  const target = rules as AnyObject;
-  const specificUserId = String(target.specific_user_id ?? '').trim();
-  if (specificUserId && specificUserId !== String(profile.id)) return false;
-
-  const subscription = String(target.subscription_status ?? '').trim();
-  if (subscription === 'premium' && !isPremiumProfile(profile)) return false;
-  if (subscription === 'free' && isPremiumProfile(profile)) return false;
-
-  const classLevels = Array.isArray(target.class_level)
-    ? target.class_level.map((value) => String(value))
-    : [];
-  if (
-    classLevels.length > 0 &&
-    !classLevels.includes('all') &&
-    !classLevels.includes(String(profile.class_level ?? ''))
-  ) {
-    return false;
-  }
-
-  const boards = Array.isArray(target.education_board)
-    ? target.education_board.map((value) => String(value))
-    : [];
-  if (
-    boards.length > 0 &&
-    !boards.includes('all') &&
-    !boards.includes(String(profile.education_board ?? ''))
-  ) {
-    return false;
-  }
-
-  const inactiveDays = Number(target.last_active_days_ago);
-  if (Number.isFinite(inactiveDays) && inactiveDays > 0) {
-    const lastActive = new Date(String(profile.last_active_at ?? '')).getTime();
-    if (
-      Number.isFinite(lastActive) &&
-      lastActive > Date.now() - inactiveDays * 24 * 60 * 60 * 1000
-    ) {
-      return false;
-    }
-  }
-
-  return true;
-};
+const AUDIENCE_PAGE = 1000;
+const AUDIENCE_MAX_PAGES = 100;
 
 /**
- * Android installations recorded in `user_devices`.
+ * Registered platforms per account.
  *
- * After the FCM migration the row no longer stores a token: it records that this
- * account opened the app on an Android device, which is the audience a campaign
- * may target. Actual delivery still depends on the device being subscribed in
- * OneSignal.
+ * `user_devices` records which installations this account opened the app on, so
+ * it is the audience a campaign may target. It stores no push token: delivery
+ * is addressed by the OneSignal External ID (the Supabase user id).
  */
-const loadPushAudience = async (
-  targetUserId?: string | null
-): Promise<string[]> => {
-  const userIds: string[] = [];
+export const loadDevicePlatforms = async (): Promise<Map<string, Set<string>>> => {
+  const byUser = new Map<string, Set<string>>();
 
-  for (let page = 0; page < PUSH_AUDIENCE_MAX_PAGES; page += 1) {
-    const from = page * PUSH_AUDIENCE_PAGE;
-    let query = getAdmin()
+  for (let page = 0; page < AUDIENCE_MAX_PAGES; page += 1) {
+    const from = page * AUDIENCE_PAGE;
+    const { data, error } = await getAdmin()
       .from('user_devices')
-      .select('user_id')
-      .eq('platform', 'android')
+      .select('user_id, platform')
       .order('user_id', { ascending: true })
-      .range(from, from + PUSH_AUDIENCE_PAGE - 1);
+      .range(from, from + AUDIENCE_PAGE - 1);
 
-    if (targetUserId) query = query.eq('user_id', targetUserId);
-
-    const { data, error } = await query;
     if (error) {
-      console.error('[notify] push audience lookup failed:', error.message);
+      console.error('[notify] device audience lookup failed:', error.message);
       break;
     }
 
     const rows = (data ?? []) as AnyObject[];
-    rows.forEach((row) => userIds.push(String(row.user_id ?? '')));
-    if (rows.length < PUSH_AUDIENCE_PAGE) break;
+    rows.forEach((row) => {
+      const userId = String(row.user_id ?? '');
+      if (!userId) return;
+      const platforms = byUser.get(userId) ?? new Set<string>();
+      platforms.add(String(row.platform ?? 'web'));
+      byUser.set(userId, platforms);
+    });
+
+    if (rows.length < AUDIENCE_PAGE) break;
   }
 
-  return normalizeExternalIds(userIds);
+  return byUser;
 };
 
 /**
- * Delivers one bilingual campaign push to the audience and returns the number of
- * devices OneSignal accepted it for. The notification row is written by the
- * caller before this runs, so a delivery failure leaves the inbox entry intact.
+ * Result of one campaign delivery attempt. `accepted` counts devices OneSignal
+ * accepted the message for, which is provider acceptance rather than proof of
+ * delivery; `delivered` is only known after a delivery report refresh.
+ */
+export type CampaignPushResult = {
+  accepted: number;
+  messageId: string | null;
+  error: string | null;
+};
+
+/**
+ * Delivers one bilingual campaign push and reports what the provider accepted.
+ * The notification row is written by the caller first, so a provider failure
+ * leaves the in-app record intact and the failure visible in `push_error`.
  */
 export const sendCampaignPush = async (campaign: {
   id: string;
@@ -388,21 +363,30 @@ export const sendCampaignPush = async (campaign: {
   body_en?: string | null;
   imageUrl?: string | null;
   actionLink?: string | null;
-  targetUserId?: string | null;
   targetRules?: unknown;
+  type?: string | null;
   priority?: NotificationPriority;
-}): Promise<number> => {
+  /** Retries pass a fresh key; the first attempt reuses the notification id. */
+  idempotencyKey?: string | null;
+}): Promise<CampaignPushResult> => {
   try {
-    const audience = await loadPushAudience(campaign.targetUserId);
-    if (audience.length === 0) return 0;
+    const devicePlatforms = await loadDevicePlatforms();
+    if (devicePlatforms.size === 0) {
+      return { accepted: 0, messageId: null, error: 'no_registered_devices' };
+    }
 
+    const audience = Array.from(devicePlatforms.keys());
+    const rules = (campaign.targetRules && typeof campaign.targetRules === 'object'
+      ? campaign.targetRules
+      : null) as AudienceRules | null;
+    const type = String(campaign.type ?? 'social');
     const allowed: string[] = [];
 
     for (const userChunk of chunk(audience, INSERT_CHUNK_SIZE)) {
       const { data, error } = await getAdmin()
         .from('profiles')
         .select(
-          'id, settings, class_level, education_board, subscription_status, last_active_at'
+          'id, settings, class_level, education_board, subscription_status, last_active_at, account_status'
         )
         .in('id', userChunk);
 
@@ -412,19 +396,29 @@ export const sendCampaignPush = async (campaign: {
       }
 
       (data ?? []).forEach((profile: AnyObject) => {
+        if (String(profile.account_status ?? 'active') !== 'active') return;
+
         const preferences = normalizePreferences(
           (profile.settings as AnyObject | null)?.notification_preferences
         );
+        if (!preferences.push) return;
+        if (preferences.types[type as NotificationType] === false) return;
+
         if (
-          preferences.push &&
-          matchesCampaignTargetRules(campaign.targetRules, profile)
+          matchesAudienceRules(
+            rules,
+            profile,
+            Array.from(devicePlatforms.get(String(profile.id)) ?? [])
+          )
         ) {
           allowed.push(String(profile.id));
         }
       });
     }
 
-    if (allowed.length === 0) return 0;
+    if (allowed.length === 0) {
+      return { accepted: 0, messageId: null, error: 'no_matching_subscribers' };
+    }
 
     const outcome = await sendPushToUsers(
       allowed,
@@ -439,24 +433,26 @@ export const sendCampaignPush = async (campaign: {
         },
         imageUrl: campaign.imageUrl ?? null,
         actionLink: campaign.actionLink ?? null,
-        type: 'campaign',
+        type,
         notificationId: campaign.id,
         priority: campaign.priority,
       },
-      { idempotencyKey: `campaign:${campaign.id}` }
+      { idempotencyKey: campaign.idempotencyKey ?? `campaign:${campaign.id}` }
     );
 
     if (outcome.error) {
       console.error('[notify] campaign push failed:', outcome.error);
     }
 
-    return outcome.sent;
+    return {
+      accepted: outcome.sent,
+      messageId: outcome.messageId,
+      error: outcome.error,
+    };
   } catch (error) {
-    console.error(
-      '[notify] campaign broadcast failed:',
-      error instanceof Error ? error.message : 'unknown error'
-    );
-    return 0;
+    const message = error instanceof Error ? error.message : 'campaign push failed';
+    console.error('[notify] campaign broadcast failed:', message);
+    return { accepted: 0, messageId: null, error: message };
   }
 };
 

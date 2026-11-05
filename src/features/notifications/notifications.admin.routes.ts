@@ -6,13 +6,28 @@ import { requirePermission } from '../../middlewares/requirePermission';
 import { PERMISSIONS } from '../../middlewares/authorization';
 
 const router = Router();
+
+// Every notification admin surface uses the existing Porokh RBAC: an admin
+// (or super admin) role plus the staff-management permission. No parallel
+// authorization system is introduced.
 router.use(requireAuth, rbacGuard(['admin']), requirePermission(PERMISSIONS.USER_MANAGE));
 
-// Campaigns
+// Dashboard
+router.get('/stats', NotificationAdminController.getStats);
+router.post('/audience/preview', NotificationAdminController.previewAudience);
+
+// Notifications (called campaigns by the existing admin panel)
+router.get('/campaigns', NotificationAdminController.listCampaigns);
 router.post('/campaigns', NotificationAdminController.createCampaign);
-router.get('/campaigns', NotificationAdminController.getCampaigns);
-router.put('/campaigns/:id', NotificationAdminController.updateCampaign); // NEW: Edit
+router.get('/campaigns/:id', NotificationAdminController.getCampaign);
+router.put('/campaigns/:id', NotificationAdminController.updateCampaign);
 router.patch('/campaigns/:id/cancel', NotificationAdminController.cancelCampaign);
-router.delete('/campaigns/:id', NotificationAdminController.deleteCampaign); // NEW: Delete
+router.post('/campaigns/:id/send', NotificationAdminController.sendCampaign);
+router.post('/campaigns/:id/retry', NotificationAdminController.retryCampaign);
+router.post(
+  '/campaigns/:id/refresh-stats',
+  NotificationAdminController.refreshDeliveryStats
+);
+router.delete('/campaigns/:id', NotificationAdminController.deleteCampaign);
 
 export default router;
