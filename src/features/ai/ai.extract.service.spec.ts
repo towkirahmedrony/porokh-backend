@@ -128,6 +128,9 @@ test('extraction sends every source to the model and returns plain text', async 
     assert.ok(systemText.includes('Structured Plain Text'));
     assert.ok(systemText.includes('Q_BN'));
     assert.ok(systemText.includes('Never invent'));
+    assert.ok(systemText.includes('@session'));
+    assert.ok(systemText.includes('Do not use @group'));
+    assert.ok(systemText.includes('For model_test, guidebook and unknown sources, institution and unit are optional'));
 
     const parts = body.contents[0].parts as Array<Record<string, unknown>>;
     const textParts = parts
