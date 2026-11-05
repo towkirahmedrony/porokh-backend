@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../../config/supabaseAdmin';
 import { fetchOneSignalMessageReport } from '../../config/onesignal';
+import { randomUUID } from 'node:crypto';
 import {
   loadDevicePlatforms,
   normalizePreferences,
@@ -83,6 +84,8 @@ const deliverStoredNotification = async (
   attempt: number,
   idempotencyKey?: string
 ): Promise<AnyObject> => {
+  const providerIdempotencyKey =
+    idempotencyKey ?? (attempt > 1 ? randomUUID() : String(row.id));
   const result = await sendCampaignPush({
     id: String(row.id),
     title_bn: row.title_bn,
@@ -94,7 +97,7 @@ const deliverStoredNotification = async (
     targetRules: row.target_rules,
     type: row.type,
     priority: row.priority === 'high' || row.priority === 'low' ? row.priority : 'normal',
-    idempotencyKey: idempotencyKey ?? (attempt > 1 ? `campaign:${row.id}:retry:${attempt}` : null),
+    idempotencyKey: providerIdempotencyKey,
   });
 
   const now = new Date().toISOString();

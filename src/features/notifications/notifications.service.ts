@@ -437,7 +437,7 @@ export const sendCampaignPush = async (campaign: {
         notificationId: campaign.id,
         priority: campaign.priority,
       },
-      { idempotencyKey: campaign.idempotencyKey ?? `campaign:${campaign.id}` }
+      { idempotencyKey: campaign.idempotencyKey ?? campaign.id }
     );
 
     if (outcome.error) {
