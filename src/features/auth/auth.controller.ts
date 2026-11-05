@@ -346,13 +346,20 @@ export const authController = {
 
       if (!userId) return res.status(401).json({ error: 'Unauthorized user' });
 
-      const { device_name, os_or_browser, fcm_token } = req.body;
+      const { device_name, os_or_browser, fcm_token, device_id, platform } =
+        req.body;
+      const headerDeviceId = req.headers['x-device-id'];
+      const stableDeviceId = Array.isArray(headerDeviceId)
+        ? headerDeviceId[0]
+        : headerDeviceId;
 
       await authService.saveUserDevice({
         user_id: userId,
         device_name,
         os_or_browser,
         fcm_token,
+        device_id: device_id || stableDeviceId,
+        platform,
         ip_address: getClientIp(req)
       });
 

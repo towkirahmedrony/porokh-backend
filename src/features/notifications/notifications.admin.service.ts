@@ -20,26 +20,47 @@ const normalizeCampaignType = (value: unknown): NotificationType => {
   return LEGACY_TYPE_MAP[raw] ?? 'social';
 };
 
+const parseCampaignDate = (value: unknown, field: string): Date | null => {
+  if (value === null || value === undefined || value === '') return null;
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) throw new Error(`Invalid ${field}`);
+  return date;
+};
+
 // --- CAMPAIGNS ---
 export const createCampaign = async (campaignData: any, adminId: string) => {
-  // ১. ডাটাবেসে সেভ করা (status 'scheduled' এর বদলে 'sent' দেওয়া হলো যাতে সাথে সাথে যায়)
-  const { data, error } = await supabase.from('notifications').insert({ 
-    ...campaignData, 
-    type: normalizeCampaignType(campaignData.type),
-    meta_data: {
-      ...(campaignData.meta_data ?? {}),
-      legacy_type: campaignData.type ?? null,
-    },
-    created_by: adminId, 
-    status: 'sent', 
-    total_sent: 0, 
-    total_clicks: 0 
-  }).select().single();
-  
-  if (error) throw new Error(error.message); 
+  const scheduledFor = parseCampaignDate(campaignData.scheduled_at, 'scheduled_at');
+  const expiresAt = parseCampaignDate(campaignData.expires_at, 'expires_at');
+  const shouldSchedule = Boolean(
+    scheduledFor && scheduledFor.getTime() > Date.now()
+  );
 
-  // ২. OneSignal দিয়ে পুশ পাঠানো। ইন-অ্যাপ রেকর্ড আগেই সেভ হয়েছে, তাই ডেলিভারি
-  // ব্যর্থ হলেও বিজ্ঞপ্তিটি ইনবক্সে থাকবে।
+  const { data, error } = await supabase
+    .from('notifications')
+    .insert({
+      ...campaignData,
+      type: normalizeCampaignType(campaignData.type),
+      meta_data: {
+        ...(campaignData.meta_data ?? {}),
+        legacy_type: campaignData.type ?? null,
+      },
+      created_by: adminId,
+      status: shouldSchedule ? 'scheduled' : 'sent',
+      scheduled_at: scheduledFor?.toISOString() ?? null,
+      expires_at: expiresAt?.toISOString() ?? null,
+      sent_at: shouldSchedule ? null : new Date().toISOString(),
+      total_sent: 0,
+      total_clicks: 0,
+    })
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
+
+  if (shouldSchedule) return data;
+
+  // OneSignal delivery is attempted after the inbox record exists, so a push
+  // failure can never erase the notification.
   try {
     const recipients = await sendCampaignPush({
       id: data.id,
@@ -50,10 +71,14 @@ export const createCampaign = async (campaignData: any, adminId: string) => {
       imageUrl: campaignData.image_url || null,
       actionLink: campaignData.action_link || '/',
       targetUserId: campaignData.target_user_id ?? null,
+      targetRules: campaignData.target_rules ?? null,
       priority: campaignData.priority,
     });
 
-    await supabase.from('notifications').update({ total_sent: recipients }).eq('id', data.id);
+    await supabase
+      .from('notifications')
+      .update({ total_sent: recipients })
+      .eq('id', data.id);
     console.log(`Campaign broadcasted through OneSignal. Recipients: ${recipients}`);
   } catch (pushError) {
     console.error('Error broadcasting push notification:', pushError);

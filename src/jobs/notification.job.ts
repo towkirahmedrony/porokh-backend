@@ -192,15 +192,31 @@ export const initNotificationCron = () => {
 
   cron.schedule('* * * * *', async () => {
     try {
+      const now = new Date();
       const { data: campaigns, error } = await supabase
         .from('notifications')
-        .select('id, title_bn, title_en, body_bn, body_en, image_url, action_link, target_user_id')
-        .eq('status', 'scheduled');
+        .select(
+          'id, title_bn, title_en, body_bn, body_en, image_url, action_link, target_user_id, target_rules, expires_at, priority'
+        )
+        .eq('status', 'scheduled')
+        .lte('scheduled_at', now.toISOString());
       if (error) throw error;
       if (!campaigns?.length) return;
 
       console.log(`🚀 Found ${campaigns.length} scheduled campaigns. Processing...`);
       for (const campaign of campaigns) {
+        const expiresAt = campaign.expires_at
+          ? new Date(campaign.expires_at)
+          : null;
+
+        if (expiresAt && expiresAt.getTime() <= now.getTime()) {
+          await supabase
+            .from('notifications')
+            .update({ status: 'cancelled' })
+            .eq('id', campaign.id);
+          continue;
+        }
+
         let successCount = 0;
         try {
           successCount = await sendCampaignPush({
@@ -212,6 +228,8 @@ export const initNotificationCron = () => {
             imageUrl: campaign.image_url || null,
             actionLink: campaign.action_link || '/',
             targetUserId: campaign.target_user_id,
+            targetRules: campaign.target_rules,
+            priority: campaign.priority === 'high' ? 'high' : 'normal',
           });
         } catch (pushError) {
           // Mark once after the attempt to avoid duplicate sends on the next cron tick.

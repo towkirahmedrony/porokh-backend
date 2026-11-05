@@ -101,7 +101,7 @@ require.cache[supabaseConfigPath] = {
   exports: { supabaseAdmin: fakeSupabase },
 } as any;
 
-const { normalizePreferences, levelForXp, notify } =
+const { normalizePreferences, levelForXp, notify, matchesCampaignTargetRules } =
   require('./notifications.service') as typeof import('./notifications.service');
 
 const USER_ID = 'user-1';
@@ -231,4 +231,64 @@ test('notify is idempotent for a repeated dedupe key', async () => {
   assert.equal(first.inserted, 1);
   assert.equal(second.inserted, 0);
   assert.equal(state.notifications.length, 1);
+});
+
+test('campaign targeting matches subscription, class and board on the profile', () => {
+  const profile = {
+    id: 'user-1',
+    subscription_status: 'active',
+    class_level: 'HSC',
+    education_board: 'Dhaka',
+    last_active_at: new Date().toISOString(),
+  };
+
+  assert.equal(matchesCampaignTargetRules(null, profile), true);
+  assert.equal(
+    matchesCampaignTargetRules({ subscription_status: 'premium' }, profile),
+    true
+  );
+  assert.equal(
+    matchesCampaignTargetRules({ subscription_status: 'free' }, profile),
+    false
+  );
+  assert.equal(
+    matchesCampaignTargetRules({ class_level: ['HSC', 'SSC'] }, profile),
+    true
+  );
+  assert.equal(
+    matchesCampaignTargetRules({ class_level: ['SSC'] }, profile),
+    false
+  );
+  assert.equal(
+    matchesCampaignTargetRules({ education_board: ['Dhaka'] }, profile),
+    true
+  );
+  assert.equal(
+    matchesCampaignTargetRules({ education_board: ['Rajshahi'] }, profile),
+    false
+  );
+  assert.equal(
+    matchesCampaignTargetRules({ specific_user_id: 'user-2' }, profile),
+    false
+  );
+});
+
+test('campaign targeting treats a recently active user as failing an inactive filter', () => {
+  const recentlyActive = {
+    id: 'user-1',
+    last_active_at: new Date().toISOString(),
+  };
+  const stale = {
+    id: 'user-2',
+    last_active_at: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(),
+  };
+
+  assert.equal(
+    matchesCampaignTargetRules({ last_active_days_ago: 30 }, recentlyActive),
+    false
+  );
+  assert.equal(
+    matchesCampaignTargetRules({ last_active_days_ago: 30 }, stale),
+    true
+  );
 });

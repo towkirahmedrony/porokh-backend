@@ -82,10 +82,15 @@ export const authService = {
   },
 
   async saveUserDevice(payload: any): Promise<void> {
-    const deviceId = payload.device_id || crypto.randomUUID();
-    const ipToSave = payload.ip_address && payload.ip_address.trim() !== '' ? payload.ip_address : '0.0.0.0';
-
-    const { error } = await supabaseAdmin.from('user_devices').insert([{
+    // The install id is stable (sent by the app); the random fallback only
+    // covers very old clients that never sent one.
+    const deviceId = String(payload.device_id || '').trim() || crypto.randomUUID();
+    const ipToSave =
+      payload.ip_address && String(payload.ip_address).trim() !== ''
+        ? String(payload.ip_address).trim()
+        : '0.0.0.0';
+    const platform = payload.platform === 'android' ? 'android' : 'web';
+    const device = {
       user_id: payload.user_id,
       device_name: payload.device_name || 'Unknown',
       device_id: deviceId,
@@ -93,8 +98,23 @@ export const authService = {
       last_active_at: new Date().toISOString(),
       is_trusted: true,
       os_or_browser: payload.os_or_browser || 'Unknown',
-      ip_address: ipToSave
-    }]);
+      platform,
+      ip_address: ipToSave,
+    };
+
+    const { data: existing } = await supabaseAdmin
+      .from('user_devices')
+      .select('id')
+      .eq('user_id', payload.user_id)
+      .eq('device_id', deviceId)
+      .maybeSingle();
+
+    const { error } = existing?.id
+      ? await supabaseAdmin
+          .from('user_devices')
+          .update(device)
+          .eq('id', existing.id)
+      : await supabaseAdmin.from('user_devices').insert([device]);
 
     if (error) throw new Error(`Device save error: ${error.message}`);
   },
