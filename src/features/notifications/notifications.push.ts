@@ -1,117 +1,127 @@
-import type { DevicePlatform } from './notifications.types';
+import type { BilingualCopy, NotificationPriority } from './notifications.types';
 
 /**
- * FCM payload shaping.
+ * OneSignal payload shaping.
  *
- * Web Push is delivered by `firebase-messaging-sw.js`, which reads the message
- * `data` and calls `showNotification` itself. Sending a `notification` block to
- * a web token would let the browser display its own notification as well, so the
- * web payload must stay data-only.
+ * A push carries identifiers and routing hints only. The OS renders the title
+ * and body, but the record those fields point at is always fetched from Supabase
+ * through RLS, so a leaked payload cannot expose another account's content.
  *
- * Android is the opposite: a data-only message is not displayed when the app is
- * backgrounded or terminated, so it must carry a `notification` block. The
- * plugin still exposes the `data` keys to the JS layer for the tap action.
+ * Recipients are addressed as `include_aliases.external_id` — the Supabase user
+ * UUID the device logged in with. OneSignal then reaches every subscription of
+ * that user, which is what makes multi-device delivery work without a token
+ * table here.
  */
 
-/** Android channel created by the app; also declared in AndroidManifest. */
-export const PUSH_CHANNEL_ID = 'porokh_default';
+/** Documented maximum number of `external_id` aliases per create-message call. */
+export const PUSH_ALIAS_LIMIT = 20_000;
 
-/** Android first: a phone notification is the delivery mechanism users see. */
-export const PUSH_PLATFORM_ORDER: DevicePlatform[] = ['android', 'web'];
-
-export type PushDeviceRow = {
-  fcm_token: string | null;
-  platform?: string | null;
-};
+/** Transport recorded for an installation in `user_devices`. */
+export type DevicePlatform = 'web' | 'android';
 
 export type PushCopy = {
-  title: string;
-  body: string;
+  title: BilingualCopy;
+  body: BilingualCopy;
   imageUrl?: string | null;
   actionLink?: string | null;
   type: string;
   notificationId?: string | null;
+  priority?: NotificationPriority;
 };
+
+export type OneSignalPushMessage = {
+  target_channel: 'push';
+  include_aliases: { external_id: string[] };
+  headings: { en: string; bn: string };
+  contents: { en: string; bn: string };
+  data: Record<string, string>;
+  big_picture?: string;
+  priority?: number;
+  idempotency_key?: string;
+};
+
+/** OneSignal priority 10 = high, which wakes a dozing device immediately. */
+const ONESIGNAL_HIGH_PRIORITY = 10;
 
 export const normalizeDevicePlatform = (value: unknown): DevicePlatform =>
   String(value ?? '').trim().toLowerCase() === 'android' ? 'android' : 'web';
 
 /**
- * Splits registered tokens by platform, dropping blanks and duplicates.
- *
- * A token is unique per installation, so one token must be sent exactly once
- * even if two rows somehow carry it.
+ * Trims and de-duplicates recipient ids. The same user must appear once even if
+ * two registrations point at them, otherwise the alias list carries duplicates.
  */
-export const groupTokensByPlatform = (
-  devices: PushDeviceRow[]
-): Record<DevicePlatform, string[]> => {
-  const grouped: Record<DevicePlatform, string[]> = { android: [], web: [] };
+export const normalizeExternalIds = (
+  values: Array<string | null | undefined>
+): string[] => {
   const seen = new Set<string>();
 
-  for (const device of devices) {
-    const token = String(device.fcm_token ?? '').trim();
-    if (!token || seen.has(token)) continue;
-    seen.add(token);
-    grouped[normalizeDevicePlatform(device.platform)].push(token);
+  for (const value of values) {
+    const id = String(value ?? '').trim();
+    if (id) seen.add(id);
   }
 
-  return grouped;
+  return Array.from(seen);
 };
 
-const pushData = (copy: PushCopy): Record<string, string> => ({
-  title: copy.title,
-  body: copy.body,
-  image_url: copy.imageUrl || '',
-  action_link: copy.actionLink || '/',
-  type: copy.type,
-  notification_id: copy.notificationId || '',
-});
+/** Splits a recipient list into requests OneSignal will accept. */
+export const chunkExternalIds = (
+  ids: string[],
+  size = PUSH_ALIAS_LIMIT
+): string[][] => {
+  const chunkSize = Math.max(1, Math.floor(size));
+  const chunks: string[][] = [];
 
-export type PushMessage = {
-  tokens: string[];
-  data: Record<string, string>;
-  notification?: { title: string; body: string; imageUrl?: string };
-  android?: {
-    priority: 'high';
-    notification: { channelId: string; sound: string; imageUrl?: string };
-  };
+  for (let index = 0; index < ids.length; index += chunkSize) {
+    chunks.push(ids.slice(index, index + chunkSize));
+  }
+
+  return chunks;
 };
+
+const nonEmpty = (value: string | null | undefined): string =>
+  String(value ?? '').trim();
 
 /**
- * Builds the multicast message for one platform.
+ * Builds the create-message body for one chunk of recipients.
  *
- * The return type is structural on purpose: importing `firebase-admin` here
- * would construct the Firebase app as a side effect of importing the
- * notification service.
+ * Both languages are sent in every message: Android picks the heading and
+ * contents that match the device locale, which is a better signal than the
+ * profile row's stored preference and removes the old per-language fan-out.
  */
-export const buildPushMessage = (
-  tokens: string[],
-  platform: DevicePlatform,
-  copy: PushCopy
-): PushMessage => {
-  const data = pushData(copy);
+export const buildOneSignalMessage = (
+  externalIds: string[],
+  copy: PushCopy,
+  options: { idempotencyKey?: string | null } = {}
+): OneSignalPushMessage => {
+  const recipients = normalizeExternalIds(externalIds);
+  if (recipients.length === 0) throw new Error('No push recipients');
 
-  if (platform !== 'android') {
-    return { tokens, data };
-  }
+  const titleEn = nonEmpty(copy.title?.en) || nonEmpty(copy.title?.bn) || 'Porokh';
+  const titleBn = nonEmpty(copy.title?.bn) || titleEn;
+  const bodyEn = nonEmpty(copy.body?.en) || titleEn;
+  const bodyBn = nonEmpty(copy.body?.bn) || bodyEn;
 
-  return {
-    tokens,
-    data,
-    notification: {
-      title: copy.title || 'Porokh',
-      body: copy.body,
-      ...(copy.imageUrl ? { imageUrl: copy.imageUrl } : {}),
-    },
-    android: {
-      // High priority lets FCM wake a terminated app instead of batching the
-      // message until the next time the device happens to check in.
-      priority: 'high',
-      notification: {
-        channelId: PUSH_CHANNEL_ID,
-        sound: 'default',
-        ...(copy.imageUrl ? { imageUrl: copy.imageUrl } : {}),
-      },
+  const message: OneSignalPushMessage = {
+    target_channel: 'push',
+    include_aliases: { external_id: recipients },
+    headings: { en: titleEn, bn: titleBn },
+    contents: { en: bodyEn, bn: bodyBn },
+    // Minimal routing metadata: the client validates `action_link` against the
+    // routes this build serves and opens the record from Supabase.
+    data: {
+      type: copy.type,
+      notification_id: nonEmpty(copy.notificationId),
+      action_link: nonEmpty(copy.actionLink) || '/',
     },
   };
+
+  const imageUrl = nonEmpty(copy.imageUrl);
+  if (imageUrl) message.big_picture = imageUrl;
+
+  if (copy.priority === 'high') message.priority = ONESIGNAL_HIGH_PRIORITY;
+
+  const idempotencyKey = nonEmpty(options.idempotencyKey);
+  if (idempotencyKey) message.idempotency_key = idempotencyKey;
+
+  return message;
 };

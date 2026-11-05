@@ -1,9 +1,6 @@
 import { supabase } from '../../config/supabase';
-import { supabaseAdmin } from '../../config/supabaseAdmin';
-import { parseLanguage } from '../../lib/utils/language';
 import { NOTIFICATION_TYPES, NotificationType } from './notifications.types';
-import { PushDeviceRow } from './notifications.push';
-import { sendPushToDevices } from './notifications.service';
+import { sendCampaignPush } from './notifications.service';
 
 const LEGACY_TYPE_MAP: Record<string, NotificationType> = {
   system: 'security',
@@ -21,11 +18,6 @@ const normalizeCampaignType = (value: unknown): NotificationType => {
   const raw = String(value ?? '').trim();
   if (NOTIFICATION_TYPES.includes(raw as NotificationType)) return raw as NotificationType;
   return LEGACY_TYPE_MAP[raw] ?? 'social';
-};
-
-const pushEnabled = (settings: unknown): boolean => {
-  const value = (settings as Record<string, any> | null)?.notification_preferences?.push;
-  return value !== false;
 };
 
 // --- CAMPAIGNS ---
@@ -46,54 +38,23 @@ export const createCampaign = async (campaignData: any, adminId: string) => {
   
   if (error) throw new Error(error.message); 
 
-  // ২. ফায়ারবেসের মাধ্যমে পুশ নোটিফিকেশন পাঠানো
+  // ২. OneSignal দিয়ে পুশ পাঠানো। ইন-অ্যাপ রেকর্ড আগেই সেভ হয়েছে, তাই ডেলিভারি
+  // ব্যর্থ হলেও বিজ্ঞপ্তিটি ইনবক্সে থাকবে।
   try {
-    // সব ইউজারের ফায়ারবেস টোকেন নিয়ে আসা (যাদের টোকেন null নয়)
-    const { data: userDevices } = await supabaseAdmin
-      .from('user_devices')
-      .select('user_id, fcm_token, platform')
-      .not('fcm_token', 'is', null);
+    const recipients = await sendCampaignPush({
+      id: data.id,
+      title_bn: campaignData.title_bn,
+      title_en: campaignData.title_en,
+      body_bn: campaignData.body_bn,
+      body_en: campaignData.body_en,
+      imageUrl: campaignData.image_url || null,
+      actionLink: campaignData.action_link || '/',
+      targetUserId: campaignData.target_user_id ?? null,
+      priority: campaignData.priority,
+    });
 
-    if (userDevices && userDevices.length > 0) {
-      const userIds = [...new Set(userDevices.map(device => device.user_id).filter(Boolean))] as string[];
-      const { data: profiles } = userIds.length
-        ? await supabaseAdmin.from('profiles').select('id, language_preference, settings').in('id', userIds)
-        : { data: [] };
-      const languageByUser = new Map((profiles || []).map(profile => [profile.id, parseLanguage(profile.language_preference)]));
-      const pushAllowed = new Set((profiles || []).filter(profile => pushEnabled(profile.settings)).map(profile => profile.id));
-      const devicesByLanguage: Record<'bn' | 'en', PushDeviceRow[]> = { bn: [], en: [] };
-      for (const device of userDevices) {
-        if (device.fcm_token && pushAllowed.has(device.user_id)) {
-          devicesByLanguage[languageByUser.get(device.user_id) || 'bn'].push(
-            device as PushDeviceRow
-          );
-        }
-      }
-      let successCount = 0;
-      let failureCount = 0;
-      for (const language of ['bn', 'en'] as const) {
-        const devices = devicesByLanguage[language];
-        if (devices.length === 0) continue;
-        const title = language === 'en'
-          ? campaignData.title_en || campaignData.title_bn || 'New Notification'
-          : campaignData.title_bn || campaignData.title_en || 'নতুন বিজ্ঞপ্তি';
-        const body = language === 'en'
-          ? campaignData.body_en || campaignData.body_bn || ''
-          : campaignData.body_bn || campaignData.body_en || '';
-        const outcome = await sendPushToDevices(devices, {
-          title,
-          body,
-          imageUrl: campaignData.image_url || null,
-          actionLink: campaignData.action_link || '/',
-          type: 'campaign',
-        });
-        successCount += outcome.sent;
-        failureCount += devices.length - outcome.sent;
-      }
-      // কতজনকে পাঠানো হলো সেই সংখ্যাটি ডাটাবেসে আপডেট করা
-      await supabase.from('notifications').update({ total_sent: successCount }).eq('id', data.id);
-      console.log(`Campaign broadcasted. Success: ${successCount}, Failed: ${failureCount}`);
-    }
+    await supabase.from('notifications').update({ total_sent: recipients }).eq('id', data.id);
+    console.log(`Campaign broadcasted through OneSignal. Recipients: ${recipients}`);
   } catch (pushError) {
     console.error('Error broadcasting push notification:', pushError);
   }

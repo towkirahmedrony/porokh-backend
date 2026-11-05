@@ -225,9 +225,6 @@ stub('../../config/supabase', { supabase: fakeSupabase });
 stub('../../config/supabaseAdmin', { supabaseAdmin: fakeSupabase });
 stub('../../config/supabaseAuth', { supabaseAuth: fakeSupabase });
 stub('../../config/userSupabase', { createUserSupabaseClient: () => fakeSupabase });
-stub('../../config/firebaseAdmin', {
-  messaging: { sendEachForMulticast: async () => ({ successCount: 0, failureCount: 0 }) },
-});
 
 const app = require('../../app').default;
 

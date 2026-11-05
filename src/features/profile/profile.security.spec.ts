@@ -103,9 +103,6 @@ const stubModule = (relativePath: string, exports: unknown) => {
 
 stubModule('../../config/supabase', { supabase: fakeSupabase });
 stubModule('../../config/supabaseAdmin', { supabaseAdmin: fakeSupabaseAdmin });
-stubModule('../../config/firebaseAdmin', {
-  messaging: { send: async () => 'ok' },
-});
 
 const { ProfileService } = require('./profile.service');
 const {

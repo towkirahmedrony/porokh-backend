@@ -211,15 +211,6 @@ require.cache[supabaseConfigPath] = {
 // Other feature modules pulled in transitively (streak, profile) import these
 // clients at load time; provide transport-level fakes so no real client is
 // constructed without credentials.
-const firebaseStub = { messaging: () => ({ send: async () => 'message-id' }) };
-const firebaseConfigPath = require.resolve('../../config/firebaseAdmin');
-require.cache[firebaseConfigPath] = {
-  id: firebaseConfigPath,
-  filename: firebaseConfigPath,
-  loaded: true,
-  exports: { messaging: firebaseStub.messaging() },
-} as any;
-
 for (const modulePath of ['../../config/supabaseAdmin', '../../config/supabaseAuth']) {
   const resolved = require.resolve(modulePath);
   require.cache[resolved] = {

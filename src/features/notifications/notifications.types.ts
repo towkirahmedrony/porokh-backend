@@ -10,7 +10,11 @@ export interface IDeviceTokenPayload {
   device_id: string;
   device_name?: string;
   os_or_browser?: string;
-  fcm_token: string | null;
+  /**
+   * Legacy FCM token. Push delivery now goes through OneSignal External IDs, so
+   * clients no longer send it; the column is kept for existing device rows.
+   */
+  fcm_token?: string | null;
   /** Defaults to `web` so existing web clients keep their behaviour. */
   platform?: DevicePlatform;
   ip_address?: string | null;

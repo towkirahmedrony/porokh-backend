@@ -90,9 +90,6 @@ stubModule('../../config/supabaseAuth', { supabaseAuth: fakeSupabase });
 stubModule('../../config/userSupabase', {
   createUserSupabaseClient: () => fakeUserClient,
 });
-stubModule('../../config/firebaseAdmin', {
-  messaging: { sendEachForMulticast: async () => ({ successCount: 0, failureCount: 0 }) },
-});
 stubModule('../../lib/utils/adminAudit', { recordAdminAudit: async () => undefined });
 
 const { default: app, EXPOSED_ERROR_CODES } = require('../../app');

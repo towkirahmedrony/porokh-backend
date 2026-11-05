@@ -6,19 +6,19 @@ import {
   NOTIFICATION_TYPES,
   NotificationChannel,
   NotificationPreferences,
+  NotificationPriority,
   NotificationType,
   NotifyInput,
   NotifyResult,
 } from './notifications.types';
-import { Language, parseLanguage } from '../../lib/utils/language';
 import {
-  PUSH_PLATFORM_ORDER,
   PushCopy,
-  PushDeviceRow,
-  buildPushMessage,
-  groupTokensByPlatform,
+  buildOneSignalMessage,
+  chunkExternalIds,
   normalizeDevicePlatform,
+  normalizeExternalIds,
 } from './notifications.push';
+import { sendOneSignalMessage } from '../../config/onesignal';
 
 type AnyObject = Record<string, any>;
 
@@ -42,16 +42,6 @@ type TemplateRow = {
 
 const MAX_PUSH_PER_USER_PER_DAY = 3;
 const INSERT_CHUNK_SIZE = 200;
-const TOKEN_CHUNK_SIZE = 500;
-
-const INVALID_TOKEN_CODES = new Set([
-  'messaging/registration-token-not-registered',
-  'messaging/invalid-registration-token',
-  'messaging/invalid-argument',
-]);
-
-const localizedCopy = (copy: BilingualCopy, language: Language): string =>
-  copy[language]?.trim() || copy[language === 'en' ? 'bn' : 'en']?.trim() || '';
 
 const chunk = <T>(rows: T[], size: number): T[][] => {
   const chunks: T[][] = [];
@@ -216,45 +206,41 @@ const getPushCapReached = async (userId: string): Promise<boolean> => {
   return (count ?? 0) >= MAX_PUSH_PER_USER_PER_DAY;
 };
 
-const cleanupInvalidTokens = async (tokens: string[], responses: AnyObject[]): Promise<void> => {
-  const stale = tokens.filter((_token, index) => {
-    const response = responses[index];
-    if (!response || response.success) return false;
-    return INVALID_TOKEN_CODES.has(String(response.error?.code ?? ''));
-  });
-
-  if (stale.length === 0) return;
-
-  const { error } = await getAdmin().from('user_devices').delete().in('fcm_token', stale);
-  if (error) console.error('[notify] stale token cleanup failed:', error.message);
-};
-
 /**
- * Sends one payload to a set of devices, splitting by transport because a
- * multicast message can only carry one shape.
+ * Sends one payload to every device subscribed to the given Supabase users.
+ *
+ * OneSignal resolves the External IDs to subscriptions, so no token lookup is
+ * needed here and an account with two phones is served by the same call.
  */
-export const sendPushToDevices = async (
-  devices: PushDeviceRow[],
-  copy: PushCopy
+export const sendPushToUsers = async (
+  userIds: string | string[],
+  copy: PushCopy,
+  options: { idempotencyKey?: string | null } = {}
 ): Promise<PushOutcome> => {
-  const grouped = groupTokensByPlatform(devices);
+  const externalIds = normalizeExternalIds(
+    Array.isArray(userIds) ? userIds : [userIds]
+  );
+  if (externalIds.length === 0) return { sent: 0, error: null };
+
   let sent = 0;
   let lastError: string | null = null;
 
-  for (const platform of PUSH_PLATFORM_ORDER) {
-    for (const tokenChunk of chunk(grouped[platform], TOKEN_CHUNK_SIZE)) {
-      try {
-        const { messaging } = await import('../../config/firebaseAdmin');
-        const response = await messaging.sendEachForMulticast(
-          buildPushMessage(tokenChunk, platform, copy)
-        );
+  for (const [index, aliasChunk] of chunkExternalIds(externalIds).entries()) {
+    try {
+      const result = await sendOneSignalMessage(
+        buildOneSignalMessage(aliasChunk, copy, {
+          // One key per chunk: reusing a single key would make OneSignal drop
+          // every chunk after the first as a duplicate message.
+          idempotencyKey: options.idempotencyKey
+            ? `${options.idempotencyKey}:${index}`
+            : null,
+        })
+      );
 
-        sent += response.successCount;
-        await cleanupInvalidTokens(tokenChunk, response.responses as AnyObject[]);
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : 'push failed';
-        console.error('[notify] FCM push failed:', lastError);
-      }
+      sent += result.recipients;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : 'push failed';
+      console.error('[notify] OneSignal push failed:', lastError);
     }
   }
 
@@ -269,37 +255,143 @@ const deliverPushForUser = async (
     imageUrl?: string | null;
     type: NotificationType;
     notificationId?: string | null;
-    language?: Language;
+    priority?: NotificationPriority;
   }
-): Promise<PushOutcome> => {
-  let language = options.language;
-  if (!language) {
-    const { data: profile } = await getAdmin()
-      .from('profiles')
-      .select('language_preference')
-      .eq('id', userId)
-      .maybeSingle();
-    language = parseLanguage(profile?.language_preference);
+): Promise<PushOutcome> =>
+  sendPushToUsers(
+    userId,
+    {
+      title: copy.title,
+      body: copy.body,
+      imageUrl: options.imageUrl,
+      actionLink: options.actionLink,
+      type: options.type,
+      notificationId: options.notificationId,
+      priority: options.priority,
+    },
+    // The record id makes a retried notify() for the same row a no-op instead
+    // of a second push.
+    { idempotencyKey: options.notificationId }
+  );
+
+// --- Campaign broadcasts -----------------------------------------------------
+
+const PUSH_AUDIENCE_PAGE = 1000;
+const PUSH_AUDIENCE_MAX_PAGES = 100;
+
+/**
+ * Android installations recorded in `user_devices`.
+ *
+ * After the FCM migration the row no longer stores a token: it records that this
+ * account opened the app on an Android device, which is the audience a campaign
+ * may target. Actual delivery still depends on the device being subscribed in
+ * OneSignal.
+ */
+const loadPushAudience = async (
+  targetUserId?: string | null
+): Promise<string[]> => {
+  const userIds: string[] = [];
+
+  for (let page = 0; page < PUSH_AUDIENCE_MAX_PAGES; page += 1) {
+    const from = page * PUSH_AUDIENCE_PAGE;
+    let query = getAdmin()
+      .from('user_devices')
+      .select('user_id')
+      .eq('platform', 'android')
+      .order('user_id', { ascending: true })
+      .range(from, from + PUSH_AUDIENCE_PAGE - 1);
+
+    if (targetUserId) query = query.eq('user_id', targetUserId);
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('[notify] push audience lookup failed:', error.message);
+      break;
+    }
+
+    const rows = (data ?? []) as AnyObject[];
+    rows.forEach((row) => userIds.push(String(row.user_id ?? '')));
+    if (rows.length < PUSH_AUDIENCE_PAGE) break;
   }
 
-  const { data: devices, error } = await getAdmin()
-    .from('user_devices')
-    .select('fcm_token, platform')
-    .eq('user_id', userId)
-    .not('fcm_token', 'is', null);
+  return normalizeExternalIds(userIds);
+};
 
-  if (error || !devices || devices.length === 0) {
-    return { sent: 0, error: error?.message ?? null };
+/**
+ * Delivers one bilingual campaign push to the audience and returns the number of
+ * devices OneSignal accepted it for. The notification row is written by the
+ * caller before this runs, so a delivery failure leaves the inbox entry intact.
+ */
+export const sendCampaignPush = async (campaign: {
+  id: string;
+  title_bn?: string | null;
+  title_en?: string | null;
+  body_bn?: string | null;
+  body_en?: string | null;
+  imageUrl?: string | null;
+  actionLink?: string | null;
+  targetUserId?: string | null;
+  priority?: NotificationPriority;
+}): Promise<number> => {
+  try {
+    const audience = await loadPushAudience(campaign.targetUserId);
+    if (audience.length === 0) return 0;
+
+    const allowed: string[] = [];
+
+    for (const userChunk of chunk(audience, INSERT_CHUNK_SIZE)) {
+      const { data, error } = await getAdmin()
+        .from('profiles')
+        .select('id, settings')
+        .in('id', userChunk);
+
+      if (error) {
+        console.error('[notify] campaign audience lookup failed:', error.message);
+        continue;
+      }
+
+      (data ?? []).forEach((profile: AnyObject) => {
+        const preferences = normalizePreferences(
+          (profile.settings as AnyObject | null)?.notification_preferences
+        );
+        if (preferences.push) allowed.push(String(profile.id));
+      });
+    }
+
+    if (allowed.length === 0) return 0;
+
+    const outcome = await sendPushToUsers(
+      allowed,
+      {
+        title: {
+          bn: campaign.title_bn ?? campaign.title_en ?? '',
+          en: campaign.title_en ?? campaign.title_bn ?? '',
+        },
+        body: {
+          bn: campaign.body_bn ?? campaign.body_en ?? '',
+          en: campaign.body_en ?? campaign.body_bn ?? '',
+        },
+        imageUrl: campaign.imageUrl ?? null,
+        actionLink: campaign.actionLink ?? null,
+        type: 'campaign',
+        notificationId: campaign.id,
+        priority: campaign.priority,
+      },
+      { idempotencyKey: `campaign:${campaign.id}` }
+    );
+
+    if (outcome.error) {
+      console.error('[notify] campaign push failed:', outcome.error);
+    }
+
+    return outcome.sent;
+  } catch (error) {
+    console.error(
+      '[notify] campaign broadcast failed:',
+      error instanceof Error ? error.message : 'unknown error'
+    );
+    return 0;
   }
-
-  return sendPushToDevices(devices as PushDeviceRow[], {
-    title: localizedCopy(copy.title, language) || 'Porokh',
-    body: localizedCopy(copy.body, language),
-    imageUrl: options.imageUrl,
-    actionLink: options.actionLink,
-    type: options.type,
-    notificationId: options.notificationId,
-  });
 };
 
 // --- Core entry point --------------------------------------------------------
@@ -447,7 +539,7 @@ export const notify = async (input: NotifyInput): Promise<NotifyResult> => {
       const { data, error } = await getAdmin()
         .from('notifications')
         .upsert(rowChunk, { onConflict: 'dedupe_key', ignoreDuplicates: true })
-        .select('id, target_user_id, title_bn, title_en, body_bn, body_en, action_link, image_url, type, meta_data');
+        .select('id, target_user_id, title_bn, title_en, body_bn, body_en, action_link, image_url, type, priority, meta_data');
 
       if (error) {
         console.error('[notify] insert failed:', error.message);
@@ -505,6 +597,7 @@ export const notify = async (input: NotifyInput): Promise<NotifyResult> => {
           imageUrl: row.image_url,
           type: input.type,
           notificationId: row.id,
+          priority: (row.priority ?? input.priority) as NotificationPriority,
         }
       );
 
