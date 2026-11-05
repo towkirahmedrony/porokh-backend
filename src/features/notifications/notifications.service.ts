@@ -13,6 +13,7 @@ import {
 } from './notifications.types';
 import {
   PushCopy,
+  buildNotificationIdempotencyKey,
   buildOneSignalMessage,
   chunkExternalIds,
   normalizeDevicePlatform,
@@ -216,7 +217,7 @@ const getPushCapReached = async (userId: string): Promise<boolean> => {
 export const sendPushToUsers = async (
   userIds: string | string[],
   copy: PushCopy,
-  options: { idempotencyKey?: string | null } = {}
+  options: { notificationId?: string | null; attempt?: number } = {}
 ): Promise<PushOutcome> => {
   const externalIds = normalizeExternalIds(
     Array.isArray(userIds) ? userIds : [userIds]
@@ -232,9 +233,14 @@ export const sendPushToUsers = async (
       const result = await sendOneSignalMessage(
         buildOneSignalMessage(aliasChunk, copy, {
           // One key per chunk: reusing a single key would make OneSignal drop
-          // every chunk after the first as a duplicate message.
-          idempotencyKey: options.idempotencyKey
-            ? `${options.idempotencyKey}:${index}`
+          // every chunk after the first as a duplicate message. The key must be
+          // a UUID, so it is derived rather than assembled with separators.
+          idempotencyKey: options.notificationId
+            ? buildNotificationIdempotencyKey(
+                options.notificationId,
+                options.attempt ?? 1,
+                index
+              )
             : null,
         })
       );
@@ -274,7 +280,7 @@ const deliverPushForUser = async (
     },
     // The record id makes a retried notify() for the same row a no-op instead
     // of a second push.
-    { idempotencyKey: options.notificationId }
+    { notificationId: options.notificationId, attempt: 1 }
   );
 
 // --- Campaign broadcasts -----------------------------------------------------
@@ -366,8 +372,8 @@ export const sendCampaignPush = async (campaign: {
   targetRules?: unknown;
   type?: string | null;
   priority?: NotificationPriority;
-  /** Retries pass a fresh key; the first attempt reuses the notification id. */
-  idempotencyKey?: string | null;
+  /** Retries use a new attempt number so the provider does not drop the send. */
+  attempt?: number;
 }): Promise<CampaignPushResult> => {
   try {
     const devicePlatforms = await loadDevicePlatforms();
@@ -437,7 +443,7 @@ export const sendCampaignPush = async (campaign: {
         notificationId: campaign.id,
         priority: campaign.priority,
       },
-      { idempotencyKey: campaign.idempotencyKey ?? `campaign:${campaign.id}` }
+      { notificationId: campaign.id, attempt: campaign.attempt ?? 1 }
     );
 
     if (outcome.error) {

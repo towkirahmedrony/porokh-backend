@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   PUSH_ALIAS_LIMIT,
+  buildNotificationIdempotencyKey,
   buildOneSignalMessage,
   chunkExternalIds,
   normalizeDevicePlatform,
@@ -85,16 +86,38 @@ test('missing copy still produces a sendable message', () => {
 });
 
 test('high priority and idempotency keys are forwarded, normal priority is not', () => {
+  const key = buildNotificationIdempotencyKey('n-1', 1);
   const urgent = buildOneSignalMessage([USER], { ...copy, priority: 'high' }, {
-    idempotencyKey: 'notification:n-1:0',
+    idempotencyKey: key,
   }) as Record<string, any>;
 
   assert.equal(urgent.priority, 10);
-  assert.equal(urgent.idempotency_key, 'notification:n-1:0');
+  assert.equal(urgent.idempotency_key, key);
 
   const normal = buildOneSignalMessage([USER], { ...copy, priority: 'normal' }) as Record<string, any>;
   assert.equal(normal.priority, undefined);
   assert.equal(normal.idempotency_key, undefined);
+});
+
+test('idempotency keys are valid UUIDs, stable per attempt and distinct on retry', () => {
+  const uuidV5 =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+  const first = buildNotificationIdempotencyKey('20fcc69e-9f2b-408f-871f-4dd0741a2e54', 1);
+  const repeated = buildNotificationIdempotencyKey('20fcc69e-9f2b-408f-871f-4dd0741a2e54', 1);
+  const retry = buildNotificationIdempotencyKey('20fcc69e-9f2b-408f-871f-4dd0741a2e54', 2);
+  const nextChunk = buildNotificationIdempotencyKey(
+    '20fcc69e-9f2b-408f-871f-4dd0741a2e54',
+    1,
+    1
+  );
+
+  assert.match(first, uuidV5);
+  assert.equal(first, repeated);
+  assert.notEqual(first, retry);
+  assert.notEqual(first, nextChunk);
+  assert.equal(first.includes(':'), false);
+  assert.throws(() => buildNotificationIdempotencyKey('', 1), /Notification id/);
 });
 
 test('an empty recipient list is refused instead of broadcasting to everyone', () => {

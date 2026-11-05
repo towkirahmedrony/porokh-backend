@@ -48,14 +48,16 @@ const loadNotification = async (id: string): Promise<AnyObject> => {
  * Audit writes never fail a request: the notification itself already happened,
  * and losing the trail entry is preferable to reporting a failed send.
  */
-const recordAudit = async (
+export const recordAudit = async (
   notificationId: string | null,
   actorId: string | null,
   action:
     | 'created'
     | 'updated'
     | 'scheduled'
+    | 'send_attempted'
     | 'sent'
+    | 'failed'
     | 'cancelled'
     | 'retried'
     | 'delivery_refreshed'
@@ -71,18 +73,34 @@ const recordAudit = async (
   }
 };
 
+export const pushFailureReason = (result: {
+  accepted: number;
+  messageId: string | null;
+  error: string | null;
+}): string | null => {
+  if (result.error) return result.error;
+  if (result.accepted === 0) return 'OneSignal accepted 0 devices';
+  if (!result.messageId) return 'OneSignal response had no message id';
+  return null;
+};
+
 /**
  * Pushes one stored notification and records exactly what the provider
- * reported. The row is published (status `sent`) even when the push fails: the
- * in-app record is valid, and the delivery problem is kept in `push_error`
- * instead of hiding the notification from every inbox.
+ * reported. A notification is only published as `sent` after OneSignal accepts
+ * it and returns a message id; any provider error or zero accepted devices
+ * leaves the row `failed` with the error stored for the retry button.
  */
 const deliverStoredNotification = async (
   row: AnyObject,
   actorId: string,
-  attempt: number,
-  idempotencyKey?: string
+  attempt: number
 ): Promise<AnyObject> => {
+  await recordAudit(row.id, actorId, 'send_attempted', {
+    attempt,
+    target_rules: row.target_rules ?? {},
+    target_user_id: row.target_user_id ?? null,
+  });
+
   const result = await sendCampaignPush({
     id: String(row.id),
     title_bn: row.title_bn,
@@ -94,19 +112,21 @@ const deliverStoredNotification = async (
     targetRules: row.target_rules,
     type: row.type,
     priority: row.priority === 'high' || row.priority === 'low' ? row.priority : 'normal',
-    idempotencyKey: idempotencyKey ?? (attempt > 1 ? `campaign:${row.id}:retry:${attempt}` : null),
+    attempt,
   });
 
+  const errorText = pushFailureReason(result);
+  const succeeded = Boolean(result.messageId) && result.accepted > 0 && !errorText;
   const now = new Date().toISOString();
   const { data, error } = await supabaseAdmin
     .from('notifications')
     .update({
-      status: 'sent',
-      sent_at: row.sent_at ?? now,
+      status: succeeded ? 'sent' : 'failed',
+      sent_at: succeeded ? row.sent_at ?? now : null,
       total_sent: result.accepted,
       onesignal_message_id: result.messageId,
       provider_accepted_at: result.accepted > 0 ? now : null,
-      push_error: result.error ? result.error.slice(0, 500) : null,
+      push_error: succeeded ? null : errorText!.slice(0, 500),
       push_attempts: attempt,
     })
     .eq('id', row.id)
@@ -115,10 +135,10 @@ const deliverStoredNotification = async (
 
   if (error) throw new NotificationAdminError(error.message, 500);
 
-  await recordAudit(row.id, actorId, attempt > 1 ? 'retried' : 'sent', {
+  await recordAudit(row.id, actorId, succeeded ? (attempt > 1 ? 'retried' : 'sent') : 'failed', {
     attempt,
     provider_accepted: result.accepted,
-    provider_error: result.error,
+    provider_error: errorText,
     onesignal_message_id: result.messageId,
   });
 
@@ -129,8 +149,9 @@ const deliverStoredNotification = async (
 
 export const createCampaign = async (body: unknown, actorId: string): Promise<AnyObject> => {
   const { record, mode } = validateCampaignInput(body);
-  const status = mode === 'draft' ? 'draft' : mode === 'schedule' ? 'scheduled' : 'sent';
-  const now = new Date().toISOString();
+  // A send starts as a draft so the row is never published before the provider
+  // response; deliverStoredNotification moves it to sent or failed.
+  const status = mode === 'draft' ? 'draft' : mode === 'schedule' ? 'scheduled' : 'draft';
 
   const { data, error } = await supabaseAdmin
     .from('notifications')
@@ -138,7 +159,7 @@ export const createCampaign = async (body: unknown, actorId: string): Promise<An
       ...record,
       status,
       created_by: actorId,
-      sent_at: mode === 'send' ? now : null,
+      sent_at: null,
       total_sent: 0,
       total_clicks: 0,
       push_attempts: 0,
@@ -170,7 +191,11 @@ export const listCampaigns = async (query: unknown) => {
       'id, title_en, title_bn, body_en, body_bn, image_url, action_link, type, channel, priority, status, target_user_id, target_rules, meta_data, total_sent, total_clicks, delivered_count, failed_count, push_error, push_attempts, onesignal_message_id, delivery_checked_at, scheduled_at, sent_at, expires_at, created_at, created_by, event_code',
       { count: 'exact' }
     )
-    .or('created_by.not.is.null,target_user_id.is.null')
+    // Only admin-authored campaigns belong here. Per-user notifications (for
+    // example urgent notices created through notify()) also carry created_by
+    // but have target_user_id and no campaign audience rules.
+    .not('created_by', 'is', null)
+    .is('target_user_id', null)
     .gte('created_at', filters.from)
     .lt('created_at', filters.to)
     .order('created_at', { ascending: false });
@@ -277,14 +302,16 @@ export const updateCampaign = async (
     );
   }
 
-  const status = mode === 'draft' ? 'draft' : mode === 'schedule' ? 'scheduled' : 'sent';
+  // Sending starts from draft; deliverStoredNotification publishes it only
+  // after a successful provider response.
+  const status = mode === 'schedule' ? 'scheduled' : 'draft';
 
   const { data, error } = await supabaseAdmin
     .from('notifications')
     .update({
       ...record,
       status,
-      sent_at: mode === 'send' ? current.sent_at ?? new Date().toISOString() : null,
+      sent_at: null,
     })
     .eq('id', id)
     .select()
@@ -341,15 +368,19 @@ export const sendCampaign = async (id: string, actorId: string): Promise<AnyObje
 };
 
 /**
- * A retry re-sends the same stored notification with a fresh idempotency key,
- * so OneSignal does not drop it as a duplicate of the first attempt.
+ * A retry re-sends the same stored notification under the next attempt number,
+ * so the derived idempotency key is new and OneSignal does not drop it as a
+ * duplicate of the first attempt.
  */
 export const retryCampaign = async (id: string, actorId: string): Promise<AnyObject> => {
   const current = await loadNotification(id);
   const attempts = Number(current.push_attempts ?? 0);
 
-  if (current.status !== 'sent') {
-    throw new NotificationAdminError('Only a published notification can be retried', 409);
+  if (!['sent', 'failed'].includes(String(current.status))) {
+    throw new NotificationAdminError(
+      'Only a sent or failed notification can be retried',
+      409
+    );
   }
   if (attempts >= MAX_PUSH_ATTEMPTS) {
     throw new NotificationAdminError(

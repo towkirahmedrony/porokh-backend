@@ -5,6 +5,7 @@ import {
   notifyPremiumExpiring,
   sendCampaignPush,
 } from '../features/notifications/notifications.service';
+import { pushFailureReason, recordAudit } from '../features/notifications/notifications.admin.service';
 
 const BATCH = 500;
 
@@ -221,6 +222,11 @@ export const initNotificationCron = () => {
         }
 
         const attempt = Number(campaign.push_attempts ?? 0) + 1;
+        await recordAudit(campaign.id, null, 'send_attempted', {
+          attempt,
+          target_rules: campaign.target_rules ?? {},
+        });
+
         // Any tick that repeats this delivery is stopped by the provider-side
         // idempotency key, so an overlapping or restarted worker cannot double
         // send a scheduled notification.
@@ -235,28 +241,39 @@ export const initNotificationCron = () => {
           targetRules: campaign.target_rules,
           type: campaign.type,
           priority: campaign.priority === 'high' ? 'high' : 'normal',
+          attempt,
         });
 
+        const errorText = pushFailureReason(result);
+        const succeeded = Boolean(result.messageId) && result.accepted > 0 && !errorText;
         const deliveredAt = new Date().toISOString();
         const { error: updateError } = await supabaseAdmin
           .from('notifications')
           .update({
-            status: 'sent',
-            sent_at: deliveredAt,
+            status: succeeded ? 'sent' : 'failed',
+            sent_at: succeeded ? deliveredAt : null,
             total_sent: result.accepted,
             onesignal_message_id: result.messageId,
             provider_accepted_at: result.accepted > 0 ? deliveredAt : null,
-            push_error: result.error ? result.error.slice(0, 500) : null,
+            push_error: succeeded ? null : errorText!.slice(0, 500),
             push_attempts: attempt,
           })
           .eq('id', campaign.id)
           .eq('status', 'scheduled');
 
         if (updateError) {
-          console.error(`Failed to mark campaign ${campaign.id} as sent:`, updateError);
+          console.error(`Failed to update campaign ${campaign.id} after send:`, updateError);
         } else {
+          await recordAudit(campaign.id, null, succeeded ? 'sent' : 'failed', {
+            attempt,
+            provider_accepted: result.accepted,
+            provider_error: errorText,
+            onesignal_message_id: result.messageId,
+          });
           console.log(
-            `✅ Campaign "${campaign.title_en || campaign.title_bn}" accepted for ${result.accepted} devices.`
+            succeeded
+              ? `✅ Campaign "${campaign.title_en || campaign.title_bn}" accepted for ${result.accepted} devices.`
+              : `❌ Campaign "${campaign.title_en || campaign.title_bn}" failed: ${errorText}`
           );
         }
       }

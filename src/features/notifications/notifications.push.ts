@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import type { BilingualCopy, NotificationPriority } from './notifications.types';
 
 /**
@@ -80,6 +81,42 @@ export const chunkExternalIds = (
 
 const nonEmpty = (value: string | null | undefined): string =>
   String(value ?? '').trim();
+
+const IDEMPOTENCY_NAMESPACE = 'porokh:notification:idempotency:v1';
+
+/**
+ * OneSignal requires `idempotency_key` to be a real UUID, not an arbitrary
+ * string. The key is derived from the notification, attempt and chunk so it is
+ * stable for a repeated send but changes on a retry or a second chunk.
+ *
+ * The digest is formatted as a UUID with the version-5 nibble and RFC 4122
+ * variant bits set, which is what the provider validates.
+ */
+export const buildNotificationIdempotencyKey = (
+  notificationId: string,
+  attempt: number,
+  chunkIndex = 0
+): string => {
+  const id = String(notificationId ?? '').trim();
+  if (!id) throw new Error('Notification id is required for an idempotency key');
+
+  const normalizedAttempt = Math.max(1, Math.floor(Number(attempt) || 1));
+  const normalizedChunk = Math.max(0, Math.floor(Number(chunkIndex) || 0));
+  const seed = `${IDEMPOTENCY_NAMESPACE}|${id}|${normalizedAttempt}|${normalizedChunk}`;
+
+  const bytes = Buffer.from(createHash('sha256').update(seed).digest().subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+  const hex = bytes.toString('hex');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join('-');
+};
 
 /**
  * Builds the create-message body for one chunk of recipients.
