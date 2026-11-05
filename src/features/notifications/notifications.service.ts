@@ -279,6 +279,64 @@ const deliverPushForUser = async (
 const PUSH_AUDIENCE_PAGE = 1000;
 const PUSH_AUDIENCE_MAX_PAGES = 100;
 
+const isPremiumProfile = (profile: AnyObject): boolean =>
+  profile.subscription_status === 'premium' ||
+  profile.subscription_status === 'active';
+
+/**
+ * Campaign targeting is applied to the profile, not to the device: a user with
+ * two Android phones must match or miss the campaign as one person.
+ */
+export const matchesCampaignTargetRules = (
+  rules: unknown,
+  profile: AnyObject
+): boolean => {
+  if (!rules || typeof rules !== 'object' || Array.isArray(rules)) return true;
+
+  const target = rules as AnyObject;
+  const specificUserId = String(target.specific_user_id ?? '').trim();
+  if (specificUserId && specificUserId !== String(profile.id)) return false;
+
+  const subscription = String(target.subscription_status ?? '').trim();
+  if (subscription === 'premium' && !isPremiumProfile(profile)) return false;
+  if (subscription === 'free' && isPremiumProfile(profile)) return false;
+
+  const classLevels = Array.isArray(target.class_level)
+    ? target.class_level.map((value) => String(value))
+    : [];
+  if (
+    classLevels.length > 0 &&
+    !classLevels.includes('all') &&
+    !classLevels.includes(String(profile.class_level ?? ''))
+  ) {
+    return false;
+  }
+
+  const boards = Array.isArray(target.education_board)
+    ? target.education_board.map((value) => String(value))
+    : [];
+  if (
+    boards.length > 0 &&
+    !boards.includes('all') &&
+    !boards.includes(String(profile.education_board ?? ''))
+  ) {
+    return false;
+  }
+
+  const inactiveDays = Number(target.last_active_days_ago);
+  if (Number.isFinite(inactiveDays) && inactiveDays > 0) {
+    const lastActive = new Date(String(profile.last_active_at ?? '')).getTime();
+    if (
+      Number.isFinite(lastActive) &&
+      lastActive > Date.now() - inactiveDays * 24 * 60 * 60 * 1000
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
 /**
  * Android installations recorded in `user_devices`.
  *
@@ -331,6 +389,7 @@ export const sendCampaignPush = async (campaign: {
   imageUrl?: string | null;
   actionLink?: string | null;
   targetUserId?: string | null;
+  targetRules?: unknown;
   priority?: NotificationPriority;
 }): Promise<number> => {
   try {
@@ -342,7 +401,9 @@ export const sendCampaignPush = async (campaign: {
     for (const userChunk of chunk(audience, INSERT_CHUNK_SIZE)) {
       const { data, error } = await getAdmin()
         .from('profiles')
-        .select('id, settings')
+        .select(
+          'id, settings, class_level, education_board, subscription_status, last_active_at'
+        )
         .in('id', userChunk);
 
       if (error) {
@@ -354,7 +415,12 @@ export const sendCampaignPush = async (campaign: {
         const preferences = normalizePreferences(
           (profile.settings as AnyObject | null)?.notification_preferences
         );
-        if (preferences.push) allowed.push(String(profile.id));
+        if (
+          preferences.push &&
+          matchesCampaignTargetRules(campaign.targetRules, profile)
+        ) {
+          allowed.push(String(profile.id));
+        }
       });
     }
 
@@ -792,23 +858,27 @@ export const saveUserDeviceToken = async (userId: string, payload: IDeviceTokenP
     }
   }
 
-  const { data, error } = await getAdmin()
-    .from('user_devices')
-    .upsert(
-      {
-        user_id: userId,
-        device_id: deviceId,
-        device_name: payload.device_name || 'Web Client',
-        os_or_browser: payload.os_or_browser || 'Unknown',
-        fcm_token: fcmToken,
-        platform,
-        ip_address: payload.ip_address || null,
-        last_active_at: new Date().toISOString(),
-        is_trusted: true,
-      },
-      { onConflict: 'user_id,device_id' }
-    )
-    .select();
+  const device = {
+    user_id: userId,
+    device_id: deviceId,
+    device_name: payload.device_name || 'Web Client',
+    os_or_browser: payload.os_or_browser || 'Unknown',
+    fcm_token: fcmToken,
+    platform,
+    ip_address: payload.ip_address || null,
+    last_active_at: new Date().toISOString(),
+    is_trusted: true,
+  };
+
+  // The live schema may not enforce a unique (user_id, device_id) pair, so do
+  // not make registration depend on an ON CONFLICT target that may not exist.
+  const { data, error } = existing?.id
+    ? await getAdmin()
+        .from('user_devices')
+        .update(device)
+        .eq('id', existing.id)
+        .select()
+    : await getAdmin().from('user_devices').insert([device]).select();
 
   if (error) {
     console.error('Device token save failed:', error);
