@@ -24,10 +24,6 @@ router.put('/campaigns/:id', NotificationAdminController.updateCampaign);
 router.patch('/campaigns/:id/cancel', NotificationAdminController.cancelCampaign);
 router.post('/campaigns/:id/send', NotificationAdminController.sendCampaign);
 router.post('/campaigns/:id/retry', NotificationAdminController.retryCampaign);
-router.post(
-  '/campaigns/:id/refresh-stats',
-  NotificationAdminController.refreshDeliveryStats
-);
 router.delete('/campaigns/:id', NotificationAdminController.deleteCampaign);
 
 export default router;

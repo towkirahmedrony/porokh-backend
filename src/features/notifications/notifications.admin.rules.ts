@@ -535,7 +535,7 @@ export interface NotificationStats {
   draft: number;
   cancelled: number;
   failed: number;
-  /** Devices OneSignal accepted the message for. */
+  /** Devices FCM accepted the message for. */
   providerAccepted: number;
   /** Devices the provider reported as delivered; only meaningful once refreshed. */
   delivered: number;

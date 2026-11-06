@@ -87,14 +87,6 @@ export const retryCampaign = async (req: Request, res: Response): Promise<void> 
     'Notification retried'
   );
 
-export const refreshDeliveryStats = async (req: Request, res: Response): Promise<void> =>
-  handle(
-    res,
-    () => NotificationAdminService.refreshDeliveryStats(req.params.id, req.user!.id),
-    200,
-    'Delivery stats refreshed'
-  );
-
 export const deleteCampaign = async (req: Request, res: Response): Promise<void> =>
   handle(
     res,

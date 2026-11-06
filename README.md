@@ -95,6 +95,53 @@ starting a new attempt remain strictly bounded by the authoritative deadline.
 - `exam_history.status` accepts `passed`, `failed`, `pending` and
   `fraud_detected`.
 
+## Push notifications (Firebase Cloud Messaging)
+
+Push is FCM only. The backend writes the notification row and then sends to the
+FCM registration tokens in `public.user_devices`; there is no third-party push
+provider in the path and no per-device token on any client response.
+
+### Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `FIREBASE_PROJECT_ID` | Firebase project that owns the Android app. |
+| `FIREBASE_CLIENT_EMAIL` | Service-account client email from the private key JSON. |
+| `FIREBASE_PRIVATE_KEY` | Service-account private key, `\n` escapes preserved. |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | Optional single-variable form; overrides the three above. |
+
+Missing credentials do not crash the server: push is reported as
+`fcm_not_configured` in the notification row's `push_error` and every other
+feature keeps working.
+
+### Delivery contract
+
+- `src/config/fcm.ts` batches at FCM's 500-token limit, retries only transient
+errors with exponential backoff, and classifies per-token failures.
+- Tokens FCM reports as `registration-token-not-registered`,
+`invalid-registration-token`, `invalid-argument` or `mismatched-credential` are
+removed from their device row (`fcm_token = NULL`); the row itself survives so
+the security history and the "new device login" dedupe stay intact.
+- `notifications.total_sent` is *devices FCM accepted*. It is not a delivery
+receipt, so the API exposes no delivery or open rate; taps come from the client's
+read acknowledgement (`total_clicks`).
+- Scheduled sends are claimed with a compare-and-set on `push_attempts`, so two
+workers cannot send the same row twice.
+
+### Endpoints
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `POST` | `/api/v1/notifications/device-token` | Registers `{device_id, fcm_token, platform, device_name?}` for the bearer's user. |
+| `DELETE` | `/api/v1/notifications/device-token` | Deactivates this installation on sign-out or account switch. |
+| `GET` | `/api/v1/notifications/campaigns` | Admin notification history with status and counts. |
+| `POST` | `/api/v1/notifications/campaigns` | Create (draft), schedule or send immediately. |
+| `POST` | `/api/v1/notifications/campaigns/:id/send` | Send or retry a stored notification. |
+| `POST` | `/api/v1/notifications/campaigns/:id/retry` | Retry a failed send (3 attempts max). |
+
+Admin routes require `admin` plus `USER_MANAGE`; audience resolution and token
+lookup happen server-side, so a request cannot address arbitrary users.
+
 ## Migrations
 
 `supabase/migrations/` is a history mirror of the live project. Files are

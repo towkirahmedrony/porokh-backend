@@ -13,13 +13,17 @@ import {
 } from './notifications.types';
 import {
   PushCopy,
-  buildNotificationIdempotencyKey,
-  buildOneSignalMessage,
-  chunkExternalIds,
+  PushDevice,
+  PushLanguage,
+  buildFcmPushPayload,
   normalizeDevicePlatform,
-  normalizeExternalIds,
+  normalizePushLanguage,
 } from './notifications.push';
-import { sendOneSignalMessage } from '../../config/onesignal';
+import {
+  isFcmConfigured,
+  normalizePushTokens,
+  sendFcmMulticast,
+} from '../../config/fcm';
 import { AudienceRules, matchesAudienceRules } from './notifications.admin.rules';
 
 type AnyObject = Record<string, any>;
@@ -192,7 +196,22 @@ export const updateNotificationPreferences = async (
 
 // --- Push --------------------------------------------------------------------
 
-type PushOutcome = { sent: number; messageId: string | null; error: string | null };
+type PushOutcome = {
+  /** Devices FCM accepted the message for. Acceptance is not proof of display. */
+  sent: number;
+  failed: number;
+  invalidTokens: number;
+  messageId: string | null;
+  error: string | null;
+};
+
+const emptyPushOutcome = (error: string | null = null): PushOutcome => ({
+  sent: 0,
+  failed: 0,
+  invalidTokens: 0,
+  messageId: null,
+  error,
+});
 
 const getPushCapReached = async (userId: string): Promise<boolean> => {
   const { count, error } = await getAdmin()
@@ -208,52 +227,157 @@ const getPushCapReached = async (userId: string): Promise<boolean> => {
   return (count ?? 0) >= MAX_PUSH_PER_USER_PER_DAY;
 };
 
-/**
- * Sends one payload to every device subscribed to the given Supabase users.
- *
- * OneSignal resolves the External IDs to subscriptions, so no token lookup is
- * needed here and an account with two phones is served by the same call.
- */
-export const sendPushToUsers = async (
-  userIds: string | string[],
-  copy: PushCopy,
-  options: { notificationId?: string | null; attempt?: number } = {}
-): Promise<PushOutcome> => {
-  const externalIds = normalizeExternalIds(
-    Array.isArray(userIds) ? userIds : [userIds]
-  );
-  if (externalIds.length === 0) return { sent: 0, messageId: null, error: null };
+/** Text language per account, used to localise the system notification. */
+const loadProfileLanguages = async (
+  userIds: string[]
+): Promise<Map<string, PushLanguage>> => {
+  const byUser = new Map<string, PushLanguage>();
 
-  let sent = 0;
-  let messageId: string | null = null;
-  let lastError: string | null = null;
+  for (const idChunk of chunk(userIds, INSERT_CHUNK_SIZE)) {
+    const { data, error } = await getAdmin()
+      .from('profiles')
+      .select('id, language_preference')
+      .in('id', idChunk);
 
-  for (const [index, aliasChunk] of chunkExternalIds(externalIds).entries()) {
-    try {
-      const result = await sendOneSignalMessage(
-        buildOneSignalMessage(aliasChunk, copy, {
-          // One key per chunk: reusing a single key would make OneSignal drop
-          // every chunk after the first as a duplicate message. The key must be
-          // a UUID, so it is derived rather than assembled with separators.
-          idempotencyKey: options.notificationId
-            ? buildNotificationIdempotencyKey(
-                options.notificationId,
-                options.attempt ?? 1,
-                index
-              )
-            : null,
-        })
-      );
-
-      sent += result.recipients;
-      messageId = messageId ?? result.id;
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : 'push failed';
-      console.error('[notify] OneSignal push failed:', lastError);
+    if (error) {
+      console.error('[notify] language lookup failed:', error.message);
+      continue;
     }
+
+    (data ?? []).forEach((row: AnyObject) => {
+      byUser.set(String(row.id), normalizePushLanguage(row.language_preference));
+    });
   }
 
-  return { sent, messageId, error: lastError };
+  return byUser;
+};
+
+/**
+ * Every active registration token for the given accounts, de-duplicated by
+ * token. This is the only place the server decides who can receive a push:
+ * tokens are read with the service role and never returned to a client.
+ */
+export const loadDeviceTokens = async (userIds: string[]): Promise<PushDevice[]> => {
+  const ids = normalizeUserIds(userIds);
+  if (ids.length === 0) return [];
+
+  const languages = await loadProfileLanguages(ids);
+  const devices = new Map<string, PushDevice>();
+
+  for (const idChunk of chunk(ids, INSERT_CHUNK_SIZE)) {
+    const { data, error } = await getAdmin()
+      .from('user_devices')
+      .select('user_id, fcm_token, platform')
+      .in('user_id', idChunk)
+      .not('fcm_token', 'is', null);
+
+    if (error) {
+      console.error('[notify] device token lookup failed:', error.message);
+      continue;
+    }
+
+    (data ?? []).forEach((row: AnyObject) => {
+      const token = String(row.fcm_token ?? '').trim();
+      if (!token) return;
+
+      devices.set(token, {
+        token,
+        platform: normalizeDevicePlatform(row.platform),
+        language: languages.get(String(row.user_id)) ?? 'bn',
+      });
+    });
+  }
+
+  return Array.from(devices.values());
+};
+
+/**
+ * Removes tokens FCM reported as unregistered or invalid. The device row is kept
+ * so the security history and the login dedupe key stay intact.
+ */
+const deactivateInvalidTokens = async (tokens: string[]): Promise<void> => {
+  const unique = normalizePushTokens(tokens);
+  if (unique.length === 0) return;
+
+  for (const tokenChunk of chunk(unique, INSERT_CHUNK_SIZE)) {
+    const { error } = await getAdmin()
+      .from('user_devices')
+      .update({ fcm_token: null, last_active_at: new Date().toISOString() })
+      .in('fcm_token', tokenChunk);
+
+    if (error) {
+      console.error('[notify] invalid token cleanup failed:', error.message);
+    }
+  }
+};
+
+/**
+ * Sends one payload to the given devices.
+ *
+ * Devices are grouped by platform and language because both change the payload:
+ * Android needs a system notification block for a terminated app, the web client
+ * renders its own from data-only pushes, and the text follows the recipient's
+ * stored language instead of fanning out a second message per language.
+ */
+export const sendPushToDevices = async (
+  devices: PushDevice[],
+  copy: PushCopy
+): Promise<PushOutcome> => {
+  if (devices.length === 0) return emptyPushOutcome();
+
+  if (!isFcmConfigured()) return emptyPushOutcome('fcm_not_configured');
+
+  const groups = new Map<string, string[]>();
+
+  for (const device of devices) {
+    const key = `${device.platform}:${device.language}`;
+    const tokens = groups.get(key) ?? [];
+    tokens.push(device.token);
+    groups.set(key, tokens);
+  }
+
+  const outcome = emptyPushOutcome();
+  const invalidTokens: string[] = [];
+
+  for (const [key, tokens] of groups) {
+    const [platform, language] = key.split(':') as [PushDevice['platform'], PushLanguage];
+
+    const result = await sendFcmMulticast(
+      tokens,
+      buildFcmPushPayload(copy, { platform, language })
+    );
+
+    outcome.sent += result.accepted;
+    outcome.failed += result.failed;
+    outcome.invalidTokens += result.invalidTokens.length;
+    outcome.messageId = outcome.messageId ?? result.messageIds[0] ?? null;
+    if (result.error) outcome.error = result.error;
+    invalidTokens.push(...result.invalidTokens);
+  }
+
+  await deactivateInvalidTokens(invalidTokens);
+
+  return outcome;
+};
+
+/** Resolves the accounts' tokens and sends. Never throws into the caller. */
+export const sendPushToUsers = async (
+  userIds: string | string[],
+  copy: PushCopy
+): Promise<PushOutcome> => {
+  const ids = normalizeUserIds(Array.isArray(userIds) ? userIds : [userIds]);
+  if (ids.length === 0) return emptyPushOutcome();
+
+  try {
+    const devices = await loadDeviceTokens(ids);
+    if (devices.length === 0) return emptyPushOutcome('no_registered_devices');
+
+    return await sendPushToDevices(devices, copy);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'push failed';
+    console.error('[notify] push failed:', message.slice(0, 300));
+    return emptyPushOutcome(message.slice(0, 300));
+  }
 };
 
 const deliverPushForUser = async (
@@ -267,21 +391,15 @@ const deliverPushForUser = async (
     priority?: NotificationPriority;
   }
 ): Promise<PushOutcome> =>
-  sendPushToUsers(
-    userId,
-    {
-      title: copy.title,
-      body: copy.body,
-      imageUrl: options.imageUrl,
-      actionLink: options.actionLink,
-      type: options.type,
-      notificationId: options.notificationId,
-      priority: options.priority,
-    },
-    // The record id makes a retried notify() for the same row a no-op instead
-    // of a second push.
-    { notificationId: options.notificationId, attempt: 1 }
-  );
+  sendPushToUsers(userId, {
+    title: copy.title,
+    body: copy.body,
+    imageUrl: options.imageUrl,
+    actionLink: options.actionLink,
+    type: options.type,
+    notificationId: options.notificationId,
+    priority: options.priority,
+  });
 
 // --- Campaign broadcasts -----------------------------------------------------
 
@@ -311,8 +429,9 @@ const AUDIENCE_MAX_PAGES = 100;
  * Registered platforms per account.
  *
  * `user_devices` records which installations this account opened the app on, so
- * it is the audience a campaign may target. It stores no push token: delivery
- * is addressed by the OneSignal External ID (the Supabase user id).
+ * it is the audience a campaign may target. Platform is read here; the tokens
+ * themselves are loaded separately and only for the accounts that survive the
+ * audience filter.
  */
 export const loadDevicePlatforms = async (): Promise<Map<string, Set<string>>> => {
   const byUser = new Map<string, Set<string>>();
@@ -346,15 +465,25 @@ export const loadDevicePlatforms = async (): Promise<Map<string, Set<string>>> =
 };
 
 /**
- * Result of one campaign delivery attempt. `accepted` counts devices OneSignal
- * accepted the message for, which is provider acceptance rather than proof of
- * delivery; `delivered` is only known after a delivery report refresh.
+ * Result of one campaign delivery attempt. `accepted` counts devices FCM accepted
+ * the message for, which is provider acceptance rather than proof a user saw it;
+ * no delivery or open rate is derived from it.
  */
 export type CampaignPushResult = {
   accepted: number;
+  failed: number;
+  invalidTokens: number;
   messageId: string | null;
   error: string | null;
 };
+
+const emptyCampaignResult = (error: string | null = null): CampaignPushResult => ({
+  accepted: 0,
+  failed: 0,
+  invalidTokens: 0,
+  messageId: null,
+  error,
+});
 
 /**
  * Delivers one bilingual campaign push and reports what the provider accepted.
@@ -372,13 +501,11 @@ export const sendCampaignPush = async (campaign: {
   targetRules?: unknown;
   type?: string | null;
   priority?: NotificationPriority;
-  /** Retries use a new attempt number so the provider does not drop the send. */
-  attempt?: number;
 }): Promise<CampaignPushResult> => {
   try {
     const devicePlatforms = await loadDevicePlatforms();
     if (devicePlatforms.size === 0) {
-      return { accepted: 0, messageId: null, error: 'no_registered_devices' };
+      return emptyCampaignResult('no_registered_devices');
     }
 
     const audience = Array.from(devicePlatforms.keys());
@@ -423,28 +550,24 @@ export const sendCampaignPush = async (campaign: {
     }
 
     if (allowed.length === 0) {
-      return { accepted: 0, messageId: null, error: 'no_matching_subscribers' };
+      return emptyCampaignResult('no_matching_subscribers');
     }
 
-    const outcome = await sendPushToUsers(
-      allowed,
-      {
-        title: {
-          bn: campaign.title_bn ?? campaign.title_en ?? '',
-          en: campaign.title_en ?? campaign.title_bn ?? '',
-        },
-        body: {
-          bn: campaign.body_bn ?? campaign.body_en ?? '',
-          en: campaign.body_en ?? campaign.body_bn ?? '',
-        },
-        imageUrl: campaign.imageUrl ?? null,
-        actionLink: campaign.actionLink ?? null,
-        type,
-        notificationId: campaign.id,
-        priority: campaign.priority,
+    const outcome = await sendPushToUsers(allowed, {
+      title: {
+        bn: campaign.title_bn ?? campaign.title_en ?? '',
+        en: campaign.title_en ?? campaign.title_bn ?? '',
       },
-      { notificationId: campaign.id, attempt: campaign.attempt ?? 1 }
-    );
+      body: {
+        bn: campaign.body_bn ?? campaign.body_en ?? '',
+        en: campaign.body_en ?? campaign.body_bn ?? '',
+      },
+      imageUrl: campaign.imageUrl ?? null,
+      actionLink: campaign.actionLink ?? null,
+      type,
+      notificationId: campaign.id,
+      priority: campaign.priority,
+    });
 
     if (outcome.error) {
       console.error('[notify] campaign push failed:', outcome.error);
@@ -452,13 +575,15 @@ export const sendCampaignPush = async (campaign: {
 
     return {
       accepted: outcome.sent,
+      failed: outcome.failed,
+      invalidTokens: outcome.invalidTokens,
       messageId: outcome.messageId,
       error: outcome.error,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'campaign push failed';
     console.error('[notify] campaign broadcast failed:', message);
-    return { accepted: 0, messageId: null, error: message };
+    return emptyCampaignResult(message);
   }
 };
 
