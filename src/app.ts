@@ -96,6 +96,8 @@ app.get('/health', (req: Request, res: Response) => {
 });
 
 // Application Routes (Standard API v1)
+import phoneVerifyRoutes from './modules/phone-verify/phone-verify.routes';
+app.use('/api/v1/phone', phoneVerifyRoutes);
 app.use('/api/v1/auth', authRoutes); 
 app.use('/api/v1/profiles', profileRoutes);
 
