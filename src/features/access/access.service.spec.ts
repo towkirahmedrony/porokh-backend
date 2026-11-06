@@ -1,6 +1,7 @@
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { dhakaDayKey } from '../../lib/utils/time';
 
 /**
  * Access administration rules (grants, quota configuration, usage reset and
@@ -17,7 +18,6 @@ const state: {
   updates: { table: string; patch: Row; filters: Row[] }[];
   orFilters: { table: string; expression: string }[];
   rpcCalls: { name: string; args: Row }[];
-  limitRpcError: boolean;
 } = {
   featureQuotas: [],
   grants: [],
@@ -46,6 +46,10 @@ const compare = (row: Row, filters: Row[]) =>
         return value === null ? actual === null || actual === undefined : String(actual) === String(value);
       case 'gte':
         return Date.parse(String(actual)) >= Date.parse(String(value));
+      case 'lt':
+        return Date.parse(String(actual)) < Date.parse(String(value));
+      case 'gt':
+        return Date.parse(String(actual)) > Date.parse(String(value));
       case 'not':
         return actual !== null && actual !== undefined;
       default:
@@ -66,6 +70,8 @@ const createBuilder = (table: string) => {
   let inserted: Row[] | null = null;
   let patch: Row | null = null;
   let countHead = false;
+  let rangeFrom = 0;
+  let rangeTo = Number.POSITIVE_INFINITY;
 
   const matching = () => rowsFor(table).filter((row) => compare(row, filters));
 
@@ -93,7 +99,8 @@ const createBuilder = (table: string) => {
       return { data: null, error: null, count: rows.length };
     }
 
-    return { data: mode === 'single' ? rows[0] ?? null : rows, error: null, count: rows.length };
+    const page = rows.slice(rangeFrom, rangeTo + 1);
+    return { data: mode === 'single' ? page[0] ?? null : page, error: null, count: rows.length };
   };
 
   const builder: any = {
@@ -122,7 +129,14 @@ const createBuilder = (table: string) => {
       return builder;
     },
     lte: () => builder,
-    gt: () => builder,
+    lt: (column: string, value: any) => {
+      filters.push({ column, op: 'lt', value });
+      return builder;
+    },
+    gt: (column: string, value: any) => {
+      filters.push({ column, op: 'gt', value });
+      return builder;
+    },
     not: (column: string) => {
       filters.push({ column, op: 'not', value: null });
       return builder;
@@ -133,6 +147,11 @@ const createBuilder = (table: string) => {
     },
     order: () => builder,
     limit: () => builder,
+    range: (from: number, to: number) => {
+      rangeFrom = from;
+      rangeTo = to;
+      return builder;
+    },
     insert: (rows: Row[]) => {
       inserted = rows;
       return builder;
@@ -189,13 +208,6 @@ const fakeSupabase = {
         },
         error: null,
       };
-    }
-
-    if (name === 'count_users_at_limit_today') {
-      if (state.limitRpcError) {
-        return { data: null, error: { message: 'function does not exist' } };
-      }
-      return { data: 4, error: null };
     }
 
     return { data: null, error: null };
@@ -256,7 +268,6 @@ beforeEach(() => {
   state.updates = [];
   state.orFilters = [];
   state.rpcCalls = [];
-  state.limitRpcError = false;
   seq = 0;
 });
 
@@ -398,9 +409,9 @@ test('usage reset uses the Asia/Dhaka day boundary, not the server timezone', as
   const now = new Date('2026-10-22T18:30:00.000Z');
 
   state.usageEvents = [
-    { id: 'u1', user_id: 'user-1', feature: 'exam_start', usage_date: '2026-10-22T18:10:00.000Z', refunded_at: null },
-    { id: 'u2', user_id: 'user-1', feature: 'exam_start', usage_date: '2026-10-22T17:50:00.000Z', refunded_at: null },
-    { id: 'u3', user_id: 'user-2', feature: 'exam_start', usage_date: '2026-10-22T18:10:00.000Z', refunded_at: null },
+    { id: 'u1', user_id: 'user-1', feature: 'exam_start', usage_date: '2026-10-23', refunded_at: null },
+    { id: 'u2', user_id: 'user-1', feature: 'exam_start', usage_date: '2026-10-22', refunded_at: null },
+    { id: 'u3', user_id: 'user-2', feature: 'exam_start', usage_date: '2026-10-23', refunded_at: null },
   ];
 
   const result = await resetUsage('user-1', 'exam_start', now);
@@ -435,13 +446,12 @@ test('overview keeps grants without an expiry active', async () => {
   assert.equal(overview.active_grants, 2);
 });
 
-test('overview falls back to usage events when the counting function is unavailable', async () => {
-  state.limitRpcError = true;
+test('overview counts users at the daily limit from today usage events', async () => {
   state.usageEvents = [
-    { id: 'e1', user_id: 'user-1', feature: 'exam_start', usage_date: new Date().toISOString(), refunded_at: null },
-    { id: 'e2', user_id: 'user-1', feature: 'exam_start', usage_date: new Date().toISOString(), refunded_at: null },
-    { id: 'e3', user_id: 'user-1', feature: 'exam_start', usage_date: new Date().toISOString(), refunded_at: null },
-    { id: 'e4', user_id: 'user-2', feature: 'exam_start', usage_date: new Date().toISOString(), refunded_at: null },
+    { id: 'e1', user_id: 'user-1', feature: 'exam_start', usage_date: dhakaDayKey(), refunded_at: null },
+    { id: 'e2', user_id: 'user-1', feature: 'exam_start', usage_date: dhakaDayKey(), refunded_at: null },
+    { id: 'e3', user_id: 'user-1', feature: 'exam_start', usage_date: dhakaDayKey(), refunded_at: null },
+    { id: 'e4', user_id: 'user-2', feature: 'exam_start', usage_date: dhakaDayKey(), refunded_at: null },
   ];
 
   const overview = await getOverview();

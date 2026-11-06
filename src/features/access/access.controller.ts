@@ -17,7 +17,11 @@ export const getQuotas = catchAsync(async (req: Request, res: Response) => {
 });
 
 export const updateQuota = catchAsync(async (req: Request, res: Response) => {
-  const result = await accessService.updateQuota(req.params.feature, req.body);
+  const result = await accessService.updateQuota(
+    req.params.feature,
+    req.body,
+    (req as any).user?.id
+  );
   sendResponse(res, { statusCode: 200, success: true, message: 'Quota updated', data: result });
 });
 

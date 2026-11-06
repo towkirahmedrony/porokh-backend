@@ -71,14 +71,30 @@ export const createQuest = async (payload: CreateQuestDTO) => {
 };
 
 // ================= Manual Override =================
-export const grantManualSubscription = async (payload: ManualOverrideDTO) => {
-  const { data: user, error: userError } = await supabase
-    .from('profiles')
-    .select('id')
-    .or(`email.eq.${payload.user_identifier},phone_number.eq.${payload.user_identifier}`)
-    .single();
+/**
+ * Resolves the target account by exact email or phone match.
+ *
+ * The previous implementation interpolated the identifier into a PostgREST
+ * `or` filter, where a comma or parenthesis becomes filter syntax. Exact-match
+ * queries keep the identifier as data.
+ */
+const findUserByIdentifier = async (identifier: string) => {
+  const value = identifier.trim();
+  if (!value) throw new Error('User not found');
 
-  if (userError || !user) throw new Error('User not found');
+  const byEmail = await supabase.from('profiles').select('id').eq('email', value).limit(1);
+  if (!byEmail.error && byEmail.data && byEmail.data.length > 0) return byEmail.data[0];
+
+  const byPhone = await supabase.from('profiles').select('id').eq('phone_number', value).limit(1);
+  if (!byPhone.error && byPhone.data && byPhone.data.length > 0) return byPhone.data[0];
+
+  return null;
+};
+
+export const grantManualSubscription = async (payload: ManualOverrideDTO) => {
+  const user = await findUserByIdentifier(String(payload?.user_identifier ?? ''));
+
+  if (!user) throw new Error('User not found');
 
   const { data: plan, error: planError } = await supabase
     .from('subscription_plans')

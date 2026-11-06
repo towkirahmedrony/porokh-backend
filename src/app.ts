@@ -210,6 +210,8 @@ interface CustomError extends Error {
   code?: string;
   errorCode?: string;
   details?: unknown;
+  /** Set only on errors whose message is a hand-written, non-sensitive constant. */
+  exposeMessage?: boolean;
 }
 
 /**
@@ -260,7 +262,9 @@ app.use((err: CustomError, req: Request, res: Response, next: NextFunction) => {
     statusCode >= 500
       ? schemaDrift
         ? 'A required service dependency is not available'
-        : 'Internal Server Error'
+        : err.exposeMessage && err.message
+          ? err.message
+          : 'Internal Server Error'
       : err.message || 'Request failed';
 
   // Clients gate the paywall and the "already attempted" result link on a

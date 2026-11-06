@@ -21,3 +21,7 @@ export const endOfDhakaDay = (now: Date = new Date()): Date =>
 export const startOfDhakaDayIso = (now?: Date): string => startOfDhakaDay(now).toISOString();
 
 export const endOfDhakaDayIso = (now?: Date): string => endOfDhakaDay(now).toISOString();
+
+/** The Asia/Dhaka calendar day (YYYY-MM-DD) containing `now`. */
+export const dhakaDayKey = (now: Date = new Date()): string =>
+  new Date(startOfDhakaDay(now).getTime() + DHAKA_UTC_OFFSET_MS).toISOString().slice(0, 10);
