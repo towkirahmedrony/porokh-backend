@@ -11,8 +11,9 @@ export interface IDeviceTokenPayload {
   device_name?: string;
   os_or_browser?: string;
   /**
-   * Legacy FCM token. Push delivery now goes through OneSignal External IDs, so
-   * clients no longer send it; the column is kept for existing device rows.
+   * FCM registration token for this installation. It is the only push address:
+   * the backend resolves recipients from these tokens, so a null token means the
+   * installation is registered but cannot receive push.
    */
   fcm_token?: string | null;
   /** Defaults to `web` so existing web clients keep their behaviour. */

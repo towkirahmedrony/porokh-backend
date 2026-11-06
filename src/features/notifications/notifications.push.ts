@@ -1,28 +1,47 @@
-import { createHash } from 'crypto';
-import type { BilingualCopy, NotificationPriority } from './notifications.types';
+import type { MulticastMessage } from 'firebase-admin/messaging';
+import type { NotificationPriority } from './notifications.types';
 
 /**
- * OneSignal payload shaping.
+ * FCM payload shaping.
  *
- * A push carries identifiers and routing hints only. The OS renders the title
- * and body, but the record those fields point at is always fetched from Supabase
- * through RLS, so a leaked payload cannot expose another account's content.
+ * A push carries routing hints and the notification text only. The record the
+ * fields point at is always fetched from Supabase through RLS, so a payload that
+ * leaks cannot expose another account's content.
  *
- * Recipients are addressed as `include_aliases.external_id` — the Supabase user
- * UUID the device logged in with. OneSignal then reaches every subscription of
- * that user, which is what makes multi-device delivery work without a token
- * table here.
+ * Two payload shapes exist because the two clients render differently:
+ *
+ * - Android gets a `notification` block, which the system displays even when the
+ *   app is terminated, plus a data block with the canonical routing fields.
+ * - The web client gets data-only pushes, which its service worker renders, and
+ *   no `notification` block, so one message is never shown twice.
  */
 
-/** Documented maximum number of `external_id` aliases per create-message call. */
-export const PUSH_ALIAS_LIMIT = 20_000;
+/** Channel created by the Android app for normal-priority notifications. */
+export const ANDROID_NOTIFICATION_CHANNEL_ID = 'porokh_default';
+
+/** Channel created by the Android app for high-priority notifications. */
+export const ANDROID_URGENT_CHANNEL_ID = 'porokh_urgent';
+
+/** Delivery window for a push; a stale reminder must not arrive a week late. */
+const PUSH_TTL_MS = 24 * 60 * 60 * 1000;
+
+const DEFAULT_ACTION_LINK = '/';
 
 /** Transport recorded for an installation in `user_devices`. */
 export type DevicePlatform = 'web' | 'android';
 
+/** Text language of one push. Bangla is the default for this product. */
+export type PushLanguage = 'bn' | 'en';
+
+export type PushDevice = {
+  token: string;
+  platform: DevicePlatform;
+  language: PushLanguage;
+};
+
 export type PushCopy = {
-  title: BilingualCopy;
-  body: BilingualCopy;
+  title: { bn: string; en: string };
+  body: { bn: string; en: string };
   imageUrl?: string | null;
   actionLink?: string | null;
   type: string;
@@ -30,135 +49,119 @@ export type PushCopy = {
   priority?: NotificationPriority;
 };
 
-export type OneSignalPushMessage = {
-  target_channel: 'push';
-  include_aliases: { external_id: string[] };
-  headings: { en: string; bn: string };
-  contents: { en: string; bn: string };
-  data: Record<string, string>;
-  big_picture?: string;
-  priority?: number;
-  idempotency_key?: string;
-};
-
-/** OneSignal priority 10 = high, which wakes a dozing device immediately. */
-const ONESIGNAL_HIGH_PRIORITY = 10;
+export type FcmPushPayload = Omit<MulticastMessage, 'tokens'>;
 
 export const normalizeDevicePlatform = (value: unknown): DevicePlatform =>
   String(value ?? '').trim().toLowerCase() === 'android' ? 'android' : 'web';
 
-/**
- * Trims and de-duplicates recipient ids. The same user must appear once even if
- * two registrations point at them, otherwise the alias list carries duplicates.
- */
-export const normalizeExternalIds = (
-  values: Array<string | null | undefined>
-): string[] => {
-  const seen = new Set<string>();
+export const normalizePushLanguage = (value: unknown): PushLanguage => {
+  const normalized = String(value ?? '').trim().toLowerCase();
 
-  for (const value of values) {
-    const id = String(value ?? '').trim();
-    if (id) seen.add(id);
-  }
-
-  return Array.from(seen);
-};
-
-/** Splits a recipient list into requests OneSignal will accept. */
-export const chunkExternalIds = (
-  ids: string[],
-  size = PUSH_ALIAS_LIMIT
-): string[][] => {
-  const chunkSize = Math.max(1, Math.floor(size));
-  const chunks: string[][] = [];
-
-  for (let index = 0; index < ids.length; index += chunkSize) {
-    chunks.push(ids.slice(index, index + chunkSize));
-  }
-
-  return chunks;
+  // Anything that is not an explicit English preference is served in Bangla:
+  // a missing or malformed value must not push English to a Bangla user.
+  return normalized.startsWith('en') ? 'en' : 'bn';
 };
 
 const nonEmpty = (value: string | null | undefined): string =>
   String(value ?? '').trim();
 
-const IDEMPOTENCY_NAMESPACE = 'porokh:notification:idempotency:v1';
-
 /**
- * OneSignal requires `idempotency_key` to be a real UUID, not an arbitrary
- * string. The key is derived from the notification, attempt and chunk so it is
- * stable for a repeated send but changes on a retry or a second chunk.
- *
- * The digest is formatted as a UUID with the version-5 nibble and RFC 4122
- * variant bits set, which is what the provider validates.
+ * Only an in-app route may be attached. An absolute or protocol-relative URL is
+ * replaced with the home route so a payload can never navigate the app off-site.
  */
-export const buildNotificationIdempotencyKey = (
-  notificationId: string,
-  attempt: number,
-  chunkIndex = 0
-): string => {
-  const id = String(notificationId ?? '').trim();
-  if (!id) throw new Error('Notification id is required for an idempotency key');
+export const safeActionLink = (value: unknown): string => {
+  const link = String(value ?? '').trim();
 
-  const normalizedAttempt = Math.max(1, Math.floor(Number(attempt) || 1));
-  const normalizedChunk = Math.max(0, Math.floor(Number(chunkIndex) || 0));
-  const seed = `${IDEMPOTENCY_NAMESPACE}|${id}|${normalizedAttempt}|${normalizedChunk}`;
+  if (!link || !link.startsWith('/') || link.startsWith('//')) {
+    return DEFAULT_ACTION_LINK;
+  }
 
-  const bytes = Buffer.from(createHash('sha256').update(seed).digest().subarray(0, 16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x50;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-  const hex = bytes.toString('hex');
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    hex.slice(12, 16),
-    hex.slice(16, 20),
-    hex.slice(20, 32),
-  ].join('-');
+  return link;
 };
 
 /**
- * Builds the create-message body for one chunk of recipients.
+ * Builds the payload for one platform and language.
  *
- * Both languages are sent in every message: Android picks the heading and
- * contents that match the device locale, which is a better signal than the
- * profile row's stored preference and removes the old per-language fan-out.
+ * Both languages are also carried in `data` so the client can re-render the
+ * notification in-app after a language switch or a cold start.
  */
-export const buildOneSignalMessage = (
-  externalIds: string[],
+export const buildFcmPushPayload = (
   copy: PushCopy,
-  options: { idempotencyKey?: string | null } = {}
-): OneSignalPushMessage => {
-  const recipients = normalizeExternalIds(externalIds);
-  if (recipients.length === 0) throw new Error('No push recipients');
+  options: { platform?: DevicePlatform; language?: PushLanguage } = {}
+): FcmPushPayload => {
+  const platform = options.platform ?? 'web';
+  const language = options.language ?? 'bn';
 
   const titleEn = nonEmpty(copy.title?.en) || nonEmpty(copy.title?.bn) || 'Porokh';
   const titleBn = nonEmpty(copy.title?.bn) || titleEn;
-  const bodyEn = nonEmpty(copy.body?.en) || titleEn;
+  const bodyEn = nonEmpty(copy.body?.en) || nonEmpty(copy.body?.bn) || titleEn;
   const bodyBn = nonEmpty(copy.body?.bn) || bodyEn;
 
-  const message: OneSignalPushMessage = {
-    target_channel: 'push',
-    include_aliases: { external_id: recipients },
-    headings: { en: titleEn, bn: titleBn },
-    contents: { en: bodyEn, bn: bodyBn },
-    // Minimal routing metadata: the client validates `action_link` against the
-    // routes this build serves and opens the record from Supabase.
-    data: {
-      type: copy.type,
-      notification_id: nonEmpty(copy.notificationId),
-      action_link: nonEmpty(copy.actionLink) || '/',
-    },
+  const title = language === 'bn' ? titleBn : titleEn;
+  const body = language === 'bn' ? bodyBn : bodyEn;
+  const actionLink = safeActionLink(copy.actionLink);
+  const imageUrl = nonEmpty(copy.imageUrl);
+  const type = nonEmpty(copy.type) || 'system';
+  const notificationId = nonEmpty(copy.notificationId);
+  const highPriority = copy.priority === 'high';
+
+  const data: Record<string, string> = {
+    type,
+    notification_id: notificationId,
+    action_link: actionLink,
+    // `title`/`body` are the resolved values; the labeled pairs let the client
+    // pick the other language without a second lookup.
+    title,
+    body,
+    title_bn: titleBn,
+    title_en: titleEn,
+    body_bn: bodyBn,
+    body_en: bodyEn,
   };
 
-  const imageUrl = nonEmpty(copy.imageUrl);
-  if (imageUrl) message.big_picture = imageUrl;
+  if (imageUrl) data.image_url = imageUrl;
 
-  if (copy.priority === 'high') message.priority = ONESIGNAL_HIGH_PRIORITY;
+  if (platform === 'android') {
+    return {
+      notification: {
+        title,
+        body,
+        ...(imageUrl ? { imageUrl } : {}),
+      },
+      data,
+      android: {
+        priority: highPriority ? 'high' : 'normal',
+        ttl: PUSH_TTL_MS,
+        notification: {
+          channelId: highPriority
+            ? ANDROID_URGENT_CHANNEL_ID
+            : ANDROID_NOTIFICATION_CHANNEL_ID,
+          sound: 'default',
+          ...(imageUrl ? { imageUrl } : {}),
+          // The tap opens the app; the client resolves action_link itself, so
+          // no intent filter with a per-notification URI is needed.
+          ...(notificationId ? { tag: notificationId } : {}),
+        },
+      },
+    };
+  }
 
-  const idempotencyKey = nonEmpty(options.idempotencyKey);
-  if (idempotencyKey) message.idempotency_key = idempotencyKey;
-
-  return message;
+  return {
+    data,
+    webpush: {
+      // Data-only: the service worker owns rendering and click handling.
+      headers: {
+        Urgency: highPriority ? 'high' : 'normal',
+        TTL: String(Math.floor(PUSH_TTL_MS / 1000)),
+      },
+      data: {
+        type,
+        notification_id: notificationId,
+        action_link: actionLink,
+        title,
+        body,
+        ...(imageUrl ? { image_url: imageUrl } : {}),
+      },
+    },
+  };
 };

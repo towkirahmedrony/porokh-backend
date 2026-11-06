@@ -1,5 +1,4 @@
 import { supabaseAdmin } from '../../config/supabaseAdmin';
-import { fetchOneSignalMessageReport } from '../../config/onesignal';
 import {
   loadDevicePlatforms,
   normalizePreferences,
@@ -60,7 +59,6 @@ export const recordAudit = async (
     | 'failed'
     | 'cancelled'
     | 'retried'
-    | 'delivery_refreshed'
     | 'deleted',
   details: Record<string, unknown> = {}
 ): Promise<void> => {
@@ -75,20 +73,27 @@ export const recordAudit = async (
 
 export const pushFailureReason = (result: {
   accepted: number;
+  failed: number;
+  invalidTokens: number;
   messageId: string | null;
   error: string | null;
 }): string | null => {
   if (result.error) return result.error;
-  if (result.accepted === 0) return 'OneSignal accepted 0 devices';
-  if (!result.messageId) return 'OneSignal response had no message id';
+  if (result.accepted === 0) {
+    const rejected = result.failed + result.invalidTokens;
+    return rejected > 0
+      ? `FCM rejected all ${rejected} devices`
+      : 'FCM accepted 0 devices';
+  }
+  if (!result.messageId) return 'FCM response had no message id';
   return null;
 };
 
 /**
- * Pushes one stored notification and records exactly what the provider
- * reported. A notification is only published as `sent` after OneSignal accepts
- * it and returns a message id; any provider error or zero accepted devices
- * leaves the row `failed` with the error stored for the retry button.
+ * Pushes one stored notification and records exactly what FCM reported. A
+ * notification is only published as `sent` after FCM accepts it and returns a
+ * message id; any provider error or zero accepted devices leaves the row
+ * `failed` with the error stored for the retry button.
  */
 const deliverStoredNotification = async (
   row: AnyObject,
@@ -112,7 +117,6 @@ const deliverStoredNotification = async (
     targetRules: row.target_rules,
     type: row.type,
     priority: row.priority === 'high' || row.priority === 'low' ? row.priority : 'normal',
-    attempt,
   });
 
   const errorText = pushFailureReason(result);
@@ -124,7 +128,9 @@ const deliverStoredNotification = async (
       status: succeeded ? 'sent' : 'failed',
       sent_at: succeeded ? row.sent_at ?? now : null,
       total_sent: result.accepted,
-      onesignal_message_id: result.messageId,
+      // Devices FCM rejected outright (not the same as "not delivered").
+      failed_count: result.failed + result.invalidTokens,
+      fcm_message_id: result.messageId,
       provider_accepted_at: result.accepted > 0 ? now : null,
       push_error: succeeded ? null : errorText!.slice(0, 500),
       push_attempts: attempt,
@@ -138,8 +144,10 @@ const deliverStoredNotification = async (
   await recordAudit(row.id, actorId, succeeded ? (attempt > 1 ? 'retried' : 'sent') : 'failed', {
     attempt,
     provider_accepted: result.accepted,
+    provider_failed: result.failed,
+    provider_invalid_tokens: result.invalidTokens,
     provider_error: errorText,
-    onesignal_message_id: result.messageId,
+    fcm_message_id: result.messageId,
   });
 
   return data as AnyObject;
@@ -188,7 +196,7 @@ export const listCampaigns = async (query: unknown) => {
   let request = supabaseAdmin
     .from('notifications')
     .select(
-      'id, title_en, title_bn, body_en, body_bn, image_url, action_link, type, channel, priority, status, target_user_id, target_rules, meta_data, total_sent, total_clicks, delivered_count, failed_count, push_error, push_attempts, onesignal_message_id, delivery_checked_at, scheduled_at, sent_at, expires_at, created_at, created_by, event_code',
+      'id, title_en, title_bn, body_en, body_bn, image_url, action_link, type, channel, priority, status, target_user_id, target_rules, meta_data, total_sent, total_clicks, delivered_count, failed_count, push_error, push_attempts, fcm_message_id, delivery_checked_at, scheduled_at, sent_at, expires_at, created_at, created_by, event_code',
       { count: 'exact' }
     )
     // Only admin-authored campaigns belong here. Per-user notifications (for
@@ -368,9 +376,9 @@ export const sendCampaign = async (id: string, actorId: string): Promise<AnyObje
 };
 
 /**
- * A retry re-sends the same stored notification under the next attempt number,
- * so the derived idempotency key is new and OneSignal does not drop it as a
- * duplicate of the first attempt.
+ * A retry re-sends the same stored notification under the next attempt number.
+ * The attempt counter is what limits retries, and the status gate keeps a
+ * published notification from being sent twice by accident.
  */
 export const retryCampaign = async (id: string, actorId: string): Promise<AnyObject> => {
   const current = await loadNotification(id);
@@ -396,50 +404,6 @@ export const retryCampaign = async (id: string, actorId: string): Promise<AnyObj
   }
 
   return deliverStoredNotification(current, actorId, attempts + 1);
-};
-
-/**
- * Refreshes the provider's delivery report. A notification without a stored
- * OneSignal message id has no report yet, which is reported as a conflict
- * rather than a fabricated 0.
- */
-export const refreshDeliveryStats = async (
-  id: string,
-  actorId: string
-): Promise<AnyObject> => {
-  const current = await loadNotification(id);
-  const messageId = String(current.onesignal_message_id ?? '').trim();
-
-  if (!messageId) {
-    throw new NotificationAdminError(
-      'No provider message id yet; send the notification first',
-      409
-    );
-  }
-
-  const report = await fetchOneSignalMessageReport(messageId);
-  const now = new Date().toISOString();
-
-  const { data, error } = await supabaseAdmin
-    .from('notifications')
-    .update({
-      delivered_count: report.delivered,
-      failed_count: report.failed,
-      delivery_checked_at: now,
-    })
-    .eq('id', id)
-    .select()
-    .single();
-
-  if (error) throw new NotificationAdminError(error.message, 500);
-
-  await recordAudit(id, actorId, 'delivery_refreshed', {
-    delivered: report.delivered,
-    failed: report.failed,
-    onesignal_message_id: messageId,
-  });
-
-  return data as AnyObject;
 };
 
 /**

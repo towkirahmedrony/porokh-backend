@@ -222,14 +222,29 @@ export const initNotificationCron = () => {
         }
 
         const attempt = Number(campaign.push_attempts ?? 0) + 1;
+
+        // Claim the row before sending. FCM has no idempotency key, so the
+        // attempt counter is the guard: this compare-and-set succeeds for one
+        // worker only, and an overlapping tick finds nothing left to claim.
+        const { data: claimed, error: claimError } = await supabaseAdmin
+          .from('notifications')
+          .update({ push_attempts: attempt })
+          .eq('id', campaign.id)
+          .eq('status', 'scheduled')
+          .eq('push_attempts', attempt - 1)
+          .select('id');
+
+        if (claimError) {
+          console.error(`Failed to claim campaign ${campaign.id}:`, claimError.message);
+          continue;
+        }
+        if (!claimed?.length) continue;
+
         await recordAudit(campaign.id, null, 'send_attempted', {
           attempt,
           target_rules: campaign.target_rules ?? {},
         });
 
-        // Any tick that repeats this delivery is stopped by the provider-side
-        // idempotency key, so an overlapping or restarted worker cannot double
-        // send a scheduled notification.
         const result = await sendCampaignPush({
           id: campaign.id,
           title_bn: campaign.title_bn,
@@ -241,7 +256,6 @@ export const initNotificationCron = () => {
           targetRules: campaign.target_rules,
           type: campaign.type,
           priority: campaign.priority === 'high' ? 'high' : 'normal',
-          attempt,
         });
 
         const errorText = pushFailureReason(result);
@@ -253,7 +267,8 @@ export const initNotificationCron = () => {
             status: succeeded ? 'sent' : 'failed',
             sent_at: succeeded ? deliveredAt : null,
             total_sent: result.accepted,
-            onesignal_message_id: result.messageId,
+            failed_count: result.failed + result.invalidTokens,
+            fcm_message_id: result.messageId,
             provider_accepted_at: result.accepted > 0 ? deliveredAt : null,
             push_error: succeeded ? null : errorText!.slice(0, 500),
             push_attempts: attempt,
@@ -267,8 +282,10 @@ export const initNotificationCron = () => {
           await recordAudit(campaign.id, null, succeeded ? 'sent' : 'failed', {
             attempt,
             provider_accepted: result.accepted,
+            provider_failed: result.failed,
+            provider_invalid_tokens: result.invalidTokens,
             provider_error: errorText,
-            onesignal_message_id: result.messageId,
+            fcm_message_id: result.messageId,
           });
           console.log(
             succeeded
