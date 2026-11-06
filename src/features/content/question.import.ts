@@ -1,5 +1,6 @@
-import { buildQuestionContentHash, decideQuestionWrite } from './question.policy';
+import { QUESTION_STATUSES, buildQuestionContentHash, decideQuestionWrite } from './question.policy';
 import { parsePreparationCategory, type PreparationCategory } from './question.preparation';
+import type { QuestionMappingInput } from './question.mapping';
 
 /**
  * Validation and duplicate planning for the AI Question Importer.
@@ -113,6 +114,8 @@ export interface NormalizedImportQuestion {
   /** True when the request explicitly asked to set or clear the category. */
   preparation_present: boolean;
   preparation_category: PreparationCategory | null;
+  /** Source, past-exam appearance and tracks submitted for this question. */
+  mapping?: QuestionMappingInput;
 }
 
 export interface ImportPlanRow {
@@ -417,6 +420,17 @@ export const normalizeImportQuestion = (
   const preparation = parsePreparationCategory(record.preparation_category);
   if (preparation.error) errors.push(preparation.error);
 
+  // `questions.status` has a six-value CHECK; rejecting anything else here means
+  // a typo is reported per question instead of failing at the database.
+  const requestedStatus = asText(record.status).toLowerCase();
+  if (requestedStatus && !(QUESTION_STATUSES as readonly string[]).includes(requestedStatus)) {
+    errors.push(
+      `status "${requestedStatus}" is not allowed. Use one of ${QUESTION_STATUSES.join(', ')}.`
+    );
+  }
+
+  const mapping = asRecord(record.mapping) as QuestionMappingInput | null;
+
   const type = asText(record.type).toLowerCase() || 'mcq';
   if (type !== 'mcq') {
     errors.push(`Question type "${type}" is not supported; only mcq can be imported.`);
@@ -482,6 +496,7 @@ export const normalizeImportQuestion = (
     warnings,
     preparation_present: preparation.present,
     preparation_category: preparation.category,
+    ...(mapping ? { mapping } : {}),
   };
 };
 

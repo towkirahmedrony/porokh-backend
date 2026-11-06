@@ -4,6 +4,14 @@ import {
   IMPORT_SOURCE_TYPES,
   MAX_IMPORT_BATCH_SIZE,
 } from './question.import';
+import {
+  isOccurrenceExamType,
+  isQuestionSourceType,
+  legacySourceTypeFor,
+  referenceKindForExamType,
+  toEnglishDigits,
+  type OccurrenceExamType,
+} from './question.mapping';
 
 /**
  * Plain-text -> question JSON for the AI Question Importer.
@@ -40,6 +48,43 @@ export interface ParsedOption {
   isCorrect: boolean;
 }
 
+/** Where the question came from, as written in the `@source*` headers. */
+export interface ParsedSourceMeta {
+  source_type: string;
+  source_label?: string;
+  publisher?: string;
+  edition?: string;
+  page_number?: string;
+  url?: string;
+}
+
+/** A real past exam the question appeared in, ids not resolved yet. */
+export interface ParsedOccurrenceMeta {
+  exam_type: OccurrenceExamType;
+  institution?: string;
+  unit?: string;
+  exam_name?: string;
+  exam_year_raw?: string;
+  exam_session?: string;
+  paper_set?: string;
+  shift?: string;
+  question_number?: number;
+}
+
+/**
+ * Source, occurrence and tracks for one question.
+ *
+ * Present only when the block actually says something about them, so a plain
+ * `Q:`/`ANS:` file produces exactly the same output it always did.
+ */
+export interface ParsedQuestionMapping {
+  source: ParsedSourceMeta | null;
+  occurrence: ParsedOccurrenceMeta | null;
+  tracks: string[];
+  /** Old @source exam-type syntax that the deprecation report mentions. */
+  deprecations: string[];
+}
+
 export interface ParsedQuestion {
   type: 'mcq';
   body: { text_bn: string; text_en: string; image_url: null };
@@ -49,6 +94,7 @@ export interface ParsedQuestion {
   source_type: string;
   tags: string[];
   exam_references: Array<Record<string, string>>;
+  mapping?: ParsedQuestionMapping;
 }
 
 export interface ParseIssue {
@@ -80,11 +126,22 @@ interface RawBlock {
 /** Batch defaults, written as `@key: value` and in effect for every later question. */
 const BATCH_KEYS = new Set([
   'source',
+  'source_label',
+  'publisher',
+  'edition',
+  'page',
+  'url',
+  'exam_type',
+  'track',
   'kind',
   'institution',
   'exam',
   'unit',
   'year',
+  'session',
+  'shift',
+  'set',
+  'qno',
   'difficulty',
   'tags',
 ]);
@@ -99,10 +156,21 @@ const QUESTION_KEYS = new Set([
   'exp_en',
   'diff',
   'src',
+  'source_label',
+  'publisher',
+  'edition',
+  'page',
+  'url',
+  'exam_type',
+  'track',
   'inst',
   'exam',
   'unit',
   'year',
+  'session',
+  'shift',
+  'set',
+  'qno',
   'tags',
 ]);
 
@@ -130,11 +198,6 @@ const ANSWER_MAP: Record<string, number> = {
   'ঙ': 5,
   'চ': 6,
 };
-
-const BN_DIGITS = '০১২৩৪৫৬৭৮৯';
-
-const toEnglishDigits = (value: string): string =>
-  value.replace(/[০-৯]/g, (digit) => String(BN_DIGITS.indexOf(digit)));
 
 const SOURCE_REFERENCE_KINDS: Record<string, string> = {
   admission: 'admission',
@@ -203,9 +266,7 @@ const parseBlock = (
     if (match) {
       const isHeader = match[1] === '@';
       const rawKey = match[2].toLowerCase();
-      // @session is the preferred admission label; keep storing it in the
-      // existing `year` metadata field for backward compatibility.
-      const key = rawKey === 'session' ? 'year' : rawKey;
+      const key = rawKey;
       const value = match[3].trim();
 
       if (isHeader) {
@@ -333,24 +394,70 @@ const buildQuestion = (
     );
   }
 
-  const sourceType = (pick(fields.src, defaults.source) ?? 'unknown')
+  const rawSource = (pick(fields.src, defaults.source) ?? '')
     .toLowerCase()
     .replace(/[\s-]+/g, '_');
-  if (!(IMPORT_SOURCE_TYPES as readonly string[]).includes(sourceType)) {
-    errors.push(`Source type "${sourceType}" is not supported.`);
+  const rawExamType = (pick(fields.exam_type, defaults.exam_type) ?? '')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+
+  const deprecations: string[] = [];
+  let examType: OccurrenceExamType | null = null;
+  let sourceType = 'unknown';
+  let sourceGiven = false;
+
+  // An old file may write the exam type as @source. It stays accepted, but the
+  // preview tells the author which header to use instead.
+  if (rawSource) {
+    if (isOccurrenceExamType(rawSource)) {
+      examType = rawSource;
+      deprecations.push(
+        `@source: ${rawSource} is the old syntax; use @exam_type: ${rawSource} and @source: official_paper instead.`
+      );
+    } else if (rawSource === 'model_test') {
+      deprecations.push(
+        '@source: model_test is the old syntax; a model test never appeared in a real exam, so leave @exam_type out and use @source: guidebook.'
+      );
+      sourceType = 'model_test';
+    } else if (isQuestionSourceType(rawSource)) {
+      sourceType = rawSource;
+      sourceGiven = true;
+    } else if (!(IMPORT_SOURCE_TYPES as readonly string[]).includes(rawSource)) {
+      errors.push(`Source type "${rawSource}" is not supported.`);
+    }
   }
 
-  // Exam reference: only built when an institution is given. The reference
-  // kind follows the source type unless @kind overrides it.
+  if (rawExamType) {
+    if (!isOccurrenceExamType(rawExamType)) {
+      errors.push(
+        `@exam_type "${rawExamType}" is not supported. Use board_exam, admission, college_test, school_exam or university_exam, or leave it out for a question that never appeared in a real exam.`
+      );
+    } else if (examType && examType !== rawExamType) {
+      errors.push(
+        `@source: ${examType} and @exam_type: ${rawExamType} name two different exams; keep only @exam_type.`
+      );
+    } else {
+      examType = rawExamType;
+    }
+  }
+
   const institution = pick(fields.inst, defaults.institution);
   const exam = pick(fields.exam, defaults.exam);
   const unit = pick(fields.unit, defaults.unit);
   const yearRaw = pick(fields.year, defaults.year);
-  const year = yearRaw ? toEnglishDigits(yearRaw).replace(/\s+/g, '') : undefined;
-  const kind = (pick(defaults.kind) ?? SOURCE_REFERENCE_KINDS[sourceType] ?? 'unknown').toLowerCase();
+  const sessionRaw = pick(fields.session, defaults.session);
+  // @session used to carry the admission year label, so it still fills the
+  // year when @year is absent.
+  const periodRaw = yearRaw ?? sessionRaw;
+  const year = periodRaw ? toEnglishDigits(periodRaw).replace(/\s+/g, '') : undefined;
+  const kind = (
+    pick(defaults.kind) ??
+    (examType ? referenceKindForExamType(examType) : SOURCE_REFERENCE_KINDS[sourceType]) ??
+    'unknown'
+  ).toLowerCase();
   const exam_references: Array<Record<string, string>> = [];
 
-  if (sourceType === 'admission') {
+  if (examType === 'admission') {
     if (!institution) {
       errors.push('Admission questions need an institution (use @institution).');
     }
@@ -379,6 +486,78 @@ const buildQuestion = (
 
   const tags = Array.from(new Set([...parseTags(defaults.tags), ...parseTags(fields.tags)]));
 
+  const sourceLabel = pick(fields.source_label, defaults.source_label);
+  const publisher = pick(fields.publisher, defaults.publisher);
+  const edition = pick(fields.edition, defaults.edition);
+  const pageNumber = pick(fields.page, defaults.page);
+  const url = pick(fields.url, defaults.url);
+  const paperSet = pick(fields.set);
+  const shift = pick(fields.shift);
+  const qnoRaw = pick(fields.qno, defaults.qno);
+
+  const hasSourceDetails = [sourceLabel, publisher, edition, pageNumber, url].some(
+    (value) => value !== undefined
+  );
+  const trackList = (pick(fields.track, defaults.track) ?? '')
+    .split(/[,;]/)
+    .map((track) => track.trim().toLowerCase())
+    .filter(Boolean);
+
+  let questionNumber: number | undefined;
+  if (qnoRaw) {
+    const parsed = Number(toEnglishDigits(qnoRaw).replace(/\s+/g, ''));
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      errors.push(`@qno "${qnoRaw}" must be a positive whole number.`);
+    } else {
+      questionNumber = parsed;
+    }
+  }
+
+  // Describing a source, an appearance or a track switches on the mapping.
+  // Files that only use Q_BN/Q_EN/A_BN/ANS keep producing exactly what they did.
+  const hasMappingInfo =
+    examType !== null ||
+    rawSource !== '' ||
+    hasSourceDetails ||
+    trackList.length > 0 ||
+    sessionRaw !== undefined ||
+    shift !== undefined ||
+    paperSet !== undefined ||
+    qnoRaw !== undefined;
+
+  const mapping: ParsedQuestionMapping | undefined = hasMappingInfo
+    ? {
+        source:
+          sourceGiven || hasSourceDetails
+            ? {
+                source_type: sourceGiven ? sourceType : 'unknown',
+                ...(sourceLabel ? { source_label: sourceLabel } : {}),
+                ...(publisher ? { publisher } : {}),
+                ...(edition ? { edition } : {}),
+                ...(pageNumber ? { page_number: pageNumber } : {}),
+                ...(url ? { url } : {}),
+              }
+            : null,
+        occurrence: examType
+          ? {
+              exam_type: examType,
+              ...(institution ? { institution } : {}),
+              ...(unit ? { unit } : {}),
+              ...(exam ? { exam_name: exam } : {}),
+              ...(year ? { exam_year_raw: year } : {}),
+              ...(sessionRaw ? { exam_session: sessionRaw } : {}),
+              ...(paperSet ? { paper_set: paperSet } : {}),
+              ...(shift ? { shift } : {}),
+              ...(questionNumber ? { question_number: questionNumber } : {}),
+            }
+          : null,
+        tracks: trackList,
+        deprecations,
+      }
+    : undefined;
+
+  warnings.push(...deprecations);
+
   if (errors.length > 0) return { question: null, errors, warnings };
 
   return {
@@ -390,9 +569,10 @@ const buildQuestion = (
         ? { explanation: { bn: explanationBn, en: explanationEn } }
         : {}),
       difficulty_level: difficulty,
-      source_type: sourceType,
+      source_type: legacySourceTypeFor({ examType, sourceType }),
       tags,
       exam_references,
+      ...(mapping ? { mapping } : {}),
     },
     errors,
     warnings,
