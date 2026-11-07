@@ -36,6 +36,9 @@ import notificationRoutes from './features/notifications/notifications.routes';
 import notificationsAdminRoutes from './features/notifications/notifications.admin.routes'; 
 import noticeAdminRoutes from './features/notices/notices.admin.routes';
 import noticeUserRoutes from './features/notices/notices.user.routes';
+import supportRoutes from './features/support/support.routes';
+import supportAdminRoutes from './features/support/support.admin.routes';
+import { SUPPORT_ERROR_CODES } from './features/support/support.errors';
 import historyRoutes from './features/history/history.routes'; 
 
 // মনিটাইজেশন, প্রগ্রেস, এআই, গ্রোথ, কন্টাক্ট, রিপোর্ট এবং রেফারেল রাউট ইম্পোর্ট
@@ -83,6 +86,12 @@ app.use(
   ],
   express.json({ limit: '1mb' })
 );
+// Support attachments arrive as base64 data URLs and are validated against a
+// 6 MB decoded total before anything is uploaded.
+app.use(
+  ['/api/v1/support', '/api/v1/admin/support'],
+  express.json({ limit: '12mb' })
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -121,6 +130,7 @@ app.use(
     '/api/v1/ai',
     '/api/v1/growth',
     '/api/v1/referral',
+    '/api/v1/support',
   ],
   requireSupportedNativeVersion
 );
@@ -169,6 +179,8 @@ app.use('/api/v1/finance', financeRoutes);
 app.use('/api/v1/notifications/admin', notificationsAdminRoutes); 
 app.use('/api/v1/notices/admin', noticeAdminRoutes);
 app.use('/api/v1/notices', noticeUserRoutes);
+app.use('/api/v1/admin/support', supportAdminRoutes);
+app.use('/api/v1/support', supportRoutes);
 app.use('/api/v1/notifications', notificationRoutes); 
 app.use('/api/v1/monetization', monetizationRoutes); 
 app.use('/api/v1/marketplace', marketplaceRoutes);
@@ -226,6 +238,7 @@ export const EXPOSED_ERROR_CODES = new Set([
   'VALIDATION_FAILED',
   ...Object.values(ADMISSION_ERROR_CODES),
   ...GROUP_ERROR_CODES,
+  ...Object.values(SUPPORT_ERROR_CODES),
 ]);
 
 /**
