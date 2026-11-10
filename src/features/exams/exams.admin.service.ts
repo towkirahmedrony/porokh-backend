@@ -394,6 +394,16 @@ const buildVerificationSummaries = async (
   return summaries;
 };
 
+const emptyVerificationSummary = (): ExamVerificationSummary => ({
+  completed_questions: 0,
+  verified_stages: 0,
+  total_stages: 0,
+  all_verified: false,
+  answer: emptyStageSummary(),
+  translation: emptyStageSummary(),
+  final: emptyStageSummary(),
+});
+
 /**
  * True when at least one student has started or completed this paper. The
  * admin UI uses this only to warn before replacing a question set; it never
@@ -445,20 +455,24 @@ export class ExamAdminService {
       });
     }
 
-    const verificationSummaries = await buildVerificationSummaries(papers, links);
+    let verificationSummaries: Map<string, ExamVerificationSummary> | null = null;
+    try {
+      verificationSummaries = await buildVerificationSummaries(papers, links);
+    } catch (verificationError) {
+      // A verification query failure must never hide the entire exam list.
+      logger.warn('[exam-admin] verification summary unavailable', {
+        error: verificationError instanceof Error ? verificationError.message : String(verificationError),
+      });
+    }
 
     return papers.map((paper: AnyObject) => ({
       ...paper,
       question_count: counts.get(String(paper.id)) ?? 0,
-      verification_summary: verificationSummaries.get(String(paper.id)) ?? {
-        completed_questions: 0,
-        verified_stages: 0,
-        total_stages: 0,
-        all_verified: false,
-        answer: emptyStageSummary(),
-        translation: emptyStageSummary(),
-        final: emptyStageSummary(),
-      },
+      verification_available: Boolean(verificationSummaries),
+      verification_summary: verificationSummaries?.get(String(paper.id)) ?? emptyVerificationSummary(),
+      // Keep the persisted publication state so an admin can intentionally
+      // publish manually; the UI separately shows whether verification is ready.
+      is_published: Boolean(paper.is_published),
     }));
   }
 
