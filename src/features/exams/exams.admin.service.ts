@@ -349,10 +349,38 @@ export class ExamAdminService {
       admissionUniversityId = unit?.institution_id ?? null;
     }
 
+    const { data: questionLinks, error: questionLinksError } = await supabase
+      .from('exam_paper_questions')
+      .select('question_id, sequence, marks')
+      .eq('exam_id', id)
+      .order('sequence', { ascending: true });
+
+    if (questionLinksError) throw new Error(questionLinksError.message);
+
+    const questionIds = (questionLinks || []).map((link: AnyObject) => String(link.question_id));
+    const { data: questions, error: questionsError } = questionIds.length
+      ? await supabase
+          .from('questions')
+          .select('id, body, difficulty_level, type, subject_id, chapter_id')
+          .in('id', questionIds)
+      : { data: [], error: null };
+
+    if (questionsError) throw new Error(questionsError.message);
+
+    const questionsById = new Map(
+      (questions || []).map((question: AnyObject) => [String(question.id), question])
+    );
+
     return {
       ...data,
       admission_university_id: admissionUniversityId,
-      question_count: await countExamQuestions(id),
+      question_count: questionIds.length,
+      question_ids: questionIds,
+      questions: (questionLinks || []).map((link: AnyObject) => ({
+        ...(questionsById.get(String(link.question_id)) || { id: String(link.question_id) }),
+        marks: Number(link.marks ?? 1),
+        sequence: Number(link.sequence ?? 0),
+      })),
       has_attempts: await examHasAttempts(id),
     };
   }
