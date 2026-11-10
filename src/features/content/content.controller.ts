@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import * as contentService from './content.service';
 import * as questionService from './question.service';
 import * as questionImportService from './question.import.service';
+import * as questionVerificationService from './question-verification.service';
 import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response';
 import { AuditFilterParams } from './content.types';
@@ -174,6 +175,26 @@ export const updateAuditQuestionStatus = catchAsync(async (req: AuthReq, res: Re
 
     const result = await contentService.updateQuestionAuditStatus(id, status, notes, req.user?.id!);
     sendResponse(res, { statusCode: 200, success: true, message: `Question audit status updated to ${status}`, data: result });
+});
+
+export const getQuestionVerifications = catchAsync(async (req: Request, res: Response) => {
+  const result = await questionVerificationService.getQuestionVerifications(req.params.id);
+  sendResponse(res, { statusCode: 200, success: true, message: 'Question verification statuses fetched', data: result });
+});
+
+export const updateQuestionVerification = catchAsync(async (req: AuthReq, res: Response) => {
+  if (!req.user?.id) {
+    return sendResponse(res, { statusCode: 401, success: false, message: 'Unauthorized' });
+  }
+
+  const result = await questionVerificationService.updateQuestionVerification({
+    questionId: req.params.id,
+    stage: req.params.stage,
+    status: req.body?.status,
+    notes: req.body?.notes,
+    actorId: req.user.id,
+  });
+  sendResponse(res, { statusCode: 200, success: true, message: 'Question verification status updated', data: result });
 });
 
 export const getQuestionsBank = catchAsync(async (req: Request, res: Response) => {

@@ -42,6 +42,8 @@ router.get('/comprehensions/search', rbacGuard(['admin', 'editor', 'teacher']), 
 
 router.get('/questions/audit', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.QUESTIONS_REVIEW), contentController.getQuestionsForAudit);
 router.patch('/questions/:id/status', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.QUESTIONS_REVIEW), contentController.updateAuditQuestionStatus);
+router.get('/questions/:id/verifications', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.QUESTIONS_REVIEW), contentController.getQuestionVerifications);
+router.patch('/questions/:id/verifications/:stage', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.QUESTIONS_REVIEW), contentController.updateQuestionVerification);
 
 // ==========================================
 // Question Bank Routes
