@@ -272,6 +272,128 @@ const countExamQuestions = async (examId: string): Promise<number> => {
   return count ?? 0;
 };
 
+const VERIFICATION_STAGES = ['answer', 'translation', 'final'] as const;
+type VerificationStage = (typeof VERIFICATION_STAGES)[number];
+
+type VerificationStageSummary = {
+  verified: number;
+  rejected: number;
+  pending: number;
+};
+
+type ExamVerificationSummary = {
+  completed_questions: number;
+  verified_stages: number;
+  total_stages: number;
+  all_verified: boolean;
+  answer: VerificationStageSummary;
+  translation: VerificationStageSummary;
+  final: VerificationStageSummary;
+};
+
+const emptyStageSummary = (): VerificationStageSummary => ({
+  verified: 0,
+  rejected: 0,
+  pending: 0,
+});
+
+const buildVerificationSummaries = async (
+  papers: AnyObject[],
+  links: AnyObject[]
+): Promise<Map<string, ExamVerificationSummary>> => {
+  const summaries = new Map<string, ExamVerificationSummary>();
+  const questionIds = [...new Set(links.map((link) => String(link.question_id)).filter(Boolean))];
+
+  const { data: questions, error: questionsError } = questionIds.length
+    ? await supabase
+        .from('questions')
+        .select('id, revision, content_fingerprint')
+        .in('id', questionIds)
+    : { data: [], error: null };
+
+  if (questionsError) throw new Error(questionsError.message);
+
+  const currentQuestionById = new Map(
+    (questions || []).map((question: AnyObject) => [String(question.id), question])
+  );
+
+  const { data: verificationRows, error: verificationError } = questionIds.length
+    ? await supabase
+        .from('question_verifications')
+        .select('question_id, stage, status, question_revision, content_fingerprint')
+        .in('question_id', questionIds)
+    : { data: [], error: null };
+
+  if (verificationError) throw new Error(verificationError.message);
+
+  const currentVerificationByQuestion = new Map<string, Map<string, string>>();
+  (verificationRows || []).forEach((row: AnyObject) => {
+    const question = currentQuestionById.get(String(row.question_id));
+    if (!question) return;
+
+    if (
+      Number(row.question_revision) !== Number(question.revision) ||
+      String(row.content_fingerprint) !== String(question.content_fingerprint)
+    ) {
+      return;
+    }
+
+    if (!VERIFICATION_STAGES.includes(row.stage as VerificationStage)) return;
+
+    const stageMap = currentVerificationByQuestion.get(String(row.question_id)) ?? new Map<string, string>();
+    stageMap.set(String(row.stage), String(row.status));
+    currentVerificationByQuestion.set(String(row.question_id), stageMap);
+  });
+
+  const linksByExam = new Map<string, Set<string>>();
+  links.forEach((link) => {
+    const examId = String(link.exam_id);
+    const examQuestions = linksByExam.get(examId) ?? new Set<string>();
+    examQuestions.add(String(link.question_id));
+    linksByExam.set(examId, examQuestions);
+  });
+
+  papers.forEach((paper) => {
+    const questionSet = linksByExam.get(String(paper.id)) ?? new Set<string>();
+    const summary: ExamVerificationSummary = {
+      completed_questions: 0,
+      verified_stages: 0,
+      total_stages: questionSet.size * VERIFICATION_STAGES.length,
+      all_verified: questionSet.size > 0,
+      answer: emptyStageSummary(),
+      translation: emptyStageSummary(),
+      final: emptyStageSummary(),
+    };
+
+    questionSet.forEach((questionId) => {
+      const stageMap = currentVerificationByQuestion.get(questionId) ?? new Map<string, string>();
+      let questionComplete = true;
+
+      VERIFICATION_STAGES.forEach((stage) => {
+        const status = stageMap.get(stage) ?? 'pending';
+        const stageSummary = summary[stage];
+        if (status === 'verified') {
+          stageSummary.verified += 1;
+          summary.verified_stages += 1;
+        } else if (status === 'rejected') {
+          stageSummary.rejected += 1;
+          questionComplete = false;
+        } else {
+          stageSummary.pending += 1;
+          questionComplete = false;
+        }
+      });
+
+      if (questionComplete) summary.completed_questions += 1;
+    });
+
+    summary.all_verified = questionSet.size > 0 && summary.completed_questions === questionSet.size;
+    summaries.set(String(paper.id), summary);
+  });
+
+  return summaries;
+};
+
 /**
  * True when at least one student has started or completed this paper. The
  * admin UI uses this only to warn before replacing a question set; it never
@@ -303,17 +425,19 @@ export class ExamAdminService {
 
     const papers = data || [];
     const counts = new Map<string, number>();
+    let links: AnyObject[] = [];
 
     if (papers.length > 0) {
-      const { data: links, error: linkError } = await supabase
+      const { data: questionLinks, error: linkError } = await supabase
         .from('exam_paper_questions')
-        .select('exam_id')
+        .select('exam_id, question_id')
         .in(
           'exam_id',
           papers.map((paper: AnyObject) => String(paper.id))
         );
 
       if (linkError) throw new Error(linkError.message);
+      links = questionLinks || [];
 
       (links || []).forEach((link: AnyObject) => {
         const examId = String(link.exam_id);
@@ -321,9 +445,20 @@ export class ExamAdminService {
       });
     }
 
+    const verificationSummaries = await buildVerificationSummaries(papers, links);
+
     return papers.map((paper: AnyObject) => ({
       ...paper,
       question_count: counts.get(String(paper.id)) ?? 0,
+      verification_summary: verificationSummaries.get(String(paper.id)) ?? {
+        completed_questions: 0,
+        verified_stages: 0,
+        total_stages: 0,
+        all_verified: false,
+        answer: emptyStageSummary(),
+        translation: emptyStageSummary(),
+        final: emptyStageSummary(),
+      },
     }));
   }
 
