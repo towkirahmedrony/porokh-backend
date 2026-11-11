@@ -5,6 +5,13 @@ import logger from '../../lib/utils/logger';
 import { AutoFetchDTO, PunishUserDTO } from './exams.types';
 import { ATTEMPT_STATUS, MINUTE_MS } from './exam.timing';
 import {
+  MAX_OVERVIEW_PAPERS,
+  deriveExamStatus,
+  type DerivedExamStatus,
+  type ExamAdminListQuery,
+  type ExamStatusInput,
+} from './exams.admin.query';
+import {
   ADMISSION_EXAM_MODES,
   EXAM_AUTHORING_CATEGORIES,
   MODEL_TEST_TRACKS,
@@ -24,6 +31,49 @@ type AnyObject = Record<string, any>;
 
 const RECOVER_MIN_MINUTES = 1;
 const RECOVER_MAX_MINUTES = 60;
+
+/** Columns the admin list and overview read. Kept lean so a page stays small. */
+const PAPER_LIST_COLUMNS = [
+  'id',
+  'title',
+  'title_en',
+  'category',
+  'track',
+  'subject_id',
+  'exam_type',
+  'duration_min',
+  'total_marks',
+  'pass_mark',
+  'is_published',
+  'is_premium',
+  'start_time',
+  'end_time',
+  'result_publish_time',
+  'admission_unit_id',
+  'meta_data',
+  'created_at',
+  'updated_at',
+].join(', ');
+
+/** Bounded reads used to enrich one list page without an N+1 query. */
+const MAX_PAGE_QUESTION_ROWS = 5000;
+const MAX_PAGE_RESULT_ROWS = 10000;
+const MAX_OVERVIEW_QUESTION_ROWS = 20000;
+const MAX_OVERVIEW_ATTEMPT_ROWS = 5000;
+
+const countByExamId = (rows: AnyObject[] | null, key = 'exam_id'): Map<string, number> => {
+  const counts = new Map<string, number>();
+
+  for (const row of rows ?? []) {
+    const examId = String(row?.[key] ?? '');
+
+    if (!examId) continue;
+
+    counts.set(examId, (counts.get(examId) ?? 0) + 1);
+  }
+
+  return counts;
+};
 
 const auditExamAction = async (actorId: string | undefined, action: string, examId: string) => {
   const { error } = await supabase.from('audit_logs').insert({
@@ -297,34 +347,353 @@ const examHasAttempts = async (examId: string): Promise<boolean> => {
 };
 
 export class ExamAdminService {
-  static async getAllExams() {
-    const { data, error } = await supabase.from('exam_papers').select('*').order('created_at', { ascending: false });
-    if (error) throw new Error(error.message);
+  /**
+   * Adds the derived status and the operational counters one list page needs.
+   *
+   * Counters are read for the page's ids only, so the query count stays
+   * constant while the catalog grows. A page that hits a read cap reports the
+   * truncation instead of quietly showing a smaller number.
+   */
+  private static async decoratePapers(
+    papers: AnyObject[],
+    nowMs: number = Date.now()
+  ): Promise<{ items: AnyObject[]; truncated: string[] }> {
+    if (papers.length === 0) return { items: [], truncated: [] };
 
-    const papers = data || [];
-    const counts = new Map<string, number>();
+    const ids = papers.map((paper) => String(paper.id));
+    const truncated: string[] = [];
 
-    if (papers.length > 0) {
-      const { data: links, error: linkError } = await supabase
+    const [linksResult, resultsResult, liveAttemptsResult] = await Promise.all([
+      supabase
         .from('exam_paper_questions')
         .select('exam_id')
-        .in(
-          'exam_id',
-          papers.map((paper: AnyObject) => String(paper.id))
-        );
+        .in('exam_id', ids)
+        .limit(MAX_PAGE_QUESTION_ROWS),
+      supabase
+        .from('exam_history')
+        .select('exam_id')
+        .in('exam_id', ids)
+        .limit(MAX_PAGE_RESULT_ROWS),
+      supabase
+        .from('exam_progress')
+        .select('exam_id')
+        .in('exam_id', ids)
+        .eq('status', ATTEMPT_STATUS.IN_PROGRESS)
+        .limit(MAX_PAGE_RESULT_ROWS),
+    ]);
 
-      if (linkError) throw new Error(linkError.message);
+    if (linksResult.error) throw new Error(linksResult.error.message);
+    if (resultsResult.error) throw new Error(resultsResult.error.message);
+    if (liveAttemptsResult.error) throw new Error(liveAttemptsResult.error.message);
 
-      (links || []).forEach((link: AnyObject) => {
-        const examId = String(link.exam_id);
-        counts.set(examId, (counts.get(examId) ?? 0) + 1);
+    if ((linksResult.data ?? []).length >= MAX_PAGE_QUESTION_ROWS) truncated.push('question_count');
+    if ((resultsResult.data ?? []).length >= MAX_PAGE_RESULT_ROWS) truncated.push('participant_count');
+    if ((liveAttemptsResult.data ?? []).length >= MAX_PAGE_RESULT_ROWS) {
+      truncated.push('active_attempt_count');
+    }
+
+    const questionCounts = countByExamId(linksResult.data as AnyObject[] | null);
+    const participantCounts = countByExamId(resultsResult.data as AnyObject[] | null);
+    const activeCounts = countByExamId(liveAttemptsResult.data as AnyObject[] | null);
+
+    return {
+      items: papers.map((paper) => ({
+        ...paper,
+        status: deriveExamStatus(paper as ExamStatusInput, nowMs),
+        question_count: questionCounts.get(String(paper.id)) ?? 0,
+        participant_count: participantCounts.get(String(paper.id)) ?? 0,
+        active_attempt_count: activeCounts.get(String(paper.id)) ?? 0,
+      })),
+      truncated,
+    };
+  }
+
+  /**
+   * Paginated, searched and filtered exam catalog.
+   *
+   * `live` and `open` depend on the current time in a way PostgREST cannot
+   * filter without duplicating the status rules, so those two statuses are
+   * resolved from a bounded read and paged in memory. Every other status is a
+   * plain SQL filter with an exact count, and all filters use the same
+   * `deriveExamStatus` that the list rows report.
+   */
+  static async getAllExams(query: ExamAdminListQuery) {
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+
+    const wantsInMemoryStatus = query.status === 'live' || query.status === 'open';
+    const from = (query.page - 1) * query.page_size;
+    const to = from + query.page_size - 1;
+
+    let baseQuery = supabase
+      .from('exam_papers')
+      .select(PAPER_LIST_COLUMNS, wantsInMemoryStatus ? undefined : { count: 'exact' });
+
+    if (query.category) baseQuery = baseQuery.eq('category', query.category);
+    if (query.track) baseQuery = baseQuery.eq('track', query.track);
+
+    if (query.status === 'draft') {
+      baseQuery = baseQuery.eq('is_published', false);
+    } else if (query.status === 'scheduled') {
+      baseQuery = baseQuery.eq('is_published', true).gt('start_time', nowIso);
+    } else if (query.status === 'completed') {
+      baseQuery = baseQuery.eq('is_published', true).lt('end_time', nowIso);
+    } else if (query.status !== 'all' && !wantsInMemoryStatus) {
+      baseQuery = baseQuery.eq('is_published', true);
+    }
+
+    if (query.q) {
+      baseQuery = baseQuery.or(
+        `title.ilike.%${query.q}%,title_en.ilike.%${query.q}%,id.ilike.%${query.q}%`
+      );
+    }
+
+    const ordered = baseQuery
+      .order(query.sort, { ascending: query.direction === 'asc', nullsFirst: false })
+      .order('id', { ascending: true });
+
+    if (!wantsInMemoryStatus) {
+      const { data, count, error } = await ordered.range(from, to);
+
+      if (error) throw new Error(error.message);
+
+      const { items, truncated } = await ExamAdminService.decoratePapers(
+        (data ?? []) as AnyObject[],
+        now
+      );
+      const total = count ?? items.length;
+
+      return {
+        items,
+        page: query.page,
+        page_size: query.page_size,
+        total,
+        total_pages: Math.max(1, Math.ceil(total / query.page_size)),
+        truncated,
+      };
+    }
+
+    const { data, error } = await ordered.limit(MAX_OVERVIEW_PAPERS);
+
+    if (error) throw new Error(error.message);
+
+    const matching = ((data ?? []) as AnyObject[]).filter(
+      (paper) => deriveExamStatus(paper as ExamStatusInput, now) === query.status
+    );
+    const pageRows = matching.slice(from, from + query.page_size);
+    const { items, truncated } = await ExamAdminService.decoratePapers(pageRows, now);
+
+    return {
+      items,
+      page: query.page,
+      page_size: query.page_size,
+      total: matching.length,
+      total_pages: Math.max(1, Math.ceil(matching.length / query.page_size)),
+      truncated,
+    };
+  }
+
+  /**
+   * Operational overview for the exam hub: real counts, the papers that need
+   * attention, what is scheduled next and the latest submissions.
+   *
+   * Everything here is derived from the same columns the student engine reads,
+   * so the numbers match what a student sees. Reads are bounded and grouped
+   * (no per-exam query).
+   */
+  static async getOverview() {
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const last24hIso = new Date(now - 24 * 60 * MINUTE_MS).toISOString();
+
+    const [papersResult, linksResult, attemptsResult, recentResult, attemptsLast24h] =
+      await Promise.all([
+        supabase
+          .from('exam_papers')
+          .select(PAPER_LIST_COLUMNS)
+          .order('created_at', { ascending: false })
+          .limit(MAX_OVERVIEW_PAPERS),
+        supabase
+          .from('exam_paper_questions')
+          .select('exam_id')
+          .limit(MAX_OVERVIEW_QUESTION_ROWS),
+        supabase
+          .from('exam_progress')
+          .select('exam_id, last_updated_at')
+          .eq('status', ATTEMPT_STATUS.IN_PROGRESS)
+          .limit(MAX_OVERVIEW_ATTEMPT_ROWS),
+        supabase
+          .from('exam_history')
+          .select('id, exam_id, user_id, score, total_marks, time_taken, status, submitted_at, profiles(full_name)')
+          .order('submitted_at', { ascending: false })
+          .limit(10),
+        supabase
+          .from('exam_history')
+          .select('id', { count: 'exact', head: true })
+          .gte('submitted_at', last24hIso),
+      ]);
+
+    for (const [label, result] of [
+      ['papers', papersResult],
+      ['questions', linksResult],
+      ['attempts', attemptsResult],
+      ['recent results', recentResult],
+      ['results in the last 24h', attemptsLast24h],
+    ] as const) {
+      if (result.error) throw new Error(`${label}: ${result.error.message}`);
+    }
+
+    const papers = (papersResult.data ?? []) as AnyObject[];
+    const questionCounts = countByExamId(linksResult.data as AnyObject[] | null);
+    const activeAttempts = countByExamId(attemptsResult.data as AnyObject[] | null);
+    const titleById = new Map(papers.map((paper) => [String(paper.id), String(paper.title ?? '')]));
+
+    const counts = {
+      total: papers.length,
+      draft: 0,
+      scheduled: 0,
+      live: 0,
+      completed: 0,
+      open: 0,
+    };
+
+    const decorated: AnyObject[] = papers.map((paper) => {
+      const status = deriveExamStatus(paper as ExamStatusInput, now);
+      counts[status] += 1;
+
+      return {
+        ...paper,
+        status,
+        question_count: questionCounts.get(String(paper.id)) ?? 0,
+        active_attempts: activeAttempts.get(String(paper.id)) ?? 0,
+      };
+    });
+
+    const byStatus = (status: DerivedExamStatus) =>
+      decorated.filter((paper) => paper.status === status);
+
+    const upcoming = byStatus('scheduled')
+      .slice()
+      .sort((a, b) => Date.parse(String(a.start_time)) - Date.parse(String(b.start_time)))
+      .slice(0, 6)
+      .map((paper) => ({
+        id: paper.id,
+        title: paper.title,
+        title_en: paper.title_en ?? null,
+        category: paper.category ?? null,
+        track: paper.track ?? null,
+        is_premium: paper.is_premium === true,
+        start_time: paper.start_time,
+        end_time: paper.end_time,
+        question_count: paper.question_count,
+      }));
+
+    const live = byStatus('live')
+      .slice()
+      .sort((a, b) => (b.active_attempts as number) - (a.active_attempts as number))
+      .slice(0, 6)
+      .map((paper) => ({
+        id: paper.id,
+        title: paper.title,
+        start_time: paper.start_time,
+        end_time: paper.end_time,
+        question_count: paper.question_count,
+        active_attempts: paper.active_attempts,
+      }));
+
+    const draftsWithoutQuestions = decorated.filter(
+      (paper) => paper.status === 'draft' && paper.question_count === 0
+    );
+    const publishedWithoutQuestions = decorated.filter(
+      (paper) => paper.status !== 'draft' && paper.question_count === 0
+    );
+    const endingSoon = byStatus('live').filter((paper) => {
+      const end = paper.end_time ? Date.parse(String(paper.end_time)) : Number.NaN;
+
+      return Number.isFinite(end) && end - now <= MINUTE_MS * 60 && end >= now;
+    });
+    const startingSoon = byStatus('scheduled').filter((paper) => {
+      const start = Date.parse(String(paper.start_time));
+
+      return Number.isFinite(start) && start - now <= MINUTE_MS * 60;
+    });
+
+    const alerts: Array<{
+      code: string;
+      severity: 'critical' | 'warning' | 'info';
+      title: string;
+      description: string;
+    }> = [];
+
+    if (publishedWithoutQuestions.length > 0) {
+      alerts.push({
+        code: 'PUBLISHED_WITHOUT_QUESTIONS',
+        severity: 'critical',
+        title: `${publishedWithoutQuestions.length} published exam(s) have no questions`,
+        description: 'Students cannot start these papers. Unpublish or add questions.',
       });
     }
 
-    return papers.map((paper: AnyObject) => ({
-      ...paper,
-      question_count: counts.get(String(paper.id)) ?? 0,
+    if (draftsWithoutQuestions.length > 0) {
+      alerts.push({
+        code: 'DRAFT_WITHOUT_QUESTIONS',
+        severity: 'warning',
+        title: `${draftsWithoutQuestions.length} draft exam(s) have no questions yet`,
+        description: 'A draft needs at least one question before it can be published.',
+      });
+    }
+
+    if (startingSoon.length > 0) {
+      alerts.push({
+        code: 'STARTS_WITHIN_HOUR',
+        severity: 'info',
+        title: `${startingSoon.length} exam(s) start within the next hour`,
+        description: 'Check the question sets and instructions before students open them.',
+      });
+    }
+
+    if (endingSoon.length > 0) {
+      alerts.push({
+        code: 'ENDS_WITHIN_HOUR',
+        severity: endingSoon.some((paper) => (paper.active_attempts as number) > 0)
+          ? 'warning'
+          : 'info',
+        title: `${endingSoon.length} exam window(s) close within the next hour`,
+        description: 'Open live monitoring to extend an attempt that is about to expire.',
+      });
+    }
+
+    const needsAttention = [...publishedWithoutQuestions, ...draftsWithoutQuestions]
+      .slice(0, 5)
+      .map((paper) => ({
+        id: paper.id,
+        title: paper.title,
+        status: paper.status,
+      }));
+
+    const recentResults = ((recentResult.data ?? []) as AnyObject[]).map((row) => ({
+      id: row.id,
+      exam_id: row.exam_id ?? null,
+      exam_title: titleById.get(String(row.exam_id ?? '')) ?? null,
+      user_name: row.profiles?.full_name || 'Unknown User',
+      score: Number(row.score ?? 0),
+      total_marks: Number(row.total_marks ?? 0),
+      time_taken: Number(row.time_taken ?? 0),
+      status: row.status ?? null,
+      submitted_at: row.submitted_at ?? null,
     }));
+
+    return {
+      generated_at: nowIso,
+      counts,
+      active_attempts: (attemptsResult.data ?? []).length,
+      results_last_24h: attemptsLast24h.count ?? 0,
+      live,
+      upcoming,
+      alerts,
+      needs_attention: needsAttention,
+      recent_results: recentResults,
+    };
   }
 
   static async getExamDetails(id: string) {
@@ -998,18 +1367,29 @@ export class ExamAdminService {
 
     if (error) throw new Error(error.message);
 
+    // The question total turns the saved index into a real progress figure.
+    const questionTotal = await countExamQuestions(examId);
     const now = Date.now();
 
-    return (data || []).map((progress: AnyObject) => ({
-      id: progress.id,
-      user_id: progress.user_id,
-      user_name: progress.profiles?.full_name || 'Unknown User',
-      current_question_index: Number(progress.current_question_index ?? 0),
-      status: progress.status,
-      deadline_at: progress.deadline_at ?? null,
-      seconds_remaining: secondsRemaining(progress.deadline_at, now),
-      last_updated_at: progress.last_updated_at ?? null,
-    }));
+    return (data || []).map((progress: AnyObject) => {
+      const index = Number(progress.current_question_index ?? 0);
+
+      return {
+        id: progress.id,
+        user_id: progress.user_id,
+        user_name: progress.profiles?.full_name || 'Unknown User',
+        current_question_index: index,
+        question_total: questionTotal,
+        progress_percent:
+          questionTotal > 0
+            ? Math.min(100, Math.round(((index + 1) / questionTotal) * 100))
+            : null,
+        status: progress.status,
+        deadline_at: progress.deadline_at ?? null,
+        seconds_remaining: secondsRemaining(progress.deadline_at, now),
+        last_updated_at: progress.last_updated_at ?? null,
+      };
+    });
   }
 
   static async getLeaderboard(examId: string) {

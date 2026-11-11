@@ -2,10 +2,31 @@ import { Request, Response } from 'express';
 import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response';
 import { ExamAdminService } from './exams.admin.service';
+import { parseExamAdminQuery } from './exams.admin.query';
 
 export const getAllExams = catchAsync(async (req: Request, res: Response) => {
-  const result = await ExamAdminService.getAllExams();
-  sendResponse(res, { statusCode: 200, success: true, data: result });
+  const query = parseExamAdminQuery(req.query as Record<string, unknown>);
+  const result = await ExamAdminService.getAllExams(query);
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: 'Exams fetched',
+    data: result,
+  });
+});
+
+/**
+ * Operational overview for the exam hub: status counts, live and upcoming
+ * papers, submissions and the papers that block publication.
+ */
+export const getExamOverview = catchAsync(async (_req: Request, res: Response) => {
+  const result = await ExamAdminService.getOverview();
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: 'Exam overview fetched',
+    data: result,
+  });
 });
 
 export const getExamDetails = catchAsync(async (req: Request, res: Response) => {
