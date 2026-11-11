@@ -436,23 +436,33 @@ export class ExamAdminService {
     const papers = data || [];
     const counts = new Map<string, number>();
     let links: AnyObject[] = [];
+    let questionLinksAvailable = true;
 
     if (papers.length > 0) {
-      const { data: questionLinks, error: linkError } = await supabase
-        .from('exam_paper_questions')
-        .select('exam_id, question_id')
-        .in(
-          'exam_id',
-          papers.map((paper: AnyObject) => String(paper.id))
-        );
+      try {
+        const { data: questionLinks, error: linkError } = await supabase
+          .from('exam_paper_questions')
+          .select('exam_id, question_id')
+          .in(
+            'exam_id',
+            papers.map((paper: AnyObject) => String(paper.id))
+          );
 
-      if (linkError) throw new Error(linkError.message);
-      links = questionLinks || [];
+        if (linkError) throw new Error(linkError.message);
+        links = questionLinks || [];
 
-      (links || []).forEach((link: AnyObject) => {
-        const examId = String(link.exam_id);
-        counts.set(examId, (counts.get(examId) ?? 0) + 1);
-      });
+        links.forEach((link: AnyObject) => {
+          const examId = String(link.exam_id);
+          counts.set(examId, (counts.get(examId) ?? 0) + 1);
+        });
+      } catch (linkError) {
+        questionLinksAvailable = false;
+        // The paper list is still useful when an auxiliary relationship query
+        // is unavailable during a deployment or schema-cache refresh.
+        logger.warn('[exam-admin] question links unavailable for list', {
+          error: linkError instanceof Error ? linkError.message : String(linkError),
+        });
+      }
     }
 
     let verificationSummaries: Map<string, ExamVerificationSummary> | null = null;
@@ -467,9 +477,9 @@ export class ExamAdminService {
 
     return papers.map((paper: AnyObject) => ({
       ...paper,
-      question_count: counts.get(String(paper.id)) ?? 0,
-      verification_available: Boolean(verificationSummaries),
+      verification_available: Boolean(verificationSummaries) && questionLinksAvailable,
       verification_summary: verificationSummaries?.get(String(paper.id)) ?? emptyVerificationSummary(),
+      question_count: questionLinksAvailable ? counts.get(String(paper.id)) ?? 0 : null,
       // Keep the persisted publication state so an admin can intentionally
       // publish manually; the UI separately shows whether verification is ready.
       is_published: Boolean(paper.is_published),
