@@ -75,6 +75,102 @@ const countByExamId = (rows: AnyObject[] | null, key = 'exam_id'): Map<string, n
   return counts;
 };
 
+const VERIFICATION_STAGES = ['answer', 'translation', 'final'] as const;
+type VerificationStage = (typeof VERIFICATION_STAGES)[number];
+type VerificationStageSummary = { verified: number; rejected: number; pending: number };
+type ExamVerificationSummary = {
+  completed_questions: number;
+  verified_stages: number;
+  total_stages: number;
+  all_verified: boolean;
+  answer: VerificationStageSummary;
+  translation: VerificationStageSummary;
+  final: VerificationStageSummary;
+};
+
+const emptyVerificationStage = (): VerificationStageSummary => ({ verified: 0, rejected: 0, pending: 0 });
+
+const emptyVerificationSummary = (): ExamVerificationSummary => ({
+  completed_questions: 0,
+  verified_stages: 0,
+  total_stages: 0,
+  all_verified: false,
+  answer: emptyVerificationStage(),
+  translation: emptyVerificationStage(),
+  final: emptyVerificationStage(),
+});
+
+const buildVerificationSummaries = async (
+  links: AnyObject[]
+): Promise<Map<string, ExamVerificationSummary>> => {
+  const summaries = new Map<string, ExamVerificationSummary>();
+  const questionIds = [...new Set(links.map((link) => String(link.question_id)).filter(Boolean))];
+  if (questionIds.length === 0) return summaries;
+
+  const [{ data: questions, error: questionsError }, { data: rows, error: rowsError }] = await Promise.all([
+    supabase.from('questions').select('id, revision, content_fingerprint').in('id', questionIds),
+    supabase
+      .from('question_verifications')
+      .select('question_id, stage, status, question_revision, content_fingerprint')
+      .in('question_id', questionIds),
+  ]);
+  if (questionsError) throw new Error(questionsError.message);
+  if (rowsError) throw new Error(rowsError.message);
+
+  const currentQuestions = new Map(
+    (questions ?? []).map((question: AnyObject) => [String(question.id), question])
+  );
+  const currentByQuestion = new Map<string, Map<string, string>>();
+  (rows ?? []).forEach((row: AnyObject) => {
+    const question = currentQuestions.get(String(row.question_id));
+    if (!question) return;
+    if (
+      Number(row.question_revision) !== Number(question.revision) ||
+      String(row.content_fingerprint) !== String(question.content_fingerprint)
+    ) return;
+    if (!VERIFICATION_STAGES.includes(row.stage as VerificationStage)) return;
+    const stageMap = currentByQuestion.get(String(row.question_id)) ?? new Map<string, string>();
+    stageMap.set(String(row.stage), String(row.status));
+    currentByQuestion.set(String(row.question_id), stageMap);
+  });
+
+  const linksByExam = new Map<string, Set<string>>();
+  links.forEach((link) => {
+    const examQuestions = linksByExam.get(String(link.exam_id)) ?? new Set<string>();
+    examQuestions.add(String(link.question_id));
+    linksByExam.set(String(link.exam_id), examQuestions);
+  });
+
+  linksByExam.forEach((questionSet, examId) => {
+    const summary: ExamVerificationSummary = {
+      ...emptyVerificationSummary(),
+      total_stages: questionSet.size * VERIFICATION_STAGES.length,
+      all_verified: questionSet.size > 0,
+    };
+    questionSet.forEach((questionId) => {
+      const stageMap = currentByQuestion.get(questionId) ?? new Map<string, string>();
+      let complete = true;
+      VERIFICATION_STAGES.forEach((stage) => {
+        const status = stageMap.get(stage) ?? 'pending';
+        if (status === 'verified') {
+          summary[stage].verified += 1;
+          summary.verified_stages += 1;
+        } else if (status === 'rejected') {
+          summary[stage].rejected += 1;
+          complete = false;
+        } else {
+          summary[stage].pending += 1;
+          complete = false;
+        }
+      });
+      if (complete) summary.completed_questions += 1;
+    });
+    summary.all_verified = questionSet.size > 0 && summary.completed_questions === questionSet.size;
+    summaries.set(examId, summary);
+  });
+  return summaries;
+};
+
 const auditExamAction = async (actorId: string | undefined, action: string, examId: string) => {
   const { error } = await supabase.from('audit_logs').insert({
     user_id: actorId ?? null,
@@ -366,7 +462,7 @@ export class ExamAdminService {
     const [linksResult, resultsResult, liveAttemptsResult] = await Promise.all([
       supabase
         .from('exam_paper_questions')
-        .select('exam_id')
+        .select('exam_id, question_id')
         .in('exam_id', ids)
         .limit(MAX_PAGE_QUESTION_ROWS),
       supabase
@@ -395,6 +491,16 @@ export class ExamAdminService {
     const questionCounts = countByExamId(linksResult.data as AnyObject[] | null);
     const participantCounts = countByExamId(resultsResult.data as AnyObject[] | null);
     const activeCounts = countByExamId(liveAttemptsResult.data as AnyObject[] | null);
+    let verificationSummaries = new Map<string, ExamVerificationSummary>();
+    let verificationAvailable = true;
+    try {
+      verificationSummaries = await buildVerificationSummaries((linksResult.data ?? []) as AnyObject[]);
+    } catch (verificationError) {
+      verificationAvailable = false;
+      logger.warn('[exam-admin] verification summary unavailable', {
+        error: verificationError instanceof Error ? verificationError.message : String(verificationError),
+      });
+    }
 
     return {
       items: papers.map((paper) => ({
@@ -403,6 +509,8 @@ export class ExamAdminService {
         question_count: questionCounts.get(String(paper.id)) ?? 0,
         participant_count: participantCounts.get(String(paper.id)) ?? 0,
         active_attempt_count: activeCounts.get(String(paper.id)) ?? 0,
+        verification_available: verificationAvailable,
+        verification_summary: verificationSummaries.get(String(paper.id)) ?? emptyVerificationSummary(),
       })),
       truncated,
     };
