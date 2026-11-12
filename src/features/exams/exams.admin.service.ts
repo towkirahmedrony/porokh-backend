@@ -100,6 +100,14 @@ const emptyVerificationSummary = (): ExamVerificationSummary => ({
   final: emptyVerificationStage(),
 });
 
+const chunk = <T>(values: T[], size: number): T[][] => {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+};
+
 const buildVerificationSummaries = async (
   links: AnyObject[]
 ): Promise<Map<string, ExamVerificationSummary>> => {
@@ -107,15 +115,31 @@ const buildVerificationSummaries = async (
   const questionIds = [...new Set(links.map((link) => String(link.question_id)).filter(Boolean))];
   if (questionIds.length === 0) return summaries;
 
-  const [{ data: questions, error: questionsError }, { data: rows, error: rowsError }] = await Promise.all([
-    supabase.from('questions').select('id, revision, content_fingerprint').in('id', questionIds),
-    supabase
-      .from('question_verifications')
-      .select('question_id, stage, status, question_revision, content_fingerprint')
-      .in('question_id', questionIds),
+  // Keep each PostgREST .in() URL bounded. A page can contain thousands of
+  // question links, and sending all UUIDs in one request makes the proxy
+  // reject the verification read even though the tables are healthy.
+  const questionChunks = chunk(questionIds, 200);
+  const [questionResults, verificationResults] = await Promise.all([
+    Promise.all(
+      questionChunks.map((ids) =>
+        supabase.from('questions').select('id, revision, content_fingerprint').in('id', ids)
+      )
+    ),
+    Promise.all(
+      questionChunks.map((ids) =>
+        supabase
+          .from('question_verifications')
+          .select('question_id, stage, status, question_revision, content_fingerprint')
+          .in('question_id', ids)
+      )
+    ),
   ]);
-  if (questionsError) throw new Error(questionsError.message);
-  if (rowsError) throw new Error(rowsError.message);
+  const questionError = questionResults.find((result) => result.error)?.error;
+  const verificationError = verificationResults.find((result) => result.error)?.error;
+  if (questionError) throw new Error(questionError.message);
+  if (verificationError) throw new Error(verificationError.message);
+  const questions = questionResults.flatMap((result) => result.data ?? []);
+  const rows = verificationResults.flatMap((result) => result.data ?? []);
 
   const currentQuestions = new Map(
     (questions ?? []).map((question: AnyObject) => [String(question.id), question])
