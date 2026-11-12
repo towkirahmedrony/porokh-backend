@@ -56,10 +56,10 @@ const PAPER_LIST_COLUMNS = [
 ].join(', ');
 
 /** Bounded reads used to enrich one list page without an N+1 query. */
-const MAX_PAGE_QUESTION_ROWS = 5000;
 const MAX_PAGE_RESULT_ROWS = 10000;
 const MAX_OVERVIEW_QUESTION_ROWS = 20000;
 const MAX_OVERVIEW_ATTEMPT_ROWS = 5000;
+const POSTGREST_PAGE_SIZE = 1000;
 
 const countByExamId = (rows: AnyObject[] | null, key = 'exam_id'): Map<string, number> => {
   const counts = new Map<string, number>();
@@ -73,6 +73,27 @@ const countByExamId = (rows: AnyObject[] | null, key = 'exam_id'): Map<string, n
   }
 
   return counts;
+};
+
+const fetchAllExamQuestionLinks = async (examIds: string[]): Promise<AnyObject[]> => {
+  if (examIds.length === 0) return [];
+
+  const links: AnyObject[] = [];
+  for (let from = 0; ; from += POSTGREST_PAGE_SIZE) {
+    const { data, error } = await supabase
+      .from('exam_paper_questions')
+      .select('exam_id, question_id')
+      .in('exam_id', examIds)
+      .range(from, from + POSTGREST_PAGE_SIZE - 1);
+
+    if (error) throw new Error(error.message);
+
+    const page = (data ?? []) as AnyObject[];
+    links.push(...page);
+    if (page.length < POSTGREST_PAGE_SIZE) break;
+  }
+
+  return links;
 };
 
 const VERIFICATION_STAGES = ['answer', 'translation', 'final'] as const;
@@ -483,12 +504,8 @@ export class ExamAdminService {
     const ids = papers.map((paper) => String(paper.id));
     const truncated: string[] = [];
 
-    const [linksResult, resultsResult, liveAttemptsResult] = await Promise.all([
-      supabase
-        .from('exam_paper_questions')
-        .select('exam_id, question_id')
-        .in('exam_id', ids)
-        .limit(MAX_PAGE_QUESTION_ROWS),
+    const [links, resultsResult, liveAttemptsResult] = await Promise.all([
+      fetchAllExamQuestionLinks(ids),
       supabase
         .from('exam_history')
         .select('exam_id')
@@ -502,23 +519,21 @@ export class ExamAdminService {
         .limit(MAX_PAGE_RESULT_ROWS),
     ]);
 
-    if (linksResult.error) throw new Error(linksResult.error.message);
     if (resultsResult.error) throw new Error(resultsResult.error.message);
     if (liveAttemptsResult.error) throw new Error(liveAttemptsResult.error.message);
 
-    if ((linksResult.data ?? []).length >= MAX_PAGE_QUESTION_ROWS) truncated.push('question_count');
     if ((resultsResult.data ?? []).length >= MAX_PAGE_RESULT_ROWS) truncated.push('participant_count');
     if ((liveAttemptsResult.data ?? []).length >= MAX_PAGE_RESULT_ROWS) {
       truncated.push('active_attempt_count');
     }
 
-    const questionCounts = countByExamId(linksResult.data as AnyObject[] | null);
+    const questionCounts = countByExamId(links);
     const participantCounts = countByExamId(resultsResult.data as AnyObject[] | null);
     const activeCounts = countByExamId(liveAttemptsResult.data as AnyObject[] | null);
     let verificationSummaries = new Map<string, ExamVerificationSummary>();
     let verificationAvailable = true;
     try {
-      verificationSummaries = await buildVerificationSummaries((linksResult.data ?? []) as AnyObject[]);
+      verificationSummaries = await buildVerificationSummaries(links);
     } catch (verificationError) {
       verificationAvailable = false;
       logger.warn('[exam-admin] verification summary unavailable', {

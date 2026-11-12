@@ -305,6 +305,19 @@ test('the catalog pages in Postgres and enriches only the returned page', async 
   assert.equal(second.status, 'open');
 });
 
+test('the catalog paginates question links beyond PostgREST page limits', async () => {
+  state.examPapers = [paper({ id: 'large-paper' })];
+  state.examPaperQuestions = Array.from({ length: 1006 }, (_, index) => ({
+    exam_id: 'large-paper',
+    question_id: `question-${index + 1}`,
+  }));
+
+  const result = await ExamAdminService.getAllExams(parseExamAdminQuery({}));
+
+  assert.equal(result.items[0].question_count, 1006);
+  assert.ok(!result.truncated.includes('question_count'));
+});
+
 test('the draft filter asks the database for unpublished papers only', async () => {
   state.examPapers = [
     paper({ id: 'draft-1', is_published: false }),
