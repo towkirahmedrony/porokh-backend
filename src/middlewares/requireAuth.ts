@@ -124,6 +124,12 @@ export const requireAuth = async (req: AuthReq, res: Response, next: NextFunctio
     }
 
     req.user = { id: user.id };
+    // Share the state that was just verified so `rbacGuard` does not read the
+    // same `profiles` row again for every privileged request.
+    req.authAccount = {
+      accountStatus: account.accountStatus,
+      sessionsRevokedAt: account.sessionsRevokedAt,
+    };
     // Retain only in request memory so privileged RPCs can verify auth.uid()
     // independently in Postgres. Never persist or log this token.
     req.accessToken = token;
