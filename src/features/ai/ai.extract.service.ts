@@ -1,4 +1,5 @@
 import logger from '../../lib/utils/logger';
+import { SemaphoreBusyError, createSemaphore } from '../../lib/utils/semaphore';
 import {
   ExtractionProviderError,
   callExtractionProvider,
@@ -29,15 +30,47 @@ import {
 
 const REQUEST_TIMEOUT_MS = 90_000;
 
+/**
+ * How many extraction calls this process sends to the provider at once.
+ *
+ * Each call can hold a 90-second model request plus a multi-megabyte request
+ * body, so an unbounded burst is the one place in the API that can exhaust the
+ * instance on its own. Three concurrent calls keep the importer usable for a
+ * small team while leaving headroom for the rest of the API.
+ */
+const resolveMaxConcurrency = (): number => {
+  const configured = Number(process.env.EXTRACTION_MAX_CONCURRENCY);
+  if (!Number.isFinite(configured) || configured <= 0) return 3;
+  return Math.min(Math.floor(configured), 10);
+};
+
+/** A short wait, then a clear 503: queueing megabytes for minutes helps nobody. */
+const EXTRACTION_QUEUE_WAIT_MS = 10_000;
+
+const extractionSemaphore = createSemaphore(resolveMaxConcurrency(), EXTRACTION_QUEUE_WAIT_MS);
+
+export const extractionConcurrency = () => ({
+  in_use: extractionSemaphore.inUse(),
+  waiting: extractionSemaphore.waiting(),
+});
+
 export class ExtractionServiceError extends Error {
   status: number;
   errorCode: string;
+  /** Set when the client should wait before retrying (overload, rate limit). */
+  retryAfterSeconds?: number;
 
-  constructor(message: string, status: number, errorCode = 'EXTRACTION_FAILED') {
+  constructor(
+    message: string,
+    status: number,
+    errorCode = 'EXTRACTION_FAILED',
+    retryAfterSeconds?: number
+  ) {
     super(message);
     this.name = 'ExtractionServiceError';
     this.status = status;
     this.errorCode = errorCode;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -185,7 +218,8 @@ const mapProviderError = (error: ExtractionProviderError): ExtractionServiceErro
       return new ExtractionServiceError(
         'The AI service is busy right now. Please wait a moment and retry.',
         429,
-        'EXTRACTION_RATE_LIMITED'
+        'EXTRACTION_RATE_LIMITED',
+        30
       );
     case 'invalid_response':
       return new ExtractionServiceError(
@@ -229,6 +263,25 @@ export const extractQuestionsFromSources = async (
     throw error instanceof ExtractionProviderError ? mapProviderError(error) : error;
   }
 
+  // The permit is taken only after the request has been validated, and it is
+  // released in `finally`, so a provider failure or timeout can never leak a
+  // slot and permanently shrink extraction capacity.
+  let release: () => void;
+  try {
+    release = await extractionSemaphore.acquire();
+  } catch (error) {
+    if (error instanceof SemaphoreBusyError) {
+      logger.warn('[ai:extract] rejected: extraction concurrency saturated');
+      throw new ExtractionServiceError(
+        'The AI extraction service is busy. Please retry in a moment.',
+        503,
+        'EXTRACTION_BUSY',
+        15
+      );
+    }
+    throw error;
+  }
+
   let text: string;
   try {
     const result = await callExtractionProvider({
@@ -250,6 +303,8 @@ export const extractQuestionsFromSources = async (
     throw mapProviderError(
       new ExtractionProviderError('The AI extraction provider failed.', 'unavailable')
     );
+  } finally {
+    release();
   }
 
   let sanitized;

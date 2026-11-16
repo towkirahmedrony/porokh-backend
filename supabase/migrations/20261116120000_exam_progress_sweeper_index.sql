@@ -1,0 +1,52 @@
+-- Performance: index the expired-attempt sweeper query.
+--
+-- Applied on 2026-11-16. The file was written after auditing the live catalog
+-- with pg_indexes, so only the one genuinely missing index is defined here.
+--
+-- The sweeper runs every five minutes and issues:
+--
+--   UPDATE public.exam_progress SET status = 'expired'
+--    WHERE id = ANY($1)
+--      AND status = 'in_progress'
+--      AND deadline_at < $2;
+--
+-- plus the batch selection that feeds it:
+--
+--   SELECT id FROM public.exam_progress
+--    WHERE status = 'in_progress' AND deadline_at < $2
+--    LIMIT $3;
+--
+-- Audited existing indexes on exam_progress (verified, not assumed):
+--   exam_progress_pkey                     (id)
+--   exam_progress_active_exam_attempt_uidx (user_id, exam_id) WHERE status='in_progress'
+--   exam_progress_user_exam_idx            (user_id, exam_id)
+--   exam_progress_source_history_idx       (source_history_id) WHERE NOT NULL
+--
+-- None of them covers a filter on deadline_at, so the batch selection is a
+-- sequential scan of the whole table every five minutes. The partial index only
+-- stores rows that are still in progress, which is a tiny slice of the table and
+-- keeps the write cost of insert/submit/expire low.
+--
+-- The other candidate indexes from the audit were deliberately NOT added because
+-- they already exist:
+--   exam_history(attempt_id)            -> exam_history_attempt_id_uidx (partial unique)
+--   exam_history(user_id, exam_id)      -> idx_exam_history_user_exam
+--   exam_paper_questions(exam_id, seq)  -> exam_paper_questions_exam_id_sequence_key (unique)
+--   notifications(status, scheduled_at) -> idx_notifications_scheduled_due (partial)
+--   user_devices(user_id)               -> idx_user_devices_user_id
+--   user_roles(user_id, is_active)      -> user_roles_one_active_role_per_user (partial unique)
+--
+-- `deadline_at` is nullable (legacy in-progress rows have no authoritative
+-- deadline). Those rows are excluded by the `<` comparison either way and the
+-- application treats a missing deadline as expired, so no backfill is required.
+--
+-- Rollback:
+--   DROP INDEX IF EXISTS public.exam_progress_in_progress_deadline_idx;
+--
+-- On a large table, apply this statement outside a transaction block instead:
+--   CREATE INDEX CONCURRENTLY ... (the migration runner wraps files in a
+--   transaction, and CONCURRENTLY cannot run inside one).
+
+CREATE INDEX IF NOT EXISTS exam_progress_in_progress_deadline_idx
+  ON public.exam_progress (deadline_at)
+  WHERE status = 'in_progress';

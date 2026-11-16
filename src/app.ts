@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 import { createCorsOptions } from './config/cors';
 import { requireSupportedNativeVersion } from './middlewares/requireSupportedNativeVersion';
+import { requestTiming } from './middlewares/requestMetrics';
+import { liveProbe, readyProbe } from './features/system/health.controller';
 
 // রাউট ইম্পোর্ট
 import authRoutes from './features/auth/auth.routes';
@@ -65,6 +67,9 @@ const app: Application = express();
 // left-most X-Forwarded-For entry and defeat IP rate limiting.
 app.set('trust proxy', 1);
 
+// Emits one structured line per slow request; see requestMetrics.ts.
+app.use(requestTiming);
+
 app.use(
   cors(
     createCorsOptions({
@@ -96,13 +101,19 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Health Check Route
+// Health Check Route (unchanged: existing uptime checks depend on this shape)
 app.get('/health', (req: Request, res: Response) => {
   res.status(200).json({
     success: true,
     message: 'ParaPoth API is running perfectly!'
   });
 });
+
+// Liveness never touches a dependency, so a database outage cannot make Render
+// restart an otherwise healthy process. Readiness fails closed (503) when the
+// database cannot be reached within its short timeout.
+app.get('/health/live', liveProbe);
+app.get('/health/ready', readyProbe);
 
 // Application Routes (Standard API v1)
 import phoneVerifyRoutes from './modules/phone-verify/phone-verify.routes';

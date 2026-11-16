@@ -991,16 +991,47 @@ export class ExamUserService {
     let resultPublishTime: string | null = null;
     let examTitle = 'Exam';
 
-    if (examId) {
-      const { data: examData, error: examError } = await measureSubmissionPhase(
-        trace,
-        'exam_metadata_retrieval',
-        () => measureSupabaseOperation(trace, 'exam_papers.read_submission_metadata', () => supabase
-          .from('exam_papers')
-          .select('id, title, title_en, default_negative_marks, total_marks, result_publish_time, is_published')
-          .eq('id', examId)
-          .maybeSingle())
-      );
+    // Paper metadata, per-question marks and question content are three
+    // independent reads. They are issued together so a submission pays one
+    // round-trip wait instead of three; the checks below still run in their
+    // original order, so error priority is unchanged.
+    const examMetaRead = examId
+      ? measureSubmissionPhase(
+          trace,
+          'exam_metadata_retrieval',
+          () => measureSupabaseOperation(trace, 'exam_papers.read_submission_metadata', () => supabase
+            .from('exam_papers')
+            .select('id, title, title_en, default_negative_marks, total_marks, result_publish_time, is_published')
+            .eq('id', examId)
+            .maybeSingle())
+        )
+      : null;
+
+    const questionConfigRead = examId
+      ? measureSubmissionPhase(
+          trace,
+          'question_configuration_retrieval',
+          () => measureSupabaseOperation(trace, 'exam_paper_questions.read_marks', () => supabase
+            .from('exam_paper_questions')
+            .select('question_id, marks, negative_marks')
+            .eq('exam_id', examId))
+        )
+      : null;
+
+    const questionsRead = measureSupabaseOperation(
+      trace,
+      'questions.read_for_submission',
+      () => supabase
+        .from('questions')
+        .select(EXAM_REVIEW_QUESTION_SELECT_QUERY)
+        .in('id', questionIds)
+        .eq('is_active', true)
+        .eq('status', 'published')
+        .is('deleted_at', null)
+    );
+
+    if (examId && examMetaRead) {
+      const { data: examData, error: examError } = await examMetaRead;
 
       if (examError) {
         if (attempt && historyId) {
@@ -1033,15 +1064,8 @@ export class ExamUserService {
 
     const questionConfig = new Map<string, QuestionMarkConfig>();
 
-    if (examId) {
-      const { data: configRows, error: configError } = await measureSubmissionPhase(
-        trace,
-        'question_configuration_retrieval',
-        () => measureSupabaseOperation(trace, 'exam_paper_questions.read_marks', () => supabase
-          .from('exam_paper_questions')
-          .select('question_id, marks, negative_marks')
-          .eq('exam_id', examId))
-      );
+    if (examId && questionConfigRead) {
+      const { data: configRows, error: configError } = await questionConfigRead;
 
       if (configError) {
         if (attempt && historyId) {
@@ -1062,17 +1086,7 @@ export class ExamUserService {
       });
     }
 
-    const { data: questions, error: questionsError } = await measureSupabaseOperation(
-      trace,
-      'questions.read_for_submission',
-      () => supabase
-        .from('questions')
-        .select(EXAM_REVIEW_QUESTION_SELECT_QUERY)
-        .in('id', questionIds)
-        .eq('is_active', true)
-        .eq('status', 'published')
-        .is('deleted_at', null)
-    );
+    const { data: questions, error: questionsError } = await questionsRead;
 
     if (questionsError) {
       if (attempt && historyId) {

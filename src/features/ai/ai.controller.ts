@@ -61,6 +61,12 @@ export const extractQuestions = catchAsync(async (req: Request, res: Response) =
     });
   } catch (error) {
     if (error instanceof ExtractionValidationError || error instanceof ExtractionServiceError) {
+      // Overload and upstream rate limits tell the importer when to come back.
+      const retryAfter = (error as { retryAfterSeconds?: number }).retryAfterSeconds;
+      if (typeof retryAfter === 'number' && retryAfter > 0) {
+        res.setHeader('Retry-After', String(Math.ceil(retryAfter)));
+      }
+
       return sendResponse(res, {
         statusCode: error.status,
         success: false,

@@ -1,6 +1,7 @@
 import { supabase } from '../../config/supabase';
 import { createUserSupabaseClient } from '../../config/userSupabase';
 import { CANONICAL_ROLES, isCanonicalRole } from '../../middlewares/authorization';
+import { invalidateUserRole } from '../../middlewares/roleCache';
 import { isUuid } from '../../lib/utils/search';
 import { UsersAdminError, type RolesOverview } from './users.admin.types';
 
@@ -186,6 +187,10 @@ export const assignUserRole = async (
     console.error('[users] role assignment failed:', error.code ?? 'unknown');
     throw new UsersAdminError('The role could not be changed', 500);
   }
+
+  // The target's cached role is dropped so the change is visible on the next
+  // request served by this instance; the short TTL covers other instances.
+  invalidateUserRole(targetUserId);
 
   return data as { user_id: string; role: string; is_active: boolean } | null;
 };

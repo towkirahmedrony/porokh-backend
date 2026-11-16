@@ -296,12 +296,25 @@ export class ExamAttemptService {
       );
     }
 
+    // Access state and the active attempt are independent reads, so they overlap
+    // instead of running back to back. `allSettled` keeps the original error
+    // priority: an access failure is still reported before a premium rejection,
+    // and a premium rejection before an attempt-read failure.
+    const [accessResult, existingResult] = await Promise.allSettled([
+      loadUserAccess(userId),
+      ExamAttemptService.findActiveExamAttempt(userId, normalizedExamId),
+    ]);
+
+    if (accessResult.status === 'rejected') throw accessResult.reason;
+
     // Premium papers are authorised server-side. This runs before any attempt
     // is created or resumed, so a locked paper can never yield a question set
     // and no quota is consumed for a request that will be rejected.
-    assertPremiumContentAccess(exam, await loadUserAccess(userId));
+    assertPremiumContentAccess(exam, accessResult.value);
 
-    const existing = await ExamAttemptService.findActiveExamAttempt(userId, normalizedExamId);
+    if (existingResult.status === 'rejected') throw existingResult.reason;
+
+    const existing = existingResult.value;
 
     if (existing) {
       if (isAttemptExpired(existing.deadline_at, now)) {
@@ -338,11 +351,21 @@ export class ExamAttemptService {
       return toAttemptDto(existing, now);
     }
 
-    // One attempt per exam. This application-level check runs before questions
-    // are loaded or quota is consumed, so an already-completed exam never costs
-    // the student a free-start credit. The database trigger remains the
-    // authoritative concurrency safeguard (SQLSTATE P0409, handled below).
-    const completed = await ExamAttemptService.findHistoryForUserExam(userId, normalizedExamId);
+    // One attempt per exam. This application-level check runs before quota is
+    // consumed, so an already-completed exam never costs the student a
+    // free-start credit. The database trigger remains the authoritative
+    // concurrency safeguard (SQLSTATE P0409, handled below).
+    //
+    // The history check and the question-set read are independent, so they run
+    // together; the history error is still surfaced first, as before.
+    const [completedResult, questionIdsResult] = await Promise.allSettled([
+      ExamAttemptService.findHistoryForUserExam(userId, normalizedExamId),
+      loadAuthoritativeQuestionIds(normalizedExamId),
+    ]);
+
+    if (completedResult.status === 'rejected') throw completedResult.reason;
+
+    const completed = completedResult.value;
 
     if (completed) {
       throw new ExamAttemptError('You have already taken this exam', 409, {
@@ -351,7 +374,10 @@ export class ExamAttemptService {
       });
     }
 
-    const questionIds = await loadAuthoritativeQuestionIds(normalizedExamId);
+    if (questionIdsResult.status === 'rejected') throw questionIdsResult.reason;
+
+    const questionIds = questionIdsResult.value;
+
     if (questionIds.length === 0) {
       throw new ExamAttemptError('Exam question set is not configured', 400);
     }
