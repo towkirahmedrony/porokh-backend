@@ -3,14 +3,27 @@ import { supabaseAdmin as supabase } from '../config/supabaseAdmin';
 import logger from '../lib/utils/logger';
 import { generateVectorEmbedding } from '../features/ai/ai.service';
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export const processStaleEmbeddings = async () => {
+type WorkerOptions = {
+  /** Overridable pacing timer; production uses the real timer. */
+  delay?: (ms: number) => Promise<void>;
+};
+
+export const processStaleEmbeddings = async (options: WorkerOptions = {}) => {
+  const sleep = options.delay ?? defaultSleep;
+
   try {
     const { data: staleQuestions, error: fetchError } = await supabase
       .from('questions')
       .select('id, body, explanation, subject_id')
       .eq('is_embedding_stale', true)
+      // Ordering by id lets the partial index on `(id) WHERE is_embedding_stale`
+      // answer this without a sort, and makes a batch deterministic. No keyset
+      // cursor is kept: each processed row leaves the predicate, so the next run
+      // naturally starts at the next stale row, while a row that failed stays
+      // first in line to be retried.
+      .order('id', { ascending: true })
       .limit(12);
 
     if (fetchError) {

@@ -1,0 +1,55 @@
+-- Performance: index the embedding worker's stale-question batch selection.
+--
+-- Applied on 2026-11-16 after a read-only audit of this project
+-- (pg_stat_statements + pg_indexes + EXPLAIN). The worker runs every five
+-- minutes and issues, through PostgREST:
+--
+--   SELECT id, body, explanation, subject_id
+--     FROM public.questions
+--    WHERE is_embedding_stale = true
+--    ORDER BY id
+--    LIMIT 12;
+--
+-- Measured before this index (statistics since 2026-01-26): 7,485 calls,
+-- mean 30.32 ms, total 226,956 ms, and 32,413 sequential scans of questions
+-- reading 9,865,221 tuples. Verified plan at that time:
+--
+--   Limit  (cost=0.00..452.92 rows=1 width=700)
+--     ->  Seq Scan on questions  (cost=0.00..452.92 rows=1 width=700)
+--           Filter: is_embedding_stale
+--
+-- Audited existing indexes on questions (verified against the live catalog, not
+-- assumed) — none of them covers the is_embedding_stale filter:
+--   questions_pkey                     (id)
+--   unique_subject_content             (subject_id, content_hash)
+--   idx_questions_active               (is_active) WHERE is_active
+--   idx_questions_content_fingerprint  (subject_id, content_fingerprint) WHERE ...
+--   idx_questions_hierarchy            (subject_id, chapter_id, topic_id)
+--   idx_questions_status               (status)
+--   idx_questions_subject_chapter      (subject_id, chapter_id)
+--   idx_questions_tags                 USING gin (tags)
+--   idx_questions_search               USING gin (search_vector)
+--   idx_questions_search_vector        USING gin (search_vector)  <- duplicate, untouched
+--   idx_questions_exam_refs            USING gin (exam_references)
+--   idx_questions_exam_references_gin  USING gin (exam_references) <- duplicate, untouched
+--
+-- The partial index only holds questions that still await an embedding. That is
+-- a tiny slice of the table at steady state because the worker flips each
+-- processed row back to false, so insert/import write cost stays low. It is
+-- keyed on `id` so the worker's ORDER BY id needs no sort step. The payload
+-- columns (body, explanation) are deliberately not included: they are large
+-- JSONB values and a batch only ever fetches 12 rows from the heap.
+--
+-- `is_embedding_stale` is nullable, but NULL rows are excluded by both the index
+-- predicate and the worker query, so no backfill is required.
+--
+-- Rollback:
+--   DROP INDEX IF EXISTS public.idx_questions_embedding_stale;
+--
+-- On a large table, apply this statement outside a transaction block instead:
+--   CREATE INDEX CONCURRENTLY ... (the migration runner wraps files in a
+--   transaction, and CONCURRENTLY cannot run inside one).
+
+CREATE INDEX IF NOT EXISTS idx_questions_embedding_stale
+  ON public.questions (id)
+  WHERE is_embedding_stale = true;
