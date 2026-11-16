@@ -1562,38 +1562,55 @@ export class ExamUserService {
       throw new ExamAttemptError('Attempt has no question set', 409);
     }
 
-    const { data, error } = await supabase
-      .from('questions')
-      .select(EXAM_QUESTION_SELECT_QUERY)
-      .in('id', questionIds)
-      .eq('is_active', true)
-      .eq('status', 'published')
-      .is('deleted_at', null);
+    // The question rows and the per-question marks are independent reads, so
+    // they are issued together instead of one after the other. Each loader
+    // resolves to `{ rows, error }` instead of rejecting, which keeps the
+    // original error priority: a question-read failure is reported before a
+    // marks-read failure.
+    const loadQuestionRows = async () => {
+      const { data, error } = await supabase
+        .from('questions')
+        .select(EXAM_QUESTION_SELECT_QUERY)
+        .in('id', questionIds)
+        .eq('is_active', true)
+        .eq('status', 'published')
+        .is('deleted_at', null);
 
-    if (error) throw new Error(error.message);
+      return { rows: (data || []) as AnyObject[], error };
+    };
 
-    const byId = new Map<string, AnyObject>();
-    (data || []).forEach((question: AnyObject) => byId.set(normalizeId(question.id), question));
+    const loadQuestionMarks = async () => {
+      if (!attempt.exam_id) return { rows: [] as AnyObject[], error: null };
 
-    const questionConfig = new Map<string, QuestionMarkConfig>();
-
-    if (attempt.exam_id) {
-      const { data: configRows, error: configError } = await supabase
+      const { data, error } = await supabase
         .from('exam_paper_questions')
         .select('question_id, marks, negative_marks')
         .eq('exam_id', attempt.exam_id);
 
-      if (configError) throw new Error(configError.message);
+      return { rows: (data || []) as AnyObject[], error };
+    };
 
-      (configRows || []).forEach((row: AnyObject) => {
-        const questionId = normalizeId(row.question_id);
-        if (!questionId) return;
-        questionConfig.set(questionId, {
-          marks: row.marks ?? null,
-          negative_marks: row.negative_marks ?? null,
-        });
+    const [questionRead, marksRead] = await Promise.all([
+      loadQuestionRows(),
+      loadQuestionMarks(),
+    ]);
+
+    if (questionRead.error) throw new Error(questionRead.error.message);
+    if (marksRead.error) throw new Error(marksRead.error.message);
+
+    const byId = new Map<string, AnyObject>();
+    questionRead.rows.forEach((question) => byId.set(normalizeId(question.id), question));
+
+    const questionConfig = new Map<string, QuestionMarkConfig>();
+
+    marksRead.rows.forEach((row) => {
+      const questionId = normalizeId(row.question_id);
+      if (!questionId) return;
+      questionConfig.set(questionId, {
+        marks: row.marks ?? null,
+        negative_marks: row.negative_marks ?? null,
       });
-    }
+    });
 
     // Preserve the frozen attempt order and drop anything that is no longer
     // available rather than leaking an unpublished question.

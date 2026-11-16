@@ -22,6 +22,11 @@ type FakeState = {
   tableCalls: string[];
   rpcQuestions: Row[];
   xpAwards: Row[];
+  failQuestionsQuery: boolean;
+  failMarksQuery: boolean;
+  slowQuestionsMs: number;
+  questionsSettled: boolean;
+  questionsSettledBeforeMarksQuery: boolean;
 };
 
 const state: FakeState = {
@@ -36,6 +41,11 @@ const state: FakeState = {
   tableCalls: [],
   rpcQuestions: [],
   xpAwards: [],
+  failQuestionsQuery: false,
+  failMarksQuery: false,
+  slowQuestionsMs: 0,
+  questionsSettled: false,
+  questionsSettledBeforeMarksQuery: false,
 };
 
 let attemptSeq = 0;
@@ -79,7 +89,7 @@ const createBuilder = (table: string) => {
     return true;
   };
 
-  const resolveQuery = (mode: 'many' | 'single') => {
+  const resolveQuery = async (mode: 'many' | 'single') => {
     state.tableCalls.push(`${table}:${mode}`);
 
     if (table === 'exam_papers') {
@@ -88,6 +98,14 @@ const createBuilder = (table: string) => {
     }
 
     if (table === 'exam_paper_questions') {
+      // Records whether the question read had already completed when this
+      // (independent) read started: false only when both run concurrently.
+      state.questionsSettledBeforeMarksQuery = state.questionsSettled;
+
+      if (state.failMarksQuery) {
+        return { data: null, error: { message: 'per-question marks read failed' } };
+      }
+
       const rows = state.examPaperQuestions.filter((item) =>
         sameValue(item.exam_id, filters.exam_id)
       );
@@ -95,6 +113,16 @@ const createBuilder = (table: string) => {
     }
 
     if (table === 'questions') {
+      if (state.slowQuestionsMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, state.slowQuestionsMs));
+      }
+
+      state.questionsSettled = true;
+
+      if (state.failQuestionsQuery) {
+        return { data: null, error: { message: 'question rows read failed' } };
+      }
+
       const ids: string[] = Array.isArray(filters.id) ? filters.id.map(String) : [];
       const rows =
         ids.length > 0
@@ -372,6 +400,11 @@ beforeEach(() => {
   state.tableCalls = [];
   state.rpcQuestions = questions.map((question) => ({ ...question }));
   state.xpAwards = [];
+  state.failQuestionsQuery = false;
+  state.failMarksQuery = false;
+  state.slowQuestionsMs = 0;
+  state.questionsSettled = false;
+  state.questionsSettledBeforeMarksQuery = false;
 });
 
 test('arena question retrieval never exposes correct flags or explanations', async () => {
@@ -936,4 +969,104 @@ test('a tracked practice result reveals keys and explanations for its own questi
 
   const foreign = await ExamUserService.getExamResult('user-2', result.id);
   assert.equal(foreign, null);
+});
+
+test('attempt question rows and per-question marks are fetched concurrently', async () => {
+  seedAttempt({ question_ids: [uuid('1'), uuid('2')] });
+  state.slowQuestionsMs = 5;
+
+  const response = await ExamUserService.getAttemptQuestions('user-1', 'seed-attempt-1');
+
+  assert.deepEqual(
+    response.questions.map((question: Row) => question.id),
+    [uuid('1'), uuid('2')]
+  );
+  // The marks read started while the question read was still in flight, so the
+  // two independent queries are not serialised.
+  assert.equal(state.questionsSettledBeforeMarksQuery, false);
+});
+
+test('attempt validation runs before any question read', async () => {
+  seedAttempt({ status: 'submitted' });
+  state.tableCalls.length = 0;
+
+  await assert.rejects(
+    ExamUserService.getAttemptQuestions('user-1', 'seed-attempt-1'),
+    /no longer active/
+  );
+
+  assert.equal(
+    state.tableCalls.some((call) => call.startsWith('questions:')),
+    false
+  );
+  assert.equal(
+    state.tableCalls.some((call) => call.startsWith('exam_paper_questions:')),
+    false
+  );
+});
+
+test('attempt questions keep the frozen attempt order and drop unavailable rows', async () => {
+  seedAttempt({ question_ids: [uuid('2'), uuid('1'), 'missing-question'] });
+
+  const response = await ExamUserService.getAttemptQuestions('user-1', 'seed-attempt-1');
+
+  assert.deepEqual(
+    response.questions.map((question: Row) => question.id),
+    [uuid('2'), uuid('1')]
+  );
+  assert.equal(hasCorrectFlag(response.questions[0].options), false);
+});
+
+test('per-question marks are merged and missing marks keep the existing defaults', async () => {
+  seedAttempt({ question_ids: [uuid('1'), uuid('2'), uuid('3')] });
+  state.examPaperQuestions = [
+    { exam_id: 'exam-1', question_id: uuid('1'), marks: 4, negative_marks: 1 },
+    { exam_id: 'exam-1', question_id: uuid('2'), marks: null, negative_marks: null },
+  ];
+
+  const response = await ExamUserService.getAttemptQuestions('user-1', 'seed-attempt-1');
+  const byId = (id: string) =>
+    response.questions.find((question: Row) => question.id === id);
+
+  assert.equal(byId(uuid('1')).marks, 4);
+  assert.equal(byId(uuid('1')).negative_marks, 1);
+  // A config row with null marks stays undefined, exactly as before.
+  assert.equal(byId(uuid('2')).marks, undefined);
+  // No config row at all: the question is served without marks fields.
+  assert.equal(byId(uuid('3')).marks, undefined);
+  assert.equal(byId(uuid('3')).negative_marks, undefined);
+});
+
+test('a practice attempt without an exam paper issues no marks query', async () => {
+  seedAttempt({ exam_id: null, kind: 'practice', question_ids: [uuid('1')] });
+  state.tableCalls.length = 0;
+
+  const response = await ExamUserService.getAttemptQuestions('user-1', 'seed-attempt-1');
+
+  assert.equal(response.questions.length, 1);
+  assert.equal(
+    state.tableCalls.some((call) => call.startsWith('exam_paper_questions:')),
+    false
+  );
+  assert.equal(response.questions[0].marks, undefined);
+});
+
+test('a question row read failure keeps the previous error behaviour', async () => {
+  seedAttempt();
+  state.failQuestionsQuery = true;
+
+  await assert.rejects(
+    ExamUserService.getAttemptQuestions('user-1', 'seed-attempt-1'),
+    /question rows read failed/
+  );
+});
+
+test('a per-question marks read failure keeps the previous error behaviour', async () => {
+  seedAttempt();
+  state.failMarksQuery = true;
+
+  await assert.rejects(
+    ExamUserService.getAttemptQuestions('user-1', 'seed-attempt-1'),
+    /per-question marks read failed/
+  );
 });

@@ -13,6 +13,7 @@ import {
   isAttemptExpired,
   isAttemptExpiredForAttempt,
   isUntimedPracticeAttempt,
+  QUIZ_PRACTICE_MODES,
   resolveAttemptDeadline,
   resolvePracticeDeadline,
   resolveSubmitGraceMs,
@@ -570,24 +571,7 @@ export class ExamAttemptService {
     answers: unknown,
     currentQuestionIndex?: unknown
   ): Promise<AttemptDto> {
-    // Only the timing/ownership fields are needed here. Selecting the full
-    // attempt would pull the whole answer draft on every autosave.
-    const { data: attempt, error: attemptError } = await supabase
-      .from('exam_progress')
-      .select('id, status, practice_mode, deadline_at')
-      .eq('id', normalizeId(attemptId))
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (attemptError) throw new Error(attemptError.message);
-    if (!attempt) throw new ExamAttemptError('Attempt not found', 404);
-    if (attempt.status !== ATTEMPT_STATUS.IN_PROGRESS) {
-      throw new ExamAttemptError('Attempt is no longer in progress', 409);
-    }
-    if (isAttemptExpiredForAttempt(attempt)) {
-      await ExamAttemptService.expireAttempt(attempt.id);
-      throw new ExamAttemptError('Exam attempt has expired', 409);
-    }
+    const normalizedAttemptId = normalizeId(attemptId);
 
     // `answers === undefined` is a position-only save (quiz navigation). It
     // must not overwrite a newer draft written by the answer endpoint.
@@ -607,28 +591,51 @@ export class ExamAttemptService {
 
     if (safeAnswers !== null) updates.answers_draft = safeAnswers;
 
-    // The update is conditional on in_progress AND an unexpired deadline so a
-    // concurrent submit/expire cannot be overwritten, and it never touches
-    // started_at/deadline_at (a retry can never extend the exam).
-    let updateQuery = supabase
+    // One conditional UPDATE ... RETURNING replaces the previous read-then-write.
+    // Ownership, status and the deadline are all enforced by the database, so a
+    // concurrent submit/expire can never be overwritten and a retry can never
+    // extend the exam (started_at/deadline_at are not in `updates`). The two
+    // quiz practice modes are deliberately untimed (`deadline_at IS NULL`).
+    const { data, error } = await supabase
       .from('exam_progress')
       .update(updates)
-      .eq('id', attempt.id)
+      .eq('id', normalizedAttemptId)
       .eq('user_id', userId)
-      .eq('status', ATTEMPT_STATUS.IN_PROGRESS);
-
-    if (!isUntimedPracticeAttempt(attempt)) {
-      updateQuery = updateQuery.gt('deadline_at', toIso(now));
-    }
-
-    const { data, error } = await updateQuery.select(ATTEMPT_SELECT);
+      .eq('status', ATTEMPT_STATUS.IN_PROGRESS)
+      .or(
+        `deadline_at.gt.${toIso(now)},and(deadline_at.is.null,practice_mode.in.(${QUIZ_PRACTICE_MODES.join(',')}))`
+      )
+      .select(ATTEMPT_SELECT);
 
     if (error) throw new Error(error.message);
-    if (!data || data.length === 0) {
+    if (data && data.length > 0) return toAttemptDto(data[0], now);
+
+    // Zero rows: missing, owned by another user, no longer in progress or past
+    // the deadline. Read the row back only to return the same error the previous
+    // implementation returned; nothing is written here.
+    const { data: latest, error: latestError } = await supabase
+      .from('exam_progress')
+      .select('id, user_id, status, practice_mode, deadline_at')
+      .eq('id', normalizedAttemptId)
+      .maybeSingle();
+
+    if (latestError) throw new Error(latestError.message);
+
+    // Another user's attempt stays indistinguishable from a missing one.
+    if (!latest || normalizeId(latest.user_id) !== normalizeId(userId)) {
+      throw new ExamAttemptError('Attempt not found', 404);
+    }
+    if (latest.status !== ATTEMPT_STATUS.IN_PROGRESS) {
       throw new ExamAttemptError('Attempt is no longer in progress', 409);
     }
+    if (isAttemptExpiredForAttempt(latest)) {
+      await ExamAttemptService.expireAttempt(latest.id);
+      throw new ExamAttemptError('Exam attempt has expired', 409);
+    }
 
-    return toAttemptDto(data[0], now);
+    // The row still looks open but the UPDATE matched nothing: a concurrent
+    // request changed it between the write and this read. Report the same 409.
+    throw new ExamAttemptError('Attempt is no longer in progress', 409);
   }
 
   /**

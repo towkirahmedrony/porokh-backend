@@ -18,6 +18,8 @@ const state: {
   examHistory: Row[];
   progress: Row[];
   updates: Row[];
+  queries: string[];
+  forceNextUpdateMiss: boolean;
 } = {
   examPapers: [],
   examPaperQuestions: [],
@@ -26,11 +28,71 @@ const state: {
   examHistory: [],
   progress: [],
   updates: [],
+  queries: [],
+  forceNextUpdateMiss: false,
 };
 
 let seq = 0;
 
-const matches = (row: Row, filters: Record<string, any>, ranges: Row[]) => {
+const splitTopLevel = (input: string): string[] => {
+  const members: string[] = [];
+  let depth = 0;
+  let current = '';
+
+  for (const char of input) {
+    if (char === '(') depth += 1;
+    if (char === ')') depth -= 1;
+
+    if (char === ',' && depth === 0) {
+      members.push(current);
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current) members.push(current);
+
+  return members;
+};
+
+// Mirrors the subset of PostgREST logic trees the service actually emits.
+const evaluateOrMember = (row: Row, member: string): boolean => {
+  const nested = /^(and|or)\((.*)\)$/s.exec(member);
+
+  if (nested) {
+    const results = splitTopLevel(nested[2]).map((entry) => evaluateOrMember(row, entry));
+    return nested[1] === 'and' ? results.every(Boolean) : results.some(Boolean);
+  }
+
+  const [column, operator, ...rest] = member.split('.');
+  const value = rest.join('.');
+  const actual = row[column];
+
+  if (operator === 'is') {
+    return value === 'null'
+      ? actual === null || actual === undefined
+      : String(actual) === value;
+  }
+
+  if (operator === 'in') {
+    const allowed = value.replace(/^\(/, '').replace(/\)$/, '').split(',');
+    return allowed.some((entry) => String(actual) === entry);
+  }
+
+  if (operator === 'gt') return Date.parse(String(actual)) > Date.parse(value);
+  if (operator === 'eq') return String(actual) === value;
+
+  return false;
+};
+
+const matches = (
+  row: Row,
+  filters: Record<string, any>,
+  ranges: Row[],
+  orExpressions: string[] = []
+) => {
   for (const [column, value] of Object.entries(filters)) {
     if (value === null) {
       if (row[column] !== null && row[column] !== undefined) return false;
@@ -51,16 +113,23 @@ const matches = (row: Row, filters: Record<string, any>, ranges: Row[]) => {
     if (!(actual > boundary)) return false;
   }
 
+  for (const expression of orExpressions) {
+    if (!splitTopLevel(expression).some((member) => evaluateOrMember(row, member))) return false;
+  }
+
   return true;
 };
 
 const createBuilder = (table: string) => {
   const filters: Record<string, any> = {};
   const ranges: Row[] = [];
+  const orExpressions: string[] = [];
   let inserted: Row[] | null = null;
   let update: Row | null = null;
 
   const resolve = (mode: 'many' | 'single') => {
+    state.queries.push(`${table}:${mode}`);
+
     if (table === 'exam_papers') {
       const row = state.examPapers.find((item) => matches(item, filters, ranges));
       return { data: mode === 'single' ? row ?? null : row ? [row] : [], error: null };
@@ -117,7 +186,12 @@ const createBuilder = (table: string) => {
       }
 
       if (update) {
-        const rows = state.attempts.filter((item) => matches(item, filters, ranges));
+        const forcedMiss = state.forceNextUpdateMiss;
+        state.forceNextUpdateMiss = false;
+
+        const rows = forcedMiss
+          ? []
+          : state.attempts.filter((item) => matches(item, filters, ranges, orExpressions));
         state.updates.push({ ...update, matched: rows.length });
         rows.forEach((row) => Object.assign(row, update));
         return { data: rows, error: null };
@@ -158,6 +232,10 @@ const createBuilder = (table: string) => {
     is: () => builder,
     gt: (column: string, value: any) => {
       ranges.push({ column, value });
+      return builder;
+    },
+    or: (expression: string) => {
+      orExpressions.push(expression);
       return builder;
     },
     gte: () => builder,
@@ -236,6 +314,8 @@ beforeEach(() => {
   state.attempts = [];
   state.examHistory = [];
   state.updates = [];
+  state.queries = [];
+  state.forceNextUpdateMiss = false;
 });
 
 test('the server derives the authoritative deadline from exam configuration', async () => {
@@ -568,4 +648,121 @@ test('an untimed quiz practice attempt stays resumable, editable and submittable
   );
   assert.equal(claim.claimed, true);
   assert.equal(state.attempts[0].status, ATTEMPT_STATUS.SUBMITTED);
+});
+
+test('a successful autosave is one conditional write, not a read then write', async () => {
+  const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
+
+  state.queries.length = 0;
+
+  const saved = await ExamAttemptService.saveDraftAnswers(
+    'user-1',
+    attempt.id,
+    { 'q-1': 'opt-a' },
+    1
+  );
+
+  assert.deepEqual(state.queries, ['exam_progress:many']);
+  assert.equal(saved.answers_draft['q-1'], 'opt-a');
+  assert.equal(saved.current_question_index, 1);
+  assert.equal(saved.status, ATTEMPT_STATUS.IN_PROGRESS);
+});
+
+test("autosave never writes to another user's attempt", async () => {
+  const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
+
+  await assert.rejects(
+    ExamAttemptService.saveDraftAnswers('user-2', attempt.id, { 'q-1': 'opt-b' }, 1),
+    (error: any) =>
+      error instanceof ExamAttemptError &&
+      error.status === 404 &&
+      error.message === 'Attempt not found'
+  );
+
+  assert.deepEqual(state.attempts[0].answers_draft, {});
+  assert.equal(state.attempts[0].current_question_index, 0);
+});
+
+test('autosave on a missing attempt reports 404 without writing', async () => {
+  await assert.rejects(
+    ExamAttemptService.saveDraftAnswers('user-1', 'missing-attempt', { 'q-1': 'opt-a' }),
+    (error: any) => error instanceof ExamAttemptError && error.status === 404
+  );
+
+  // The conditional UPDATE runs but matches no row, so nothing is written.
+  assert.equal(state.updates.every((update) => update.matched === 0), true);
+  assert.deepEqual(state.attempts, []);
+});
+
+test('autosave on a submitted attempt is rejected with 409 and writes nothing', async () => {
+  const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
+
+  await ExamAttemptService.claimAttemptForSubmission('user-1', attempt.id, 'history-1');
+
+  await assert.rejects(
+    ExamAttemptService.saveDraftAnswers('user-1', attempt.id, { 'q-1': 'opt-b' }, 1),
+    (error: any) =>
+      error instanceof ExamAttemptError &&
+      error.status === 409 &&
+      error.message === 'Attempt is no longer in progress'
+  );
+
+  assert.equal(state.attempts[0].status, ATTEMPT_STATUS.SUBMITTED);
+  assert.deepEqual(state.attempts[0].answers_draft, {});
+});
+
+test('a zero-row conditional update falls back to a read before reporting 409', async () => {
+  const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
+
+  state.forceNextUpdateMiss = true;
+  state.queries.length = 0;
+
+  await assert.rejects(
+    ExamAttemptService.saveDraftAnswers('user-1', attempt.id, { 'q-1': 'opt-b' }, 1),
+    (error: any) =>
+      error instanceof ExamAttemptError &&
+      error.status === 409 &&
+      error.message === 'Attempt is no longer in progress'
+  );
+
+  assert.deepEqual(state.queries, ['exam_progress:many', 'exam_progress:single']);
+  assert.deepEqual(state.attempts[0].answers_draft, {});
+});
+
+test('concurrent autosaves each write one complete draft without mixing fields', async () => {
+  const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
+
+  state.queries.length = 0;
+
+  const [first, second] = await Promise.all([
+    ExamAttemptService.saveDraftAnswers('user-1', attempt.id, { 'q-1': 'opt-a' }, 1),
+    ExamAttemptService.saveDraftAnswers('user-1', attempt.id, { 'q-1': 'opt-b' }, 2),
+  ]);
+
+  assert.equal(first.status, ATTEMPT_STATUS.IN_PROGRESS);
+  assert.equal(second.status, ATTEMPT_STATUS.IN_PROGRESS);
+
+  // Two requests, two atomic UPDATEs: no read interleaves between them.
+  assert.deepEqual(state.queries, ['exam_progress:many', 'exam_progress:many']);
+
+  const draft = state.attempts[0].answers_draft;
+  const index = state.attempts[0].current_question_index;
+  const matchesFirst = draft['q-1'] === 'opt-a' && index === 1;
+  const matchesSecond = draft['q-1'] === 'opt-b' && index === 2;
+
+  assert.ok(matchesFirst || matchesSecond);
+});
+
+test('non-object answers are stored as an empty draft and the position is kept', async () => {
+  const attempt = await ExamAttemptService.startExamAttempt('user-1', 'exam-1');
+
+  const saved = await ExamAttemptService.saveDraftAnswers(
+    'user-1',
+    attempt.id,
+    ['not', 'a', 'map'],
+    3
+  );
+
+  assert.deepEqual(saved.answers_draft, {});
+  assert.equal(saved.current_question_index, 3);
 });
