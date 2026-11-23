@@ -16,14 +16,29 @@ import type { NotificationPriority } from './notifications.types';
  *   no `notification` block, so one message is never shown twice.
  */
 
-/** Channel created by the Android app for normal-priority notifications. */
-export const ANDROID_NOTIFICATION_CHANNEL_ID = 'porokh_default';
+/**
+ * Android channels created natively on app start. The id is part of the payload
+ * contract: a message naming a missing channel is silently dropped on Android 8+.
+ */
+export const ANDROID_CHANNEL_IDS = {
+  exam: 'exam',
+  security: 'security',
+  general: 'general',
+  social: 'social',
+} as const;
 
-/** Channel created by the Android app for high-priority notifications. */
-export const ANDROID_URGENT_CHANNEL_ID = 'porokh_urgent';
+export type AndroidChannelId = (typeof ANDROID_CHANNEL_IDS)[keyof typeof ANDROID_CHANNEL_IDS];
+
+/** Resolves the channel from the stored notification type, not the priority. */
+export const androidChannelForType = (type: string): AndroidChannelId => {
+  if (type === 'exam') return ANDROID_CHANNEL_IDS.exam;
+  if (type === 'security') return ANDROID_CHANNEL_IDS.security;
+  if (type === 'social') return ANDROID_CHANNEL_IDS.social;
+  return ANDROID_CHANNEL_IDS.general;
+};
 
 /** Delivery window for a push; a stale reminder must not arrive a week late. */
-const PUSH_TTL_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_PUSH_TTL_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_ACTION_LINK = '/';
 
@@ -37,6 +52,8 @@ export type PushDevice = {
   token: string;
   platform: DevicePlatform;
   language: PushLanguage;
+  /** App installation id, used by the push log; never the token itself. */
+  deviceId?: string | null;
 };
 
 export type PushCopy = {
@@ -47,6 +64,10 @@ export type PushCopy = {
   type: string;
   notificationId?: string | null;
   priority?: NotificationPriority;
+  /** Collapses repeated events of the same kind in the tray. */
+  collapseKey?: string | null;
+  /** Remaining lifetime in ms; derived from expires_at by the dispatcher. */
+  ttlMs?: number | null;
 };
 
 export type FcmPushPayload = Omit<MulticastMessage, 'tokens'>;
@@ -104,11 +125,23 @@ export const buildFcmPushPayload = (
   const type = nonEmpty(copy.type) || 'system';
   const notificationId = nonEmpty(copy.notificationId);
   const highPriority = copy.priority === 'high';
+  const channelId = androidChannelForType(type);
+  const collapseKey = nonEmpty(copy.collapseKey) || nonEmpty(type) || 'notification';
+  const ttl = Math.max(
+    60_000,
+    Math.min(
+      typeof copy.ttlMs === 'number' && Number.isFinite(copy.ttlMs)
+        ? copy.ttlMs
+        : DEFAULT_PUSH_TTL_MS,
+      DEFAULT_PUSH_TTL_MS
+    )
+  );
 
   const data: Record<string, string> = {
     type,
     notification_id: notificationId,
     action_link: actionLink,
+    event_code: nonEmpty(copy.collapseKey) || type,
     // `title`/`body` are the resolved values; the labeled pairs let the client
     // pick the other language without a second lookup.
     title,
@@ -131,11 +164,10 @@ export const buildFcmPushPayload = (
       data,
       android: {
         priority: highPriority ? 'high' : 'normal',
-        ttl: PUSH_TTL_MS,
+        ttl,
+        collapseKey,
         notification: {
-          channelId: highPriority
-            ? ANDROID_URGENT_CHANNEL_ID
-            : ANDROID_NOTIFICATION_CHANNEL_ID,
+          channelId,
           sound: 'default',
           ...(imageUrl ? { imageUrl } : {}),
           // The tap opens the app; the client resolves action_link itself, so
@@ -152,7 +184,7 @@ export const buildFcmPushPayload = (
       // Data-only: the service worker owns rendering and click handling.
       headers: {
         Urgency: highPriority ? 'high' : 'normal',
-        TTL: String(Math.floor(PUSH_TTL_MS / 1000)),
+        TTL: String(Math.floor(ttl / 1000)),
       },
       data: {
         type,

@@ -35,7 +35,8 @@ import examBookmarkRoutes from './features/exams/exam.bookmark.routes';
 import systemRoutes from './features/system/system.routes'; 
 import { financeRoutes } from './features/finance/finance.routes';
 import notificationRoutes from './features/notifications/notifications.routes';
-import notificationsAdminRoutes from './features/notifications/notifications.admin.routes'; 
+import notificationsAdminRoutes from './features/notifications/notifications.admin.routes';
+import notificationsInternalRoutes from './features/notifications/notifications.internal.routes';
 import noticeAdminRoutes from './features/notices/notices.admin.routes';
 import noticeUserRoutes from './features/notices/notices.user.routes';
 import supportRoutes from './features/support/support.routes';
@@ -173,6 +174,11 @@ app.use('/api/v1/groups', groupRoutes);
 app.use('/api/v1/battles', groupBattleRoutes);
 app.use('/api/v1/internal', groupInternalRoutes);
 app.use('/internal', groupInternalRoutes);
+
+// External scheduler entry point (cron-job.org). Authenticated by
+// x-internal-secret, not by a user session.
+app.use('/internal', notificationsInternalRoutes);
+app.use('/api/v1/internal', notificationsInternalRoutes);
 
 // এক্সাম মডিউট রাউট
 app.use('/api/v1/exams/user', ExamUserRoutes);

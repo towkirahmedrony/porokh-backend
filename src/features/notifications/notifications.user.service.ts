@@ -1,11 +1,23 @@
 import { supabase } from '../../config/supabase';
 import { Language, parseLanguage } from '../../lib/utils/language';
-import { MANDATORY_NOTIFICATION_TYPES, NotificationType } from './notifications.types';
-import {
-  markNotificationAsRead as markRead,
-  getUnreadNotificationCount,
-  normalizePreferences,
-} from './notifications.service';
+import { getUnreadNotificationCount, markNotificationAsRead as markRead } from './notifications.service';
+
+/**
+ * The student inbox.
+ *
+ * Rows are read with the service client scoped to the authenticated user id, so
+ * pagination happens in SQL instead of loading the whole inbox and slicing it in
+ * memory. Read state is joined separately for the same reason: an embedded
+ * select would see every user's rows.
+ */
+
+const DEFAULT_PAGE = 30;
+const MAX_PAGE = 100;
+
+export type NotificationPage = {
+  items: Array<Record<string, unknown>>;
+  next_cursor: string | null;
+};
 
 const notificationText = (language: Language, bn?: string | null, en?: string | null): string => {
   const preferred = language === 'en' ? en : bn;
@@ -13,56 +25,49 @@ const notificationText = (language: Language, bn?: string | null, en?: string | 
   return preferred?.trim() || fallback?.trim() || '';
 };
 
-const isExpired = (expiresAt: string | null | undefined): boolean =>
-  Boolean(expiresAt && new Date(expiresAt).getTime() < Date.now());
-
-const matchesTargetRules = (rules: unknown, classLevel: string, subStatus: string): boolean => {
-  if (!rules || typeof rules !== 'object') return true;
-  const target = rules as Record<string, any>;
-
-  if (
-    target.subscription_status &&
-    target.subscription_status !== 'all' &&
-    target.subscription_status !== subStatus
-  ) {
-    return false;
-  }
-
-  if (Array.isArray(target.class_level) && target.class_level.length > 0) {
-    if (!target.class_level.includes('all') && !target.class_level.includes(classLevel)) {
-      return false;
-    }
-  }
-
-  return true;
+const pageSize = (limit: unknown): number => {
+  const parsed = Number(limit);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_PAGE;
+  return Math.min(Math.floor(parsed), MAX_PAGE);
 };
 
-export const getUserNotifications = async (userId: string) => {
+export const getUserNotifications = async (
+  userId: string,
+  options: { limit?: unknown; before?: unknown } = {}
+): Promise<NotificationPage> => {
   const { data: profile } = await supabase
     .from('profiles')
-    .select('class_level, subscription_status, language_preference, settings')
+    .select('language_preference')
     .eq('id', userId)
-    .single();
+    .maybeSingle();
 
-  const classLevel = profile?.class_level || 'all';
-  const subStatus = profile?.subscription_status === 'active' ? 'premium' : 'free';
   const language = parseLanguage(profile?.language_preference);
-  const preferences = normalizePreferences(
-    (profile?.settings as Record<string, any> | null)?.notification_preferences
-  );
+  const limit = pageSize(options.limit);
+  const before = typeof options.before === 'string' && options.before.trim() ? options.before.trim() : null;
 
-  const { data: notifications, error: notifError } = await supabase
+  let query = supabase
     .from('notifications')
-    .select('*')
+    .select(
+      'id, title_en, title_bn, body_en, body_bn, image_url, action_link, type, channel, priority, meta_data, event_code, created_at, expires_at'
+    )
     .eq('status', 'sent')
     .or(`target_user_id.eq.${userId},target_user_id.is.null`)
-    .order('created_at', { ascending: false });
+    .neq('channel', 'push')
+    .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`)
+    .order('created_at', { ascending: false })
+    // One extra row tells us whether another page exists without a count query.
+    .limit(limit + 1);
 
-  if (notifError) throw new Error(notifError.message);
+  if (before) query = query.lt('created_at', before);
 
-  // Read state is fetched separately for this user: the service-role client
-  // bypasses RLS, so an embedded select would leak every user's read state.
-  const notificationIds = (notifications ?? []).map((row) => String(row.id));
+  const { data: notifications, error } = await query;
+  if (error) throw new Error(error.message);
+
+  const rows = (notifications ?? []).slice(0, limit);
+  const hasMore = (notifications ?? []).length > limit;
+  const notificationIds = rows.map((row) => String(row.id));
+
+  // Read state for this user only.
   const readByNotification = new Map<string, { is_read: boolean; is_clicked: boolean }>();
 
   if (notificationIds.length > 0) {
@@ -80,37 +85,20 @@ export const getUserNotifications = async (userId: string) => {
     });
   }
 
-  const filteredNotifications = (notifications ?? []).filter((notification) => {
-    if (isExpired(notification.expires_at)) return false;
-    if (notification.target_user_id && notification.target_user_id !== userId) return false;
-    if (!matchesTargetRules(notification.target_rules, classLevel, subStatus)) return false;
-
-    const type = notification.type as NotificationType;
-    const mandatory = MANDATORY_NOTIFICATION_TYPES.includes(type);
-    if (!mandatory && preferences.types[type] === false) return false;
-    if (!mandatory && !preferences.in_app) return false;
-    if (!mandatory && notification.channel === 'push') return false;
-
-    return true;
-  });
-
-  const withReadState = filteredNotifications.map((notification) => {
+  const items = rows.map((notification) => {
     const read = readByNotification.get(String(notification.id));
     return {
       ...notification,
+      title: notificationText(language, notification.title_bn, notification.title_en),
+      body: notificationText(language, notification.body_bn, notification.body_en),
       notification_reads: read ? [read] : [],
     };
   });
 
-  const combined = [...withReadState].sort(
-    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-  );
-
-  return combined.map((notification) => ({
-    ...notification,
-    title: notificationText(language, notification.title_bn, notification.title_en),
-    body: notificationText(language, notification.body_bn, notification.body_en),
-  }));
+  return {
+    items,
+    next_cursor: hasMore && rows.length > 0 ? String(rows[rows.length - 1].created_at) : null,
+  };
 };
 
 export const getUnreadCount = async (userId: string): Promise<number> =>
@@ -119,7 +107,8 @@ export const getUnreadCount = async (userId: string): Promise<number> =>
 export const markNotificationAsRead = async (
   userId: string,
   notificationId: string,
-  isClicked = false
+  isClicked = false,
+  platform: string | null = null
 ) => {
-  await markRead(userId, notificationId, isClicked);
+  await markRead(userId, notificationId, isClicked, platform);
 };

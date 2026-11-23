@@ -90,11 +90,14 @@ export const authService = {
         ? String(payload.ip_address).trim()
         : '0.0.0.0';
     const platform = payload.platform === 'android' ? 'android' : 'web';
+    // Login also reports the device, usually before the push plugin has a
+    // token. A missing token here must not erase one stored by the provider.
+    const fcmToken = String(payload.fcm_token ?? '').trim();
     const device = {
       user_id: payload.user_id,
       device_name: payload.device_name || 'Unknown',
       device_id: deviceId,
-      fcm_token: payload.fcm_token || null,
+      ...(fcmToken ? { fcm_token: fcmToken } : {}),
       last_active_at: new Date().toISOString(),
       is_trusted: true,
       os_or_browser: payload.os_or_browser || 'Unknown',

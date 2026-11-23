@@ -1,7 +1,8 @@
 import { supabaseAdmin } from '../../config/supabaseAdmin';
 import {
+  categoryEnabledForType,
   loadDevicePlatforms,
-  normalizePreferences,
+  loadPreferenceFlags,
   sendCampaignPush,
 } from './notifications.service';
 import {
@@ -481,6 +482,10 @@ export const previewAudience = async (body: unknown): Promise<AudiencePreview> =
       throw new NotificationAdminError(error.message, 503);
     }
 
+    const preferencesByUser = await loadPreferenceFlags(
+      (data ?? []).map((profile: AnyObject) => String(profile.id))
+    );
+
     (data ?? []).forEach((profile: AnyObject) => {
       if (String(profile.account_status ?? 'active') !== 'active') return;
 
@@ -489,14 +494,14 @@ export const previewAudience = async (body: unknown): Promise<AudiencePreview> =
 
       eligibleAccounts += 1;
 
-      const preferences = normalizePreferences(
-        (profile.settings as AnyObject | null)?.notification_preferences
-      );
-      const typeEnabled = preferences.types[type] !== false;
+      const flags = preferencesByUser.get(String(profile.id));
+      const typeEnabled = categoryEnabledForType(flags, type);
+      const pushEnabled = flags ? flags.push_enabled : true;
 
-      if (preferences.push && typeEnabled) pushReachable += 1;
-      if (preferences.in_app && typeEnabled) inAppVisible += 1;
-      if (!preferences.push && !preferences.in_app) excludedByPreference += 1;
+      if (pushEnabled && typeEnabled) pushReachable += 1;
+      // In-app rows are always written, so the preview never hides them.
+      if (typeEnabled) inAppVisible += 1;
+      if (!pushEnabled) excludedByPreference += 1;
     });
   }
 

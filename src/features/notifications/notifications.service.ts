@@ -46,7 +46,6 @@ type TemplateRow = {
   action_link: string | null;
 };
 
-const MAX_PUSH_PER_USER_PER_DAY = 3;
 const INSERT_CHUNK_SIZE = 200;
 
 const chunk = <T>(rows: T[], size: number): T[][] => {
@@ -60,13 +59,6 @@ const chunk = <T>(rows: T[], size: number): T[][] => {
 const normalizeUserIds = (value: string | string[]): string[] => {
   const list = Array.isArray(value) ? value : [value];
   return Array.from(new Set(list.map((id) => String(id ?? '').trim()).filter(Boolean)));
-};
-
-/** Start of the current Asia/Dhaka day, used for daily push caps. */
-const startOfDhakaDay = (now = new Date()): Date => {
-  const dhaka = new Date(now.getTime() + 6 * 60 * 60 * 1000);
-  const ymd = dhaka.toISOString().slice(0, 10);
-  return new Date(`${ymd}T00:00:00+06:00`);
 };
 
 // --- Templates ---------------------------------------------------------------
@@ -111,6 +103,67 @@ const stringifyVariables = (variables: NotifyInput['variables']): Record<string,
 const parseBoolean = (value: unknown, fallback: boolean): boolean =>
   typeof value === 'boolean' ? value : fallback;
 
+export type PreferenceFlags = {
+  user_id: string;
+  push_enabled: boolean;
+  exam_reminders: boolean;
+  streak_reminders: boolean;
+  social: boolean;
+  rewards: boolean;
+  premium: boolean;
+};
+
+/**
+ * The toggles that decide whether a campaign may reach an account. One query per
+ * chunk, because a per-profile lookup would be hundreds of round trips.
+ */
+export const loadPreferenceFlags = async (
+  userIds: string[]
+): Promise<Map<string, PreferenceFlags>> => {
+  const byUser = new Map<string, PreferenceFlags>();
+  if (userIds.length === 0) return byUser;
+
+  for (const idChunk of chunk(userIds, INSERT_CHUNK_SIZE)) {
+    const { data, error } = await getAdmin()
+      .from('notification_preferences')
+      .select(
+        'user_id, push_enabled, exam_reminders, streak_reminders, social, rewards, premium'
+      )
+      .in('user_id', idChunk);
+
+    if (error) {
+      console.error('[notify] preference lookup failed:', error.message);
+      continue;
+    }
+
+    (data ?? []).forEach((row: PreferenceFlags) => {
+      byUser.set(String(row.user_id), row);
+    });
+  }
+
+  return byUser;
+};
+
+const TYPE_TO_COLUMN: Record<string, keyof PreferenceFlags> = {
+  exam: 'exam_reminders',
+  streak: 'streak_reminders',
+  social: 'social',
+  reward: 'rewards',
+  billing: 'premium',
+};
+
+/** A missing row means the defaults, which allow the category. */
+export const categoryEnabledForType = (
+  flags: PreferenceFlags | undefined,
+  type: string
+): boolean => {
+  if (!flags) return true;
+  if (type === 'security') return true;
+
+  const column = TYPE_TO_COLUMN[type];
+  return column ? Boolean(flags[column] ?? true) : true;
+};
+
 export const normalizePreferences = (raw: unknown): NotificationPreferences => {
   const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as AnyObject) : {};
   const rawTypes =
@@ -130,71 +183,118 @@ export const normalizePreferences = (raw: unknown): NotificationPreferences => {
     types,
     in_app: parseBoolean(source.in_app, true),
     push: parseBoolean(source.push, true),
+    quiet_start: clock(source.quiet_start as string, DEFAULT_NOTIFICATION_PREFERENCES.quiet_start),
+    quiet_end: clock(source.quiet_end as string, DEFAULT_NOTIFICATION_PREFERENCES.quiet_end),
+    timezone:
+      typeof source.timezone === 'string' && source.timezone.trim()
+        ? source.timezone.trim().slice(0, 64)
+        : DEFAULT_NOTIFICATION_PREFERENCES.timezone,
   };
 };
 
-export const getNotificationPreferences = async (userId: string): Promise<NotificationPreferences> => {
+type PreferenceRow = {
+  push_enabled: boolean;
+  exam_reminders: boolean;
+  streak_reminders: boolean;
+  social: boolean;
+  rewards: boolean;
+  premium: boolean;
+  quiet_start: string;
+  quiet_end: string;
+  timezone: string;
+};
+
+const PREFERENCE_COLUMNS =
+  'push_enabled, exam_reminders, streak_reminders, social, rewards, premium, quiet_start, quiet_end, timezone';
+
+const clock = (value: string | null | undefined, fallback: string): string => {
+  const normalized = String(value ?? '').slice(0, 5);
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(normalized) ? normalized : fallback;
+};
+
+const preferencesFromRow = (row: PreferenceRow | null): NotificationPreferences => ({
+  types: {
+    exam: row?.exam_reminders ?? true,
+    reward: row?.rewards ?? true,
+    streak: row?.streak_reminders ?? true,
+    social: row?.social ?? true,
+    billing: row?.premium ?? true,
+    security: true,
+  },
+  in_app: true,
+  push: row?.push_enabled ?? true,
+  quiet_start: clock(row?.quiet_start, '23:00'),
+  quiet_end: clock(row?.quiet_end, '07:00'),
+  timezone: row?.timezone || 'Asia/Dhaka',
+});
+
+export const getNotificationPreferences = async (
+  userId: string
+): Promise<NotificationPreferences> => {
   const { data, error } = await getAdmin()
-    .from('profiles')
-    .select('settings')
-    .eq('id', userId)
+    .from('notification_preferences')
+    .select(PREFERENCE_COLUMNS)
+    .eq('user_id', userId)
     .maybeSingle();
 
   if (error) throw new Error(error.message);
-  return normalizePreferences((data?.settings as AnyObject | null)?.notification_preferences);
+  if (data) return preferencesFromRow(data as PreferenceRow);
+
+  // A missing row means the defaults; writing it keeps later updates simple.
+  const { error: insertError } = await getAdmin()
+    .from('notification_preferences')
+    .insert({ user_id: userId })
+    .select('user_id');
+
+  if (insertError && insertError.code !== '23505') {
+    console.error('[notify] preference seed failed:', insertError.message);
+  }
+
+  return preferencesFromRow(null);
 };
 
 export const updateNotificationPreferences = async (
   userId: string,
   patch: unknown
 ): Promise<NotificationPreferences> => {
-  const current = await getNotificationPreferences(userId);
   const incoming = patch && typeof patch === 'object' && !Array.isArray(patch) ? (patch as AnyObject) : {};
   const incomingTypes =
     incoming.types && typeof incoming.types === 'object' && !Array.isArray(incoming.types)
       ? (incoming.types as AnyObject)
       : {};
 
-  const next: NotificationPreferences = {
-    types: { ...current.types },
-    in_app: parseBoolean(incoming.in_app, current.in_app),
-    push: parseBoolean(incoming.push, current.push),
-  };
+  const next = await getNotificationPreferences(userId);
+  const update: AnyObject = {};
 
-  NOTIFICATION_TYPES.forEach((type) => {
-    if (typeof incomingTypes[type] === 'boolean') {
-      next.types[type] = incomingTypes[type] as boolean;
-    }
-  });
-  MANDATORY_NOTIFICATION_TYPES.forEach((type) => {
-    next.types[type] = true;
-  });
-
-  const { data: profile, error: profileError } = await getAdmin()
-    .from('profiles')
-    .select('settings')
-    .eq('id', userId)
-    .maybeSingle();
-
-  if (profileError) throw new Error(profileError.message);
-
-  const settings =
-    profile?.settings && typeof profile.settings === 'object' && !Array.isArray(profile.settings)
-      ? { ...(profile.settings as AnyObject) }
-      : {};
-
-  settings.notification_preferences = next;
+  if (typeof incoming.push === 'boolean') update.push_enabled = incoming.push;
+  // in_app is accepted for compatibility but can never be turned off.
+  if (typeof incoming.types?.exam === 'boolean') update.exam_reminders = incoming.types.exam;
+  if (typeof incoming.types?.streak === 'boolean') update.streak_reminders = incoming.types.streak;
+  if (typeof incoming.types?.social === 'boolean') update.social = incoming.types.social;
+  if (typeof incoming.types?.reward === 'boolean') update.rewards = incoming.types.reward;
+  if (typeof incoming.types?.billing === 'boolean') update.premium = incoming.types.billing;
+  if (typeof incoming.quiet_start === 'string') update.quiet_start = clock(incoming.quiet_start, next.quiet_start);
+  if (typeof incoming.quiet_end === 'string') update.quiet_end = clock(incoming.quiet_end, next.quiet_end);
+  if (typeof incoming.timezone === 'string' && incoming.timezone.trim()) {
+    update.timezone = String(incoming.timezone).trim().slice(0, 64);
+  }
 
   const { error } = await getAdmin()
-    .from('profiles')
-    .update({ settings })
-    .eq('id', userId);
+    .from('notification_preferences')
+    .upsert({ user_id: userId, ...update }, { onConflict: 'user_id' });
 
   if (error) throw new Error(error.message);
-  return next;
+
+  return getNotificationPreferences(userId);
 };
 
 // --- Push --------------------------------------------------------------------
+
+export type PushResult = {
+  token: string;
+  deviceId: string | null;
+  status: 'accepted' | 'failed' | 'invalid_token';
+};
 
 type PushOutcome = {
   /** Devices FCM accepted the message for. Acceptance is not proof of display. */
@@ -203,6 +303,8 @@ type PushOutcome = {
   invalidTokens: number;
   messageId: string | null;
   error: string | null;
+  /** Per-device result, written to notification_push_log by the dispatcher. */
+  results: PushResult[];
 };
 
 const emptyPushOutcome = (error: string | null = null): PushOutcome => ({
@@ -211,21 +313,8 @@ const emptyPushOutcome = (error: string | null = null): PushOutcome => ({
   invalidTokens: 0,
   messageId: null,
   error,
+  results: [],
 });
-
-const getPushCapReached = async (userId: string): Promise<boolean> => {
-  const { count, error } = await getAdmin()
-    .from('notifications')
-    .select('id', { count: 'exact', head: true })
-    .eq('target_user_id', userId)
-    .gte('push_sent_at', startOfDhakaDay().toISOString());
-
-  if (error) {
-    console.error('[notify] push cap lookup failed:', error.message);
-    return false;
-  }
-  return (count ?? 0) >= MAX_PUSH_PER_USER_PER_DAY;
-};
 
 /** Text language per account, used to localise the system notification. */
 const loadProfileLanguages = async (
@@ -267,7 +356,7 @@ export const loadDeviceTokens = async (userIds: string[]): Promise<PushDevice[]>
   for (const idChunk of chunk(ids, INSERT_CHUNK_SIZE)) {
     const { data, error } = await getAdmin()
       .from('user_devices')
-      .select('user_id, fcm_token, platform')
+      .select('user_id, device_id, fcm_token, platform')
       .in('user_id', idChunk)
       .not('fcm_token', 'is', null);
 
@@ -282,6 +371,7 @@ export const loadDeviceTokens = async (userIds: string[]): Promise<PushDevice[]>
 
       devices.set(token, {
         token,
+        deviceId: row.device_id ? String(row.device_id) : null,
         platform: normalizeDevicePlatform(row.platform),
         language: languages.get(String(row.user_id)) ?? 'bn',
       });
@@ -338,6 +428,8 @@ export const sendPushToDevices = async (
 
   const outcome = emptyPushOutcome();
   const invalidTokens: string[] = [];
+  const deviceByToken = new Map<string, string | null>();
+  devices.forEach((device) => deviceByToken.set(device.token, device.deviceId ?? null));
 
   for (const [key, tokens] of groups) {
     const [platform, language] = key.split(':') as [PushDevice['platform'], PushLanguage];
@@ -353,53 +445,22 @@ export const sendPushToDevices = async (
     outcome.messageId = outcome.messageId ?? result.messageIds[0] ?? null;
     if (result.error) outcome.error = result.error;
     invalidTokens.push(...result.invalidTokens);
+
+    result.acceptedTokens.forEach((token) =>
+      outcome.results.push({ token, deviceId: deviceByToken.get(token) ?? null, status: 'accepted' })
+    );
+    result.failedTokens.forEach((token) =>
+      outcome.results.push({ token, deviceId: deviceByToken.get(token) ?? null, status: 'failed' })
+    );
+    result.invalidTokens.forEach((token) =>
+      outcome.results.push({ token, deviceId: deviceByToken.get(token) ?? null, status: 'invalid_token' })
+    );
   }
 
   await deactivateInvalidTokens(invalidTokens);
 
   return outcome;
 };
-
-/** Resolves the accounts' tokens and sends. Never throws into the caller. */
-export const sendPushToUsers = async (
-  userIds: string | string[],
-  copy: PushCopy
-): Promise<PushOutcome> => {
-  const ids = normalizeUserIds(Array.isArray(userIds) ? userIds : [userIds]);
-  if (ids.length === 0) return emptyPushOutcome();
-
-  try {
-    const devices = await loadDeviceTokens(ids);
-    if (devices.length === 0) return emptyPushOutcome('no_registered_devices');
-
-    return await sendPushToDevices(devices, copy);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'push failed';
-    console.error('[notify] push failed:', message.slice(0, 300));
-    return emptyPushOutcome(message.slice(0, 300));
-  }
-};
-
-const deliverPushForUser = async (
-  userId: string,
-  copy: { title: BilingualCopy; body: BilingualCopy },
-  options: {
-    actionLink?: string | null;
-    imageUrl?: string | null;
-    type: NotificationType;
-    notificationId?: string | null;
-    priority?: NotificationPriority;
-  }
-): Promise<PushOutcome> =>
-  sendPushToUsers(userId, {
-    title: copy.title,
-    body: copy.body,
-    imageUrl: options.imageUrl,
-    actionLink: options.actionLink,
-    type: options.type,
-    notificationId: options.notificationId,
-    priority: options.priority,
-  });
 
 // --- Campaign broadcasts -----------------------------------------------------
 
@@ -469,6 +530,26 @@ export const loadDevicePlatforms = async (): Promise<Map<string, Set<string>>> =
  * the message for, which is provider acceptance rather than proof a user saw it;
  * no delivery or open rate is derived from it.
  */
+/** Resolves the accounts' tokens and sends. Never throws into the caller. */
+export const sendPushToUsers = async (
+  userIds: string | string[],
+  copy: PushCopy
+): Promise<PushOutcome> => {
+  const ids = normalizeUserIds(Array.isArray(userIds) ? userIds : [userIds]);
+  if (ids.length === 0) return emptyPushOutcome();
+
+  try {
+    const devices = await loadDeviceTokens(ids);
+    if (devices.length === 0) return emptyPushOutcome('no_registered_devices');
+
+    return await sendPushToDevices(devices, copy);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'push failed';
+    console.error('[notify] push failed:', message.slice(0, 300));
+    return emptyPushOutcome(message.slice(0, 300));
+  }
+};
+
 export type CampaignPushResult = {
   accepted: number;
   failed: number;
@@ -528,14 +609,16 @@ export const sendCampaignPush = async (campaign: {
         continue;
       }
 
+      const preferencesByUser = await loadPreferenceFlags(
+        (data ?? []).map((profile: AnyObject) => String(profile.id))
+      );
+
       (data ?? []).forEach((profile: AnyObject) => {
         if (String(profile.account_status ?? 'active') !== 'active') return;
 
-        const preferences = normalizePreferences(
-          (profile.settings as AnyObject | null)?.notification_preferences
-        );
-        if (!preferences.push) return;
-        if (preferences.types[type as NotificationType] === false) return;
+        const flags = preferencesByUser.get(String(profile.id));
+        if (flags && !flags.push_enabled) return;
+        if (!categoryEnabledForType(flags, type)) return;
 
         if (
           matchesAudienceRules(
@@ -671,17 +754,10 @@ export const notify = async (input: NotifyInput): Promise<NotifyResult> => {
         continue;
       }
 
-      const preferences = normalizePreferences(
-        (profile.settings as AnyObject | null)?.notification_preferences
-      );
-
-      if (!mandatory && preferences.types[input.type] === false) {
-        result.skipped += 1;
-        continue;
-      }
-
-      const wantsInApp = mandatory || (channels.has('in_app') && preferences.in_app);
-      const wantsPush = channels.has('push') && preferences.push;
+      // The inbox row is always created. Whether it also becomes a push is
+      // decided once, by can_send_push, when the dispatcher picks the row up.
+      const wantsInApp = mandatory || channels.has('in_app');
+      const wantsPush = channels.has('push');
 
       if (!wantsInApp && !wantsPush) {
         result.skipped += 1;
@@ -714,9 +790,9 @@ export const notify = async (input: NotifyInput): Promise<NotifyResult> => {
         meta_data: {
           ...(input.metaData ?? {}),
           event: input.eventCode,
-          push_requested: wantsPush,
         },
-        status: 'pending',
+        status: 'sent',
+        sent_at: new Date().toISOString(),
         event_code: input.eventCode,
         dedupe_key: dedupeKey,
         expires_at: input.expiresAt ?? null,
@@ -742,72 +818,10 @@ export const notify = async (input: NotifyInput): Promise<NotifyResult> => {
       insertedRows.push(...(data ?? []));
     }
 
-    if (insertedRows.length === 0) return result;
-
-    const insertedIds = insertedRows.map((row) => row.id);
-    const { error: statusError } = await getAdmin()
-      .from('notifications')
-      .update({ status: 'sent', sent_at: new Date().toISOString() })
-      .in('id', insertedIds);
-
-    if (statusError) console.error('[notify] status update failed:', statusError.message);
-
     result.inserted = insertedRows.length;
 
-    const pushRows = insertedRows.filter((row) => Boolean(row.meta_data?.push_requested));
-
-    if (pushRows.length === 0) return result;
-
-    let pushAttempts = 0;
-    for (const row of pushRows) {
-      const userId = String(row.target_user_id);
-
-      if (input.pushLimit !== undefined && pushAttempts >= input.pushLimit) {
-        await getAdmin()
-          .from('notifications')
-          .update({ push_error: 'batch_capped' })
-          .eq('id', row.id);
-        continue;
-      }
-      pushAttempts += 1;
-
-      if (await getPushCapReached(userId)) {
-        await getAdmin()
-          .from('notifications')
-          .update({ push_error: 'rate_limited' })
-          .eq('id', row.id);
-        continue;
-      }
-
-      const outcome = await deliverPushForUser(
-        userId,
-        {
-          title: { bn: row.title_bn ?? row.title_en ?? '', en: row.title_en ?? row.title_bn ?? '' },
-          body: { bn: row.body_bn ?? row.body_en ?? '', en: row.body_en ?? row.body_bn ?? '' },
-        },
-        {
-          actionLink: row.action_link,
-          imageUrl: row.image_url,
-          type: input.type,
-          notificationId: row.id,
-          priority: (row.priority ?? input.priority) as NotificationPriority,
-        }
-      );
-
-      if (outcome.sent > 0) {
-        result.pushed += 1;
-        await getAdmin()
-          .from('notifications')
-          .update({ push_sent_at: new Date().toISOString(), push_error: null })
-          .eq('id', row.id);
-      } else if (outcome.error) {
-        await getAdmin()
-          .from('notifications')
-          .update({ push_error: outcome.error.slice(0, 500) })
-          .eq('id', row.id);
-      }
-    }
-
+    // Delivery is the dispatcher's job: it enforces the daily cap, the gap and
+    // quiet hours in one place, and it owns the retry schedule.
     return result;
   } catch (error) {
     console.error(
@@ -842,7 +856,8 @@ const isNotificationVisibleToUser = async (userId: string, notificationId: strin
 export const markNotificationAsRead = async (
   userId: string,
   notificationId: string,
-  isClicked = false
+  isClicked = false,
+  platform: string | null = null
 ): Promise<void> => {
   if (!notificationId) throw new Error('Notification id is required');
 
@@ -850,31 +865,38 @@ export const markNotificationAsRead = async (
   if (!visible) throw new Error('Notification not found');
 
   const now = new Date().toISOString();
-  const { error } = await getAdmin().from('notification_reads').upsert(
-    {
-      notification_id: notificationId,
-      user_id: userId,
-      is_read: true,
-      read_at: now,
-      is_clicked: isClicked,
-      clicked_at: isClicked ? now : null,
-      device_platform: 'web',
-    },
-    { onConflict: 'user_id,notification_id' }
-  );
+  const read: AnyObject = {
+    notification_id: notificationId,
+    user_id: userId,
+    is_read: true,
+    read_at: now,
+  };
+
+  // A plain open must not clear an earlier click: only set the click columns
+  // when this request is actually a click.
+  if (isClicked) {
+    read.is_clicked = true;
+    read.clicked_at = now;
+    read.device_platform = normalizeDevicePlatform(platform);
+  }
+
+  const { error } = await getAdmin()
+    .from('notification_reads')
+    .upsert(read, { onConflict: 'user_id,notification_id' });
 
   if (error) throw new Error(error.message);
 
   if (isClicked) {
-    const { data: row } = await getAdmin()
-      .from('notifications')
-      .select('total_clicks')
-      .eq('id', notificationId)
-      .maybeSingle();
+    // Derived, not incremented: two rapid taps cannot inflate the counter.
+    const { count } = await getAdmin()
+      .from('notification_reads')
+      .select('id', { count: 'exact', head: true })
+      .eq('notification_id', notificationId)
+      .eq('is_clicked', true);
 
     await getAdmin()
       .from('notifications')
-      .update({ total_clicks: Number(row?.total_clicks ?? 0) + 1 })
+      .update({ total_clicks: count ?? 0 })
       .eq('id', notificationId);
   }
 };
@@ -1050,23 +1072,6 @@ export const deactivateUserDeviceToken = async (
     .eq('device_id', id);
 
   if (error) throw new Error(error.message);
-};
-
-// --- Legacy helpers kept for existing call sites -----------------------------
-
-export const sendPushNotification = async (
-  userId: string,
-  title: BilingualCopy,
-  body: BilingualCopy,
-  imageUrl?: string,
-  actionLink?: string
-) => {
-  try {
-    if (await getPushCapReached(userId)) return;
-    await deliverPushForUser(userId, { title, body }, { imageUrl, actionLink, type: 'social' });
-  } catch (error) {
-    console.error('FCM Push Notification Error:', error);
-  }
 };
 
 /**

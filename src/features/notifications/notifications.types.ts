@@ -73,8 +73,12 @@ export interface NotifyResult {
 
 export interface NotificationPreferences {
   types: Record<NotificationType, boolean>;
+  /** Always true: the inbox row is never suppressed by a preference. */
   in_app: boolean;
   push: boolean;
+  quiet_start: string;
+  quiet_end: string;
+  timezone: string;
 }
 
 export const NOTIFICATION_TYPES: NotificationType[] = [
@@ -100,4 +104,7 @@ export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
   },
   in_app: true,
   push: true,
+  quiet_start: '23:00',
+  quiet_end: '07:00',
+  timezone: 'Asia/Dhaka',
 };

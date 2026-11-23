@@ -152,6 +152,10 @@ export type FcmBatchOutcome = {
   failed: number;
   /** Tokens FCM rejected as unregistered/invalid; the caller deactivates them. */
   invalidTokens: string[];
+  /** Tokens accepted for delivery, so the caller can log per device. */
+  acceptedTokens: string[];
+  /** Tokens that failed for a reason worth retrying. */
+  failedTokens: string[];
   messageIds: string[];
   failures: FcmFailure[];
   /** Set when a whole batch could not be delivered. */
@@ -163,6 +167,8 @@ export const emptyFcmOutcome = (): FcmBatchOutcome => ({
   accepted: 0,
   failed: 0,
   invalidTokens: [],
+  acceptedTokens: [],
+  failedTokens: [],
   messageIds: [],
   failures: [],
   error: null,
@@ -273,6 +279,7 @@ export const sendFcmMulticast = async (
     if (!response) {
       // The request never produced a result, so no token can be blamed.
       outcome.failed += chunk.length;
+      outcome.failedTokens.push(...chunk);
       outcome.error = lastError ?? 'fcm_send_failed';
       continue;
     }
@@ -280,6 +287,7 @@ export const sendFcmMulticast = async (
     response.responses.forEach((result, index) => {
       if (result.success) {
         outcome.accepted += 1;
+        outcome.acceptedTokens.push(chunk[index]);
         if (result.messageId) outcome.messageIds.push(result.messageId);
         return;
       }
@@ -292,6 +300,7 @@ export const sendFcmMulticast = async (
       }
 
       outcome.failed += 1;
+      outcome.failedTokens.push(chunk[index]);
       recordFailure(outcome.failures, {
         code,
         message: describeFcmError(result.error),

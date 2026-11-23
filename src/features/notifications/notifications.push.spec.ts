@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ANDROID_NOTIFICATION_CHANNEL_ID,
-  ANDROID_URGENT_CHANNEL_ID,
+  ANDROID_CHANNEL_IDS,
+  androidChannelForType,
   buildFcmPushPayload,
   normalizeDevicePlatform,
   normalizePushLanguage,
@@ -22,7 +22,7 @@ test('android payload carries a system notification so a closed app still shows 
 
   assert.equal(payload.notification?.title, 'পরীক্ষা শুরু');
   assert.equal(payload.notification?.body, '১০ মিনিট বাকি');
-  assert.equal(payload.android?.notification?.channelId, ANDROID_NOTIFICATION_CHANNEL_ID);
+  assert.equal(payload.android?.notification?.channelId, ANDROID_CHANNEL_IDS.exam);
   assert.equal(payload.android?.priority, 'normal');
   assert.equal(payload.data?.action_link, '/exam/live');
   assert.equal(payload.data?.notification_id, copy.notificationId);
@@ -35,8 +35,30 @@ test('high priority selects the urgent android channel', () => {
   );
 
   assert.equal(payload.android?.priority, 'high');
-  assert.equal(payload.android?.notification?.channelId, ANDROID_URGENT_CHANNEL_ID);
+  assert.equal(payload.android?.notification?.channelId, ANDROID_CHANNEL_IDS.exam);
   assert.equal(payload.notification?.title, 'Exam starts');
+});
+
+test('the android channel follows the notification type, not the priority', () => {
+  assert.equal(androidChannelForType('security'), 'security');
+  assert.equal(androidChannelForType('social'), 'social');
+  assert.equal(androidChannelForType('billing'), 'general');
+  assert.equal(androidChannelForType('streak'), 'general');
+  assert.equal(androidChannelForType('unknown'), 'general');
+});
+
+test('ttl is clamped to the remaining lifetime and never below a minute', () => {
+  const short = buildFcmPushPayload(
+    { ...copy, ttlMs: 5_000 },
+    { platform: 'android', language: 'bn' }
+  );
+  assert.equal(short.android?.ttl, 60_000);
+
+  const expired = buildFcmPushPayload(
+    { ...copy, ttlMs: -10 },
+    { platform: 'web', language: 'bn' }
+  );
+  assert.equal(expired.webpush?.headers?.TTL, '60');
 });
 
 test('web payload is data-only so the service worker renders exactly one notification', () => {
@@ -88,6 +110,18 @@ test('unsafe destinations are replaced with the home route', () => {
   assert.equal(safeActionLink('javascript:alert(1)'), '/');
   assert.equal(safeActionLink(null), '/');
   assert.equal(safeActionLink(''), '/');
+});
+
+test('collapse key defaults to the notification type and follows the event code', () => {
+  const byType = buildFcmPushPayload(copy, { platform: 'android', language: 'bn' });
+  assert.equal(byType.android?.collapseKey, 'exam');
+
+  const byEvent = buildFcmPushPayload(
+    { ...copy, collapseKey: 'exam_live_10m' },
+    { platform: 'android', language: 'bn' }
+  );
+  assert.equal(byEvent.android?.collapseKey, 'exam_live_10m');
+  assert.equal(byEvent.data?.event_code, 'exam_live_10m');
 });
 
 test('a payload without a stored notification id has no empty tag', () => {

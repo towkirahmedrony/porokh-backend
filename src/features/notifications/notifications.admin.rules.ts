@@ -551,6 +551,24 @@ export interface NotificationStats {
   deliveryRate: number | null;
   /** Taps divided by provider-accepted devices. */
   tapRate: number | null;
+  /** Notifications opened at least once. */
+  read: number;
+  /** Notifications clicked at least once. */
+  clicked: number;
+  readRate: number | null;
+  clickRate: number | null;
+  /** Per-event breakdown, the same shape the stats page renders. */
+  byEventCode: Array<{
+    eventCode: string;
+    total: number;
+    read: number;
+    clicked: number;
+    accepted: number;
+    failed: number;
+    clicks: number;
+    readRate: number;
+    clickRate: number;
+  }>;
 }
 
 const numberOrZero = (value: unknown): number => {
@@ -590,5 +608,22 @@ export const normalizeStats = (raw: unknown): NotificationStats => {
     pushOptedIn: numberOrZero(data.push_opted_in),
     deliveryRate: deliveryReported > 0 ? rate(delivered, providerAccepted) : null,
     tapRate: rate(numberOrZero(data.taps), providerAccepted),
+    read: numberOrZero(data.read),
+    clicked: numberOrZero(data.clicked),
+    readRate: rate(numberOrZero(data.read), numberOrZero(data.total)),
+    clickRate: rate(numberOrZero(data.clicked), numberOrZero(data.total)),
+    byEventCode: Array.isArray(data.by_event_code)
+      ? (data.by_event_code as Array<Record<string, unknown>>).map((row) => ({
+          eventCode: String(row.event_code ?? 'manual'),
+          total: numberOrZero(row.total),
+          read: numberOrZero(row.read),
+          clicked: numberOrZero(row.clicked),
+          accepted: numberOrZero(row.accepted),
+          failed: numberOrZero(row.failed),
+          clicks: numberOrZero(row.clicks),
+          readRate: Number(row.read_rate ?? 0),
+          clickRate: Number(row.click_rate ?? 0),
+        }))
+      : [],
   };
 };

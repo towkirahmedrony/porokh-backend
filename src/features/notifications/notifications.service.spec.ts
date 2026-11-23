@@ -174,7 +174,9 @@ test('level lookup picks the highest threshold reached', () => {
   assert.equal(levelForXp([], 50), null);
 });
 
-test('notify skips a type the user disabled', async () => {
+test('notify creates the inbox row and leaves the push decision to the policy', async () => {
+  // The push category toggle suppresses delivery, never the inbox row: a user
+  // who turned exam pushes off must still find the result in the app.
   state.profiles[0].settings = {
     notification_preferences: { types: { exam: false } },
   };
@@ -187,9 +189,10 @@ test('notify skips a type the user disabled', async () => {
     body: { bn: 'শীঘ্রই', en: 'Soon' },
   });
 
-  assert.equal(result.inserted, 0);
-  assert.equal(result.skipped, 1);
-  assert.equal(state.notifications.length, 0);
+  assert.equal(result.inserted, 1);
+  assert.equal(state.notifications.length, 1);
+  assert.equal(state.notifications[0].status, 'sent');
+  assert.equal(state.notifications[0].push_sent_at, undefined);
 });
 
 test('mandatory security notifications ignore disabled preferences', async () => {
