@@ -1590,6 +1590,29 @@ export class ExamUserService {
       return { rows: (data || []) as AnyObject[], error };
     };
 
+    // Papers can mix subjects (Bangla / English / general knowledge). The
+    // attempt payload is the only source the offline snapshot has, so the
+    // subject labels are attached here. A failed lookup must never block the
+    // exam: the client then groups those questions under a localized fallback.
+    const loadQuestionSubjects = async (questionRows: AnyObject[]) => {
+      const subjectIds = Array.from(
+        new Set(
+          questionRows
+            .map((question) => normalizeId(question.subject_id))
+            .filter(Boolean)
+        )
+      );
+
+      if (subjectIds.length === 0) return [] as AnyObject[];
+
+      const { data } = await supabase
+        .from('subjects')
+        .select('id, name_bn, name_en, slug')
+        .in('id', subjectIds);
+
+      return (data || []) as AnyObject[];
+    };
+
     const [questionRead, marksRead] = await Promise.all([
       loadQuestionRows(),
       loadQuestionMarks(),
@@ -1624,13 +1647,34 @@ export class ExamUserService {
       })
       .filter((question): question is AnyObject => Boolean(question));
 
+    const subjectRows = await loadQuestionSubjects(ordered);
+    const subjectById = new Map(
+      subjectRows.map((subject) => [normalizeId(subject.id), subject])
+    );
+
+    const questions = sanitizeQuestionsForClient(ordered).map((question) => {
+      const subject = subjectById.get(normalizeId(question.subject_id));
+
+      return {
+        ...question,
+        subject: subject
+          ? {
+              id: normalizeId(subject.id),
+              name_bn: subject.name_bn ?? null,
+              name_en: subject.name_en ?? null,
+              slug: subject.slug ?? null,
+            }
+          : null,
+      };
+    });
+
     return {
       attempt_id: attempt.id,
       exam_id: attempt.exam_id ?? null,
       started_at: attempt.started_at ?? null,
       deadline_at: attempt.deadline_at ?? null,
       server_time: new Date().toISOString(),
-      questions: sanitizeQuestionsForClient(ordered),
+      questions,
     };
   }
 
