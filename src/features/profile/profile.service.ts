@@ -1,12 +1,19 @@
 import { supabase } from '../../config/supabase';
 import { supabaseAdmin } from '../../config/supabaseAdmin';
 import { localizeRecord, parseLanguage } from '../../lib/utils/language';
-import { UserProfile } from './profile.types';
+import { DHAKA_UTC_OFFSET_MS, dhakaDayKey, startOfDhakaDay } from '../../lib/utils/time';
+import { ActivityPoint, PlayerStats, UserProfile, VersusStats } from './profile.types';
 import { notifyXpAndProgression } from '../notifications/notifications.service';
 import {
   buildProfileUpdatePayload,
   parseThemePreference,
 } from './profile.validation';
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export const isUuid = (value: string): boolean => UUID_PATTERN.test(value);
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const sanitizeProfileRecord = <T extends Record<string, any>>(profile: T): T => {
   if (!profile || typeof profile !== 'object') return profile;
@@ -98,55 +105,126 @@ export class ProfileService {
   }
 
   static async getPublicProfile(identifier: string) {
-    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identifier);
     let query = supabase.from('profiles').select('id, username, full_name, avatar_url, bio, total_xp, pvp_rating, current_streak, batch_year, institution, class_level');
-    
-    if (isUUID) query = query.eq('id', identifier);
+
+    if (isUuid(identifier)) query = query.eq('id', identifier);
     else query = query.eq('username', identifier);
-    
+
     const { data, error } = await query.single();
     if (error) throw new Error('User not found');
     return data;
   }
 
   static async getUserBadges(userId: string) {
-    // ডাটাবেইজে যদি user_badges টেবিল না থাকে, তবে achievements_master এর রিলেশন দিয়ে একটি ভিউ বা টেবিল বানিয়ে নিতে হবে
-    const [{ data: profile }, { data, error }] = await Promise.all([
-      supabase.from('profiles').select('language_preference').eq('id', userId).maybeSingle(),
-      supabase.from('user_badges').select(`earned_at, badge:achievements_master (id, title, title_en, description, description_en, icon_url, rarity)`).eq('user_id', userId),
+    // ব্যাজের আসল উৎস: profiles.achievements (jsonb আইডি অ্যারে) + achievements_master
+    // ক্যাটালগ। ডাটাবেইজে user_badges নামে কোনো টেবিল নেই।
+    const [{ data: profile }, { data: master, error }] = await Promise.all([
+      supabase.from('profiles').select('achievements, language_preference').eq('id', userId).maybeSingle(),
+      supabase.from('achievements_master').select('id, title, title_en, icon_url').order('xp_reward', { ascending: true }),
     ]);
     if (error) throw new Error('Failed to fetch user badges');
+
     const language = parseLanguage(profile?.language_preference);
-    return (data || []).map((entry) => ({
-      ...entry,
-      badge: Array.isArray(entry.badge)
-        ? entry.badge.map((badge) => localizeRecord(badge, language, ['title', 'description']))
-        : entry.badge
-          ? localizeRecord(entry.badge, language, ['title', 'description'])
-          : null,
+    const earnedIds = new Set(
+      (Array.isArray(profile?.achievements) ? (profile?.achievements as unknown[]) : [])
+        .map((entry) => (typeof entry === 'string' ? entry : (entry as any)?.id))
+        .filter((id): id is string => typeof id === 'string'),
+    );
+
+    // ফ্রন্টএন্ডের BadgeShowcase এই ফ্ল্যাট shape আশা করে (earned + unearned সব ব্যাজ)
+    return (master || []).map((badge) => ({
+      id: badge.id,
+      title: localizeRecord(badge, language, ['title']).title,
+      icon_url: badge.icon_url ?? null,
+      is_earned: earnedIds.has(badge.id),
     }));
   }
 
-  static async getActivityStats(userId: string) {
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    
-    // ডাটাবেইজে earned_xp নেই, তাই score কলাম ফেচ করা হলো
-    const { data, error } = await supabase.from('exam_history').select('created_at, score').eq('user_id', userId).gte('created_at', sevenDaysAgo.toISOString());
+  static async getExamStats(userId: string): Promise<Pick<PlayerStats, 'total_exams' | 'accuracy'>> {
+    const { data, error } = await supabase
+      .from('exam_history')
+      .select('correct_count, wrong_count')
+      .eq('user_id', userId);
+    if (error) throw new Error('Failed to fetch exam stats');
+
+    const rows = data || [];
+    const correct = rows.reduce((sum, row) => sum + (row.correct_count ?? 0), 0);
+    const wrong = rows.reduce((sum, row) => sum + (row.wrong_count ?? 0), 0);
+    const answered = correct + wrong;
+
+    return {
+      total_exams: rows.length,
+      // admin user-360 এর মতোই: skipped বাদ দিয়ে উত্তর দেয়া প্রশ্নের অনুপাত
+      accuracy: answered > 0 ? Math.round((correct / answered) * 1000) / 10 : 0,
+    };
+  }
+
+  static async getPlayerStats(userId: string): Promise<PlayerStats> {
+    const [{ data: profile }, examStats] = await Promise.all([
+      supabase.from('profiles').select('total_xp, current_streak').eq('id', userId).maybeSingle(),
+      ProfileService.getExamStats(userId),
+    ]);
+
+    return {
+      total_xp: profile?.total_xp ?? 0,
+      current_streak: profile?.current_streak ?? 0,
+      ...examStats,
+    };
+  }
+
+  static async getVersusComparison(
+    target: { id: string; total_xp: number | null; current_streak: number | null },
+    viewerId?: string,
+  ): Promise<VersusStats> {
+    const [targetExamStats, viewerStats] = await Promise.all([
+      ProfileService.getExamStats(target.id),
+      viewerId && viewerId !== target.id ? ProfileService.getPlayerStats(viewerId) : Promise.resolve(null),
+    ]);
+
+    const theirStats: PlayerStats = {
+      total_xp: target.total_xp ?? 0,
+      current_streak: target.current_streak ?? 0,
+      ...targetExamStats,
+    };
+    const myStats: PlayerStats = viewerStats
+      ?? (viewerId === target.id ? theirStats : { total_xp: 0, accuracy: 0, current_streak: 0, total_exams: 0 });
+
+    return { my_stats: myStats, their_stats: theirStats };
+  }
+
+  static async getActivityStats(targetId: string, viewerId?: string): Promise<ActivityPoint[]> {
+    // "গত ৭ দিন" প্ল্যাটফর্মের বাকি অংশের মতো Asia/Dhaka ক্যালেন্ডার দিনে গোনা হয়
+    const todayStart = startOfDhakaDay();
+    const windowStart = new Date(todayStart.getTime() - 6 * DAY_MS);
+    const isSelf = viewerId === targetId;
+    const userIds = viewerId && !isSelf ? [targetId, viewerId] : [targetId];
+
+    const { data, error } = await supabase
+      .from('exam_history')
+      .select('user_id, created_at')
+      .in('user_id', userIds)
+      .gte('created_at', windowStart.toISOString());
     if (error) throw new Error('Failed to fetch activity stats');
 
-    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    const stats = days.map(day => ({ day, exams: 0, xp: 0 }));
+    const dayNames = ['রবি', 'সোম', 'মঙ্গল', 'বুধ', 'বৃহঃ', 'শুক্র', 'শনি'];
+    const points = new Map<string, ActivityPoint>();
+    for (let offset = 6; offset >= 0; offset -= 1) {
+      const dayInstant = new Date(todayStart.getTime() - offset * DAY_MS);
+      const weekday = new Date(dayInstant.getTime() + DHAKA_UTC_OFFSET_MS).getUTCDay();
+      points.set(dhakaDayKey(dayInstant), { day: dayNames[weekday], you: 0, them: 0 });
+    }
 
-    data.forEach((entry: any) => {
-      const dayName = days[new Date(entry.created_at).getDay()];
-      const dayObj = stats.find(s => s.day === dayName);
-      if (dayObj) { 
-        dayObj.exams += 1; 
-        dayObj.xp += entry.score || 0; // earned_xp এর বদলে score যুক্ত হলো 
+    (data || []).forEach((entry) => {
+      const point = points.get(dhakaDayKey(new Date(entry.created_at)));
+      if (!point) return;
+      if (entry.user_id === targetId) {
+        point.them += 1;
+        if (isSelf) point.you += 1;
+      } else if (entry.user_id === viewerId) {
+        point.you += 1;
       }
     });
 
-    return stats;
+    return Array.from(points.values());
   }
 }

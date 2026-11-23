@@ -47,6 +47,19 @@ export interface UpdateProfileDto {
 
 export interface ActivityPoint {
   day: string;
-  exams: number;
-  xp: number;
+  you: number;
+  them: number;
+}
+
+// ফ্রন্টএন্ডের VersusStats কম্পোনেন্টের সাথে সামঞ্জস্যপূর্ণ
+export interface PlayerStats {
+  total_xp: number;
+  accuracy: number;
+  current_streak: number;
+  total_exams: number;
+}
+
+export interface VersusStats {
+  my_stats: PlayerStats;
+  their_stats: PlayerStats;
 }

@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { ProfileService } from './profile.service';
+import { ProfileService, isUuid } from './profile.service';
 import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response'; 
 
@@ -22,17 +22,23 @@ export const updateThemePreference = catchAsync(async (req: Request, res: Respon
 
 export const getPublicProfile = catchAsync(async (req: Request, res: Response) => {
   const { identifier } = req.params;
+  // ফ্রন্টএন্ড দর্শকের আইডি x-user-id হেডারে পাঠায় (পুরনো চুক্তি); শুধু UUID গ্রহণ করা হয়
+  const viewerHeader = req.headers['x-user-id'];
+  const viewerId = typeof viewerHeader === 'string' && isUuid(viewerHeader) ? viewerHeader : undefined;
+
   const profile = await ProfileService.getPublicProfile(identifier);
-  
-  const [badges, activity] = await Promise.all([
+
+  const [badges, activity, versusStats] = await Promise.all([
     ProfileService.getUserBadges(profile.id),
-    ProfileService.getActivityStats(profile.id)
+    ProfileService.getActivityStats(profile.id, viewerId),
+    ProfileService.getVersusComparison(profile, viewerId),
   ]);
 
   sendResponse(res, 200, true, 'Public profile fetched', {
     ...profile,
     badges,
-    activity
+    activity,
+    versusStats
   });
 });
 
