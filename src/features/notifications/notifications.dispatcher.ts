@@ -27,6 +27,13 @@ import {
 
 const MAX_ATTEMPTS = MAX_PUSH_ATTEMPTS;
 const BATCH_SIZE = 25;
+/**
+ * A student with no registered device has not failed to receive anything: the
+ * app simply is not installed on a device yet. The row is parked for an hour
+ * instead of being closed, so signing in on a phone today still delivers it
+ * without the loop retrying the same row every tick.
+ */
+const NO_DEVICE_RETRY_MS = 60 * 60 * 1000;
 
 type NotificationRow = {
   id: string;
@@ -220,15 +227,17 @@ const dispatchOne = async (
 
   const devices = await loadDeviceTokens([userId]);
   if (devices.length === 0) {
+    // No device is a skip, not an attempt: the claim is given back so the row
+    // keeps its full retry budget for the day the user registers a device.
     await closeRow(row.id, {
-      push_attempts: MAX_ATTEMPTS,
-      push_next_attempt_at: null,
+      push_attempts: attempt - 1,
+      push_next_attempt_at: iso(now.getTime() + NO_DEVICE_RETRY_MS),
       push_error: 'no_registered_devices',
     });
     await logPush(userId, row.id, [
-      { deviceId: null, status: 'skipped', errorCode: 'no_registered_devices' },
+      { deviceId: null, status: 'deferred', errorCode: 'no_registered_devices' },
     ]);
-    return 'skipped';
+    return 'deferred';
   }
 
   const ttlMs = remainingTtlMs(row.expires_at, now);
