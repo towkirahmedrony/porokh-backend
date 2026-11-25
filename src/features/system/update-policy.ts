@@ -59,6 +59,9 @@ export const compareVersions = (left: string, right: string): number => {
   return 0;
 };
 
+/** `1.2.3-ota...` -> `1.2.3`, so policy floors compare on the base version. */
+export const baseOtaVersion = (version: string): string => version.split('-')[0];
+
 /** Whether an installed native version is below the enforced minimum. */
 export const isNativeVersionBelowMinimum = (
   policy: Pick<UpdatePolicy, 'enforce_apk_update' | 'min_native_version'>,
@@ -144,6 +147,38 @@ export const updatePolicySchema = z
         code: z.ZodIssueCode.custom,
         path: ['min_ota_version'],
         message: 'A minimum OTA version is required when OTA updates are enforced',
+      });
+    }
+
+    /**
+     * A floor above the released build would lock out every device, including
+     * users who already installed the latest APK. This is the single most
+     * dangerous misconfiguration, so it is rejected outright.
+     */
+    if (
+      policy.min_native_version !== '' &&
+      policy.latest_native_version !== '' &&
+      compareVersions(policy.min_native_version, policy.latest_native_version) > 0
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['min_native_version'],
+        message: 'Minimum APK version cannot be higher than the latest APK version',
+      });
+    }
+
+    if (
+      policy.min_ota_version !== '' &&
+      policy.latest_ota_version !== '' &&
+      compareVersions(
+        baseOtaVersion(policy.min_ota_version),
+        baseOtaVersion(policy.latest_ota_version)
+      ) > 0
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['min_ota_version'],
+        message: 'Minimum OTA version cannot be higher than the latest OTA version',
       });
     }
   });

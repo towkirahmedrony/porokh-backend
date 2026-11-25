@@ -117,6 +117,12 @@ export type VersionStatus = {
     minNativeVersion: string | null;
     publishedAt: string | null;
   } | null;
+  /** Whether the configured APK URL actually serves an APK, not a web page. */
+  apkDownload: {
+    url: string;
+    ok: boolean;
+    contentType: string | null;
+  } | null;
   policy: UpdatePolicy;
 };
 
@@ -136,21 +142,60 @@ const str = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
 
 /**
+ * The semver of the build currently released to production. The APK versionName
+ * is synced from the same package version before every build, so this is the
+ * best available "actually released APK" value for write-time validation.
+ * A failed fetch returns null and never blocks an admin write.
+ */
+export const getReleasedNativeVersion = async (): Promise<string | null> => {
+  const raw = await fetchJson(`${PRODUCTION_WEB_URL}/version.json`).catch(() => null);
+  const version = str((raw as Record<string, unknown> | null)?.version);
+  return version && /^\d+\.\d+\.\d+$/.test(version) ? version : null;
+};
+
+/**
  * Snapshot of the currently published identities, for the admin panel.
  *
  * Read-only and best-effort: a GitHub/Vercel hiccup must render as "unknown"
  * in the admin UI, never as a failed settings page.
  */
+/** A signed APK is served as application/vnd.android.package-archive. */
+const probeApkDownload = async (
+  url: string
+): Promise<{ url: string; ok: boolean; contentType: string | null }> => {
+  try {
+    const response = await fetch(url, {
+      method: 'HEAD',
+      redirect: 'follow',
+      signal: AbortSignal.timeout(4_000),
+    });
+    const contentType = response.headers.get('content-type');
+    return {
+      url,
+      ok:
+        response.ok &&
+        Boolean(contentType && contentType.includes('android.package-archive')),
+      contentType,
+    };
+  } catch {
+    return { url, ok: false, contentType: null };
+  }
+};
+
 export const getVersionStatus = async (): Promise<VersionStatus> => {
   const cached = versionStatusCache;
   if (cached && Date.now() - cached.at < VERSION_STATUS_TTL_MS) {
     return cached.value;
   }
 
-  const [webRaw, otaRaw, policy] = await Promise.all([
+  const policy = await getUpdatePolicy();
+
+  const [webRaw, otaRaw, apkDownload] = await Promise.all([
     fetchJson(`${PRODUCTION_WEB_URL}/version.json`).catch(() => null),
     fetchJson(OTA_POINTER_URL).catch(() => null),
-    getUpdatePolicy(),
+    policy.apk_download_url
+      ? probeApkDownload(policy.apk_download_url)
+      : Promise.resolve(null),
   ]);
 
   const web = (webRaw ?? {}) as Record<string, unknown>;
@@ -168,9 +213,10 @@ export const getVersionStatus = async (): Promise<VersionStatus> => {
       ? {
           version: str(ota.version) as string,
           minNativeVersion: str(ota.minNativeVersion),
-          publishedAt: str(ota.publishedAt),
-        }
+                  publishedAt: str(ota.publishedAt),
+      }
       : null,
+    apkDownload,
     policy,
   };
 

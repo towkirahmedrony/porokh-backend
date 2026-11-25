@@ -66,14 +66,47 @@ const MESSAGE_COLUMNS =
 
 const DUPLICATE_WINDOW_MS = 2 * 60 * 1000;
 
+/**
+ * Every admin action on a ticket is recorded. Best-effort: a failed audit
+ * write must not undo a reply the student has already been notified about.
+ */
+const writeSupportAuditLog = async (
+  adminId: string,
+  action: string,
+  ticketId: string,
+  details: Record<string, unknown>
+): Promise<void> => {
+  try {
+    const { error } = await admin.from('audit_logs').insert({
+      user_id: adminId,
+      action,
+      target_table: 'support_tickets',
+      target_id: ticketId,
+      details,
+    });
+    if (error) console.error('[support] audit log failed:', error.message);
+  } catch (error) {
+    console.error('[support] audit log failed:', error);
+  }
+};
+
+const ALLOWED_ATTACHMENT_MIME = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+/**
+ * Attachments are written by the server after validating the upload. This is a
+ * second, read-side guard so a manually edited row can never push a non-https
+ * URL or a non-image into the admin's `<img>` tags.
+ */
 const normalizeAttachments = (value: unknown): SupportAttachment[] =>
   Array.isArray(value)
-    ? value.filter(
-        (item): item is SupportAttachment =>
-          Boolean(item) &&
-          typeof item === 'object' &&
-          typeof (item as SupportAttachment).url === 'string'
-      )
+    ? value.filter((item): item is SupportAttachment => {
+        if (!item || typeof item !== 'object') return false;
+        const attachment = item as SupportAttachment;
+        if (typeof attachment.url !== 'string') return false;
+        if (!attachment.url.startsWith('https://')) return false;
+        if (!ALLOWED_ATTACHMENT_MIME.has(attachment.mime_type)) return false;
+        return Number.isFinite(attachment.size) && attachment.size > 0;
+      })
     : [];
 
 const normalizeMessages = (
@@ -290,7 +323,11 @@ export const listStudentTickets = async (
     .select(TICKET_COLUMNS, { count: 'exact' })
     .eq('user_id', userId);
 
-  if (query.status) request = request.eq('status', query.status);
+  if (query.statuses && query.statuses.length > 0) {
+    request = request.in('status', query.statuses);
+  } else if (query.status) {
+    request = request.eq('status', query.status);
+  }
   if (query.category) request = request.eq('category', query.category);
 
   if (query.search) {
@@ -448,12 +485,51 @@ export const listAllTickets = async (
 
   if (error) throw new Error(error.message);
 
+  const items = ((data ?? []) as SupportTicketSummary[]).map(normalizeTicket);
+
   return {
-    items: ((data ?? []) as SupportTicketSummary[]).map(normalizeTicket),
+    items: await attachLastMessageRoles(items),
     total: count ?? 0,
     limit: query.limit,
     offset: query.offset,
   };
+};
+
+/**
+ * One extra query per page, so the admin inbox can mark "student is waiting"
+ * without loading every message thread.
+ */
+const attachLastMessageRoles = async (
+  items: SupportTicketSummary[]
+): Promise<SupportTicketSummary[]> => {
+  if (items.length === 0) return items;
+
+  const { data, error } = await admin
+    .from('support_ticket_messages')
+    .select('ticket_id,author_role,created_at')
+    .in(
+      'ticket_id',
+      items.map((item) => item.id)
+    )
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error('[support] last message lookup failed:', error.message);
+    return items;
+  }
+
+  const latest = new Map<string, 'student' | 'staff'>();
+  for (const row of (data ?? []) as Array<{
+    ticket_id: string;
+    author_role: 'student' | 'staff';
+  }>) {
+    if (!latest.has(row.ticket_id)) latest.set(row.ticket_id, row.author_role);
+  }
+
+  return items.map((item) => ({
+    ...item,
+    last_message_author_role: latest.get(item.id) ?? null,
+  }));
 };
 
 export const getAdminTicketDetail = async (
@@ -492,6 +568,13 @@ export const addAdminReply = async (
       : {}),
   });
 
+  await writeSupportAuditLog(adminId, 'SUPPORT_REPLY', ticketId, {
+    ticket_ref: existing.ticket_ref,
+    message_id: message.id,
+    status_from: existing.status,
+    status_to: nextStatus,
+  });
+
   void notifyStudentOfReply(updated, message.id);
 
   return {
@@ -517,6 +600,12 @@ export const setTicketStatus = async (
   const updated = await updateTicket(ticketId, {
     status,
     ...applyStatusTimestamps(status, adminId),
+  });
+
+  await writeSupportAuditLog(adminId, 'SUPPORT_STATUS', ticketId, {
+    ticket_ref: ticket.ticket_ref,
+    status_from: ticket.status,
+    status_to: status,
   });
 
   void notifyStudentOfStatus(updated, status);

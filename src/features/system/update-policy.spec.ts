@@ -75,6 +75,34 @@ test('a malformed OTA version is rejected', () => {
   );
 });
 
+test('a minimum version above the latest version is rejected', () => {
+  assert.throws(
+    () =>
+      validateUpdatePolicy({
+        min_native_version: '1.6.0',
+        latest_native_version: '1.5.0',
+      }),
+    /Minimum APK version/
+  );
+
+  assert.throws(
+    () =>
+      validateUpdatePolicy({
+        min_ota_version: '1.6.0',
+        latest_ota_version: '1.5.0-ota.production-android.r000042.nv1.5.0.db2',
+      }),
+    /Minimum OTA version/
+  );
+
+  assert.equal(
+    validateUpdatePolicy({
+      min_native_version: '1.5.0',
+      latest_native_version: '1.5.0',
+    }).min_native_version,
+    '1.5.0'
+  );
+});
+
 test('unknown fields are rejected instead of silently stored', () => {
   const result = updatePolicySchema.safeParse({ ...base, secret_token: 'x' });
   assert.equal(result.success, false);

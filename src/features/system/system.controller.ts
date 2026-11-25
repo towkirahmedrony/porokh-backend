@@ -8,6 +8,7 @@ import { supabase } from '../../config/supabase';
 import {
   UPDATE_POLICY_KEY,
   UpdatePolicyValidationError,
+  compareVersions,
   validateUpdatePolicy,
 } from './update-policy';
 
@@ -95,6 +96,23 @@ export const updateAppConfig = catchAsync(async (req: Request, res: Response) =>
   if (key === UPDATE_POLICY_KEY) {
     try {
       const policy = validateUpdatePolicy(valuePayload.value);
+
+      /**
+       * A floor above the released build would lock out every device. The
+       * released semver is fetched best-effort; if the fetch fails the write is
+       * not blocked, but min > declared latest is always rejected by the schema.
+       */
+      const released = await SystemService.getReleasedNativeVersion();
+      if (
+        released &&
+        policy.min_native_version !== '' &&
+        compareVersions(policy.min_native_version, released) > 0
+      ) {
+        throw new UpdatePolicyValidationError(
+          `Minimum APK version ${policy.min_native_version} is higher than the released build ${released}`
+        );
+      }
+
       const config = await SystemService.upsertAppConfig(key, { value: policy });
       await SystemService.createAuditLog(req.user!.id, 'UPDATE', 'app_configs', key, policy);
       return sendResponse(res, { statusCode: 200, success: true, message: 'Update policy saved', data: config });

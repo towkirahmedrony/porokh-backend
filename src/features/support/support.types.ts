@@ -75,6 +75,8 @@ export interface SupportStudentSummary {
 export interface SupportTicketSummary extends SupportTicketRecord {
   student?: SupportStudentSummary | null;
   assignee?: { full_name: string | null; username: string | null } | null;
+  /** Author of the newest message, used for the admin "needs reply" marker. */
+  last_message_author_role?: SupportAuthorRole | null;
 }
 
 export interface SupportTicketDetail {

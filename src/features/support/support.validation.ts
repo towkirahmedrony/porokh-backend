@@ -123,12 +123,31 @@ const listBase = {
   search: z.string().trim().regex(SEARCH_PATTERN, 'Invalid search text').optional(),
 };
 
-const studentListSchema = z.object(listBase);
+/**
+ * The student app groups its chips, so one filter can name several statuses,
+ * e.g. `statuses=open,in_progress,awaiting_student`.
+ */
+const statusListValue = z
+  .string()
+  .trim()
+  .transform((value) => value.split(',').map((part) => part.trim()))
+  .refine(
+    (values) =>
+      values.length > 0 &&
+      values.every((value) => (SUPPORT_STATUSES as readonly string[]).includes(value)),
+    'Invalid status filter'
+  );
+
+const studentListSchema = z.object({
+  ...listBase,
+  statuses: statusListValue.optional(),
+});
 
 export interface SupportListQuery {
   limit: number;
   offset: number;
   status?: SupportStatus;
+  statuses?: SupportStatus[];
   category?: SupportCategory;
   priority?: SupportPriority;
   assignedTo?: string;
@@ -145,6 +164,7 @@ export const parseSupportListQuery = (query: unknown): SupportListQuery => {
     limit: queryString(source.limit),
     offset: queryString(source.offset),
     status: queryString(source.status) || undefined,
+    statuses: queryString(source.statuses) || undefined,
     category: queryString(source.category) || undefined,
     search: queryString(source.search) || undefined,
   });
@@ -153,6 +173,7 @@ export const parseSupportListQuery = (query: unknown): SupportListQuery => {
     limit: parsed.limit ?? 20,
     offset: parsed.offset ?? 0,
     status: parsed.status,
+    statuses: parsed.statuses as SupportStatus[] | undefined,
     category: parsed.category,
     search: parsed.search,
   };
