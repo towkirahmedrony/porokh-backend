@@ -5,7 +5,7 @@ import { ExamUserService } from './exams.user.service';
 import { ExamAttemptError, ExamAttemptService } from './exam.attempt.service';
 import { measureSubmissionPhaseSync } from './examSubmissionPerformance';
 import { ExamPracticeService } from './exam.practice.service';
-import { incrementStreakOnExamSubmit } from '../growth/streak.service';
+import { recordStudyActivity } from '../growth/streak.service';
 import { awardGroupXpToActiveGroups } from '../groups/groups.xp';
 import logger from '../../lib/utils/logger';
 
@@ -235,15 +235,16 @@ export const submitExam = catchAsync(async (req: Request, res: Response) => {
     user_id: userId,
   }, req.submissionPerformance);
 
-  // A duplicate submission is not a new study event and must not extend the
-  // user's streak. The result is already persisted at this point, so a streak
-  // failure must never turn a successful submission into a 500: it is logged
-  // (without tokens or answer data) and the saved result is returned.
+  // A duplicate submission is not a new study event and must not earn the
+  // day's first-session reward twice. The result is already persisted at this
+  // point, so a failure here must never turn a successful submission into a
+  // 500: it is logged (without tokens or answer data) and the saved result is
+  // returned. The streak itself is derived by the database from exam_history.
   if (!(result as any)?.duplicate) {
-    // Streak/XP side effects are not part of the submission result. Run them
-    // after the response path so a first study session of the day (which may
-    // perform several writes) never delays the student's result.
-    void incrementStreakOnExamSubmit(userId).catch((streakError) => {
+    // Daily activity/XP side effects are not part of the submission result.
+    // Run them after the response path so a first study session of the day
+    // (which may perform several writes) never delays the student's result.
+    void recordStudyActivity(userId).catch((streakError) => {
       console.error('[exam:streak] failed to update streak after a saved result', {
         userId,
         message: streakError instanceof Error ? streakError.message : 'unknown error',

@@ -1,7 +1,5 @@
 import app from './app';
 import { initNotificationCron } from './jobs/notification.job';
-import cron from 'node-cron'; // 👈 node-cron ইম্পোর্ট করা হলো
-import { processDailyStreaks, resetMonthlyFreezes } from './jobs/streak.job'; // 👈 streak.job ইম্পোর্ট করা হলো
 // 👇 নতুন: এম্বেডিং ওয়ার্কার ইম্পোর্ট করা হলো
 import { startEmbeddingWorker } from './jobs/embedding.worker';
 import { startExamAttemptSweeper } from './jobs/exam.sweeper.job';
@@ -70,10 +68,11 @@ async function bootstrap() {
     // ==========================================
     startEmbeddingWorker();
 
-    // ==========================================
-    // 🌟 Streak System Cron Jobs 🌟
-    // ==========================================
-    
+    // Streak and freeze maintenance is owned by the database (the daily
+    // apply_daily_streak_freezes + refresh_all_streaks pg_cron job), so there is
+    // no in-process streak job here: two writers would fight over the same
+    // counters.
+
     // ==========================================
     // 🌟 Exam attempt expiry sweeper 🌟
     // ==========================================
@@ -85,24 +84,6 @@ async function bootstrap() {
     // 🌟 Group competition maintenance 🌟
     // ==========================================
     initGroupCron();
-
-    // প্রতিদিন রাত ১২:০১ মিনিটে স্ট্রিক প্রসেস হবে
-    cron.schedule('1 0 * * *', () => {
-      console.log('⏳ Running daily streak processing cron job...');
-      // Never let a rejected job body become an unhandled rejection that stops
-      // the process; the job logs its own failures.
-      Promise.resolve(processDailyStreaks()).catch((error) => {
-        console.error('Daily streak job failed:', error);
-      });
-    });
-
-    // প্রতি মাসের ১ তারিখ রাত ১২:০৫ মিনিটে ফ্রিজ রিসেট হবে
-    cron.schedule('5 0 1 * *', () => {
-      console.log('⏳ Running monthly freeze reset cron job...');
-      Promise.resolve(resetMonthlyFreezes()).catch((error) => {
-        console.error('Monthly freeze reset job failed:', error);
-      });
-    });
 
     // ---------------------------------------------------------------
     // Process safety
