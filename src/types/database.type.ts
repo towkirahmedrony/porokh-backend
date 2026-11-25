@@ -2413,6 +2413,7 @@ export type Database = {
           account_status: Database["public"]["Enums"]["user_status"] | null
           achievements: Json | null
           address: Json | null
+          admission_targets: string[]
           auto_purge_at: string | null
           avatar_url: string | null
           batch_year: string | null
@@ -2432,6 +2433,8 @@ export type Database = {
           gender: string | null
           group: string | null
           guardian_phone: string | null
+          hsc_batch: string | null
+          hsc_group: string | null
           id: string
           institution: string | null
           institution_id: string | null
@@ -2442,6 +2445,7 @@ export type Database = {
           last_active_at: string | null
           last_streak_reset_at: string | null
           mastery: Json | null
+          other_admission_target: string | null
           phone_number: string | null
           pvp_matches_played: number | null
           pvp_matches_won: number | null
@@ -2461,6 +2465,7 @@ export type Database = {
           account_status?: Database["public"]["Enums"]["user_status"] | null
           achievements?: Json | null
           address?: Json | null
+          admission_targets?: string[]
           auto_purge_at?: string | null
           avatar_url?: string | null
           batch_year?: string | null
@@ -2480,6 +2485,8 @@ export type Database = {
           gender?: string | null
           group?: string | null
           guardian_phone?: string | null
+          hsc_batch?: string | null
+          hsc_group?: string | null
           id: string
           institution?: string | null
           institution_id?: string | null
@@ -2490,6 +2497,7 @@ export type Database = {
           last_active_at?: string | null
           last_streak_reset_at?: string | null
           mastery?: Json | null
+          other_admission_target?: string | null
           phone_number?: string | null
           pvp_matches_played?: number | null
           pvp_matches_won?: number | null
@@ -2509,6 +2517,7 @@ export type Database = {
           account_status?: Database["public"]["Enums"]["user_status"] | null
           achievements?: Json | null
           address?: Json | null
+          admission_targets?: string[]
           auto_purge_at?: string | null
           avatar_url?: string | null
           batch_year?: string | null
@@ -2528,6 +2537,8 @@ export type Database = {
           gender?: string | null
           group?: string | null
           guardian_phone?: string | null
+          hsc_batch?: string | null
+          hsc_group?: string | null
           id?: string
           institution?: string | null
           institution_id?: string | null
@@ -2538,6 +2549,7 @@ export type Database = {
           last_active_at?: string | null
           last_streak_reset_at?: string | null
           mastery?: Json | null
+          other_admission_target?: string | null
           phone_number?: string | null
           pvp_matches_played?: number | null
           pvp_matches_won?: number | null

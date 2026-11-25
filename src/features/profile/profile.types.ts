@@ -14,6 +14,10 @@ export interface UserProfile {
   group?: string;
   education_board?: string;
   batch_year?: string;
+  hsc_batch?: string;
+  hsc_group?: string;
+  admission_targets?: string[];
+  other_admission_target?: string | null;
   guardian_phone?: string;
   study_goal?: string;
   language_preference?: string;
@@ -39,6 +43,10 @@ export interface UpdateProfileDto {
   group?: string;
   education_board?: string;
   batch_year?: string;
+  hsc_batch?: string;
+  hsc_group?: string;
+  admission_targets?: string[];
+  other_admission_target?: string | null;
   guardian_phone?: string;
   study_goal?: string;
   language_preference?: string;

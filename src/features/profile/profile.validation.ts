@@ -20,6 +20,10 @@ export const PROFILE_SELF_EDITABLE_FIELDS = [
   'group',
   'education_board',
   'batch_year',
+  'hsc_batch',
+  'hsc_group',
+  'admission_targets',
+  'other_admission_target',
   'guardian_phone',
   'study_goal',
   'language_preference',
@@ -123,6 +127,29 @@ const profileFields = {
   group: nullableText(50),
   education_board: nullableText(100),
   batch_year: nullableText(20),
+  hsc_batch: z
+    .union([z.literal(''), z.string().trim().regex(/^[0-9]{4}$/, 'HSC batch must be a four-digit year'), z.null()])
+    .optional(),
+  hsc_group: z
+    .union([z.literal(''), z.enum(['science', 'humanities', 'business_studies']), z.null()])
+    .optional(),
+  admission_targets: z
+    .array(
+      z.enum([
+        'university',
+        'engineering',
+        'medical',
+        'dental',
+        'agricultural',
+        'general_university',
+        'national_university',
+        'other',
+      ])
+    )
+    .max(8, 'Too many admission targets')
+    .transform((values) => Array.from(new Set(values)))
+    .optional(),
+  other_admission_target: nullableText(100),
   guardian_phone: nullablePhone,
   study_goal: nullableText(200),
   language_preference: z.enum(['bn', 'en'], {
