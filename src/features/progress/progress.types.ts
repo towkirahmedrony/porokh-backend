@@ -1,50 +1,53 @@
-export interface MetricData {
-  averageScore: number;
-  totalExams: number;
-  streak: number;
-  globalRank: string | number;
+import type {
+  ProgressActivityDay,
+  ProgressMentor,
+  ProgressSubjectStat,
+  ProgressTrendPoint,
+  ProgressWeakTopic,
+} from './progress.metrics';
+
+export interface ProgressUser {
+  name: string | null;
+  avatar_url: string | null;
+  class_label: string | null;
+  total_xp: number;
 }
 
-export interface ChartData {
-  name: string;
-  score: number;
+export interface ProgressLevelSummary {
+  id: number;
+  name_bn: string;
+  name_en: string;
+  min_xp: number;
+  max_xp: number | null;
+  next_min_xp: number | null;
 }
 
-export interface RadarData {
-  subject: string;
-  A: number;
-  fullMark: number;
-}
-
-export interface HeatmapData {
-  cal_date: string;
+export interface ProgressSummary {
+  accuracy_pct: number | null;
+  average_score_pct: number | null;
   exams_taken: number;
-}
-
-export interface WeaknessData {
-  topic: string;
-  subject: string;
-  errorRate: string;
-}
-
-export interface SubjectReportData {
-  subject: string;
-  score: number;
+  practice_sessions: number;
+  streak_days: number;
+  longest_streak_days: number;
   correct: number;
   wrong: number;
   skipped: number;
+  responses: number;
 }
 
 export interface ProgressDashboardResponse {
-  user: {
-    name: string;
-    batch: string;
+  user: ProgressUser;
+  level: ProgressLevelSummary | null;
+  summary: ProgressSummary;
+  activity: {
+    window_days: number;
+    days: ProgressActivityDay[];
   };
-  metrics: MetricData;
-  performanceChart: ChartData[];
-  skillMapping: RadarData[];
-  activityHeatmap: HeatmapData[];
-  weaknesses: WeaknessData[];
-  focusTopic: string;
-  subjectReport: SubjectReportData[];
+  performance: ProgressTrendPoint[];
+  subjects: ProgressSubjectStat[];
+  weaknesses: ProgressWeakTopic[];
+  mentor: ProgressMentor;
+  mistakes: {
+    available: number;
+  };
 }
