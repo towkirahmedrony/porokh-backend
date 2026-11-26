@@ -598,6 +598,97 @@ export class ExamPracticeService {
       now: Date.now(),
     });
   }
+  /**
+   * Practice the Mistakes or Bookmarks pool the student filtered in the history
+   * screen. The pool, its count and the random pick come from the same SQL
+   * definition as the list, so the sheet's "N questions" is exact. Quota, XP and
+   * leaderboard rules stay in insertPracticeAttempt, unchanged.
+   */
+  static async startExplorerPractice(
+    userId: string,
+    source: 'mistakes' | 'bookmarks',
+    filters: Record<string, unknown>,
+    requestedCount: unknown,
+    confirmReduced = false
+  ): Promise<PracticeStartResult> {
+    if (!userId) throw new ExamAttemptError('Unauthorized', 401);
+
+    const count = Number(requestedCount);
+
+    if (!Number.isInteger(count) || count < 1 || count > MAX_PRACTICE_QUESTIONS) {
+      throw new ExamAttemptError('Practice question count must be between 1 and 100', 400, {
+        code: 'INVALID_PRACTICE_REQUEST',
+      });
+    }
+
+    const normalizedSource = source === 'bookmarks' ? 'bookmarks' : 'mistakes';
+    const rpcFilters = filters && typeof filters === 'object' ? filters : {};
+
+    const { data: countData, error: countError } = await supabase.rpc(
+      'count_mistake_bookmark_questions',
+      { p_user_id: userId, p_source: normalizedSource, p_filters: rpcFilters }
+    );
+
+    if (countError) mapPracticeRpcError(countError, 'explorer_pool');
+
+    const available = Math.max(0, Number(countData ?? 0) || 0);
+
+    if (available === 0) {
+      return emptyResult(
+        PRACTICE_MODES.WRONG_GLOBAL,
+        null,
+        { available: 0, unavailable: 0, total: 0, requested: count },
+        'empty'
+      );
+    }
+
+    if (count > available && !confirmReduced) {
+      return emptyResult(
+        PRACTICE_MODES.WRONG_GLOBAL,
+        null,
+        { available, unavailable: 0, total: available, requested: count },
+        'confirm_reduced'
+      );
+    }
+
+    const target = Math.min(count, available);
+    const { data, error } = await supabase.rpc('pick_mistake_bookmark_questions', {
+      p_user_id: userId,
+      p_source: normalizedSource,
+      p_filters: rpcFilters,
+      p_count: target,
+    });
+
+    if (error) mapPracticeRpcError(error, 'explorer_pool');
+
+    const questionIds = normalizeQuestionIds(
+      (Array.isArray(data) ? data : []).map((row: AnyObject) => row.question_id)
+    );
+
+    if (questionIds.length === 0) {
+      return emptyResult(
+        PRACTICE_MODES.WRONG_GLOBAL,
+        null,
+        { available, unavailable: 0, total: available, requested: count },
+        'empty'
+      );
+    }
+
+    return insertPracticeAttempt({
+      userId,
+      mode: PRACTICE_MODES.WRONG_GLOBAL,
+      sourceHistoryId: null,
+      questionIds,
+      counts: {
+        available: questionIds.length,
+        unavailable: 0,
+        total: available,
+        requested: count,
+      },
+      now: Date.now(),
+    });
+  }
+
   static async answerPracticeQuestion(
     userId: string,
     attemptId: unknown,

@@ -319,7 +319,7 @@ const sanitizeReviewQuestion = (
   };
 };
 
-const loadReviewQuestions = async (
+export const loadReviewQuestions = async (
   questionIds: string[]
 ): Promise<Map<string, AnyObject>> => {
   const result = new Map<string, AnyObject>();
