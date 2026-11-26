@@ -18,6 +18,8 @@ test('directory query defaults are safe and bounded', () => {
   assert.equal(query.status, 'all');
   assert.equal(query.access, 'all');
   assert.equal(query.role, 'all');
+  assert.equal(query.batch, 'all');
+  assert.equal(query.goal, 'all');
   assert.equal(query.sort, 'created_at');
   assert.equal(query.direction, 'desc');
   assert.equal(query.q, '');
@@ -34,6 +36,15 @@ test('directory query rejects unknown filter values', () => {
   assert.throws(() => parseDirectoryQuery({ role: 'owner' }), /role/);
   assert.throws(() => parseDirectoryQuery({ sort: 'coin_balance' }), /sort/);
   assert.throws(() => parseDirectoryQuery({ direction: 'sideways' }), /direction/);
+  assert.throws(() => parseDirectoryQuery({ batch: '26' }), /batch/);
+  assert.throws(() => parseDirectoryQuery({ goal: 'doctor' }), /goal/);
+});
+
+test('directory accepts a batch year and a known goal as filters', () => {
+  const query = parseDirectoryQuery({ batch: '2026', goal: 'varsity' });
+
+  assert.equal(query.batch, '2026');
+  assert.equal(query.goal, 'varsity');
 });
 
 test('directory search rejects PostgREST filter syntax', () => {

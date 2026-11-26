@@ -147,7 +147,7 @@ const getTicketById = async (
   const { data, error } = await admin
     .from('support_tickets')
     .select(
-      `${TICKET_COLUMNS}, student:profiles!support_tickets_user_id_fkey(full_name,username,email,class_level,avatar_url), assignee:profiles!support_tickets_assigned_to_fkey(full_name,username)`
+      `${TICKET_COLUMNS}, student:profiles!support_tickets_user_id_fkey(full_name,username,email,hsc_batch,study_goal,avatar_url), assignee:profiles!support_tickets_assigned_to_fkey(full_name,username)`
     )
     .eq('id', ticketId)
     .maybeSingle();
@@ -448,7 +448,7 @@ export const listAllTickets = async (
   let request = admin
     .from('support_tickets')
     .select(
-      `${TICKET_COLUMNS}, student:profiles!support_tickets_user_id_fkey(full_name,username,email,class_level), assignee:profiles!support_tickets_assigned_to_fkey(full_name,username)`,
+      `${TICKET_COLUMNS}, student:profiles!support_tickets_user_id_fkey(full_name,username,email,hsc_batch,study_goal), assignee:profiles!support_tickets_assigned_to_fkey(full_name,username)`,
       { count: 'exact' }
     );
 

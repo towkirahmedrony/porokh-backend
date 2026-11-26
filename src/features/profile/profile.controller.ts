@@ -10,8 +10,23 @@ export const getMyProfile = catchAsync(async (req: Request, res: Response) => {
 
 export const updateProfile = catchAsync(async (req: Request, res: Response) => {
   // UpdateProfileDto এর ডাটাগুলো req.body থেকে পাস হচ্ছে
-  const updated = await ProfileService.updateProfile(req.user!.id, req.body);
+  const accessToken = (req as any).accessToken;
+  const updated = await ProfileService.updateProfile(req.user!.id, req.body, accessToken);
   sendResponse(res, 200, true, 'Profile updated successfully', updated);
+});
+
+export const getMyStage = catchAsync(async (req: Request, res: Response) => {
+  const stage = await ProfileService.getMyStage((req as any).accessToken);
+  sendResponse(res, 200, true, 'Stage retrieved', stage);
+});
+
+export const updateGoal = catchAsync(async (req: Request, res: Response) => {
+  const stage = await ProfileService.setGoal(
+    req.user!.id,
+    (req as any).accessToken,
+    req.body?.goal
+  );
+  sendResponse(res, 200, true, 'Goal updated', stage);
 });
 
 export const updateThemePreference = catchAsync(async (req: Request, res: Response) => {

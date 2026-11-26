@@ -1,3 +1,22 @@
+/** The only study goals the platform understands. `hsc` is the pre-exam default. */
+export const STUDY_GOALS = ['hsc', 'medical', 'engineering', 'varsity'] as const;
+
+export type StudyGoal = (typeof STUDY_GOALS)[number];
+
+export type StudyStage = 'studying' | 'post_hsc' | 'admission_prep';
+
+/**
+ * Answer of `get_my_stage()`. Every field is computed by Postgres from the
+ * caller's profile and server time, so no client can derive a different stage.
+ */
+export interface StageResponse {
+  stage: StudyStage;
+  batch_year: string | null;
+  goal: StudyGoal | null;
+  needs_goal_gate: boolean;
+  exam_ended: boolean;
+}
+
 export interface UserProfile {
   id: string;
   username: string;
@@ -10,16 +29,15 @@ export interface UserProfile {
   date_of_birth?: string;
   institution?: string;
   institution_id?: string;
-  class_level?: string;
   group?: string;
   education_board?: string;
-  batch_year?: string;
   hsc_batch?: string;
   hsc_group?: string;
   admission_targets?: string[];
   other_admission_target?: string | null;
   guardian_phone?: string;
-  study_goal?: string;
+  study_goal?: StudyGoal | null;
+  goal_confirmed_at?: string | null;
   language_preference?: string;
   address?: Record<string, any>;
   total_xp: number;
@@ -39,16 +57,14 @@ export interface UpdateProfileDto {
   date_of_birth?: string;
   institution?: string;
   institution_id?: string;
-  class_level?: string;
   group?: string;
   education_board?: string;
-  batch_year?: string;
   hsc_batch?: string;
   hsc_group?: string;
   admission_targets?: string[];
   other_admission_target?: string | null;
   guardian_phone?: string;
-  study_goal?: string;
+  study_goal?: StudyGoal;
   language_preference?: string;
   address?: Record<string, any>;
 }

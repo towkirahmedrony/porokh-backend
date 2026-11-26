@@ -211,7 +211,7 @@ export const getProgressDashboardData = async (
   const [profileResult, history] = await Promise.all([
     supabase
       .from('profiles')
-      .select('full_name, username, avatar_url, class_level, hsc_batch, batch_year, total_xp')
+      .select('full_name, username, avatar_url, hsc_batch, study_goal, total_xp')
       .eq('id', userId)
       .maybeSingle(),
     loadHistory(userId),
@@ -250,10 +250,9 @@ export const getProgressDashboardData = async (
     now: Date.now(),
   });
 
-  const classLabel =
-    toText(profile?.class_level) ??
-    toText(profile?.hsc_batch) ??
-    toText(profile?.batch_year);
+  // `class_label` keeps its name for every client already reading it, but the
+  // value is the canonical batch year and nothing else.
+  const classLabel = toText(profile?.hsc_batch);
 
   return {
     user: {

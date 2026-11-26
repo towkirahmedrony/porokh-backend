@@ -1,4 +1,5 @@
 import type { Database } from '../../types/database.type';
+import type { StudyStage } from '../profile/profile.types';
 
 export type UserProfile = Database['public']['Tables']['profiles']['Row'];
 export type Device = Database['public']['Tables']['user_devices']['Row'];
@@ -28,6 +29,10 @@ export interface DirectoryQuery {
   status: AccountStatus | 'all';
   access: AccessFilter;
   role: string | 'all';
+  /** Batch year filter, or 'all'. */
+  batch: string;
+  /** Study goal filter, or 'all'. */
+  goal: string;
   created_from?: string;
   created_to?: string;
   sort: DirectorySort;
@@ -52,7 +57,9 @@ export interface DirectoryRow {
   phone_number: string | null;
   account_status: string | null;
   role: string;
-  class_level: string | null;
+  hsc_batch: string | null;
+  study_goal: string | null;
+  stage: StudyStage;
   institution: string | null;
   created_at: string | null;
   last_active_at: string | null;
@@ -72,6 +79,8 @@ export interface DirectoryResult {
 
 export interface User360Response {
   profile: UserProfile;
+  /** Server-computed stage for this student, same rule as get_my_stage(). */
+  stage: StudyStage;
   role: string;
   access: {
     tier: string;

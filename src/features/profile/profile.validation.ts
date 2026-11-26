@@ -1,4 +1,10 @@
 import { z } from 'zod';
+import {
+  STUDY_GOALS,
+  type StageResponse,
+  type StudyGoal,
+  type StudyStage,
+} from './profile.types';
 
 /**
  * Fields an ordinary authenticated user may edit on their own profile.
@@ -16,10 +22,8 @@ export const PROFILE_SELF_EDITABLE_FIELDS = [
   'date_of_birth',
   'institution',
   'institution_id',
-  'class_level',
   'group',
   'education_board',
-  'batch_year',
   'hsc_batch',
   'hsc_group',
   'admission_targets',
@@ -36,13 +40,95 @@ export const ADMIN_PROFILE_EDITABLE_FIELDS = [
 ] as const;
 
 export class ProfileValidationError extends Error {
-  status = 400;
+  status: number;
 
-  constructor(message: string) {
+  constructor(message: string, status = 400) {
     super(message);
     this.name = 'ProfileValidationError';
+    this.status = status;
   }
 }
+
+const STUDY_STAGES: readonly StudyStage[] = ['studying', 'post_hsc', 'admission_prep'];
+
+const isStudyGoal = (value: string): value is StudyGoal =>
+  (STUDY_GOALS as readonly string[]).includes(value);
+
+/**
+ * A goal write is a commitment, so only the four known values pass and `hsc`
+ * is refused once the server says the HSC exam is over. Allowing it would let
+ * a student keep an exam track the platform no longer offers.
+ */
+export const parseStudyGoal = (
+  value: unknown,
+  options: { allowHsc?: boolean } = {}
+): StudyGoal => {
+  if (typeof value !== 'string') {
+    throw new ProfileValidationError('Goal is required');
+  }
+
+  const goal = value.trim().toLowerCase();
+
+  if (!isStudyGoal(goal)) {
+    throw new ProfileValidationError(
+      `Goal must be one of ${STUDY_GOALS.join(', ')}`
+    );
+  }
+
+  if (options.allowHsc === false && goal === 'hsc') {
+    throw new ProfileValidationError(
+      'HSC preparation is no longer available as a goal after the exam',
+      409
+    );
+  }
+
+  return goal;
+};
+
+/** Batch years are four digits starting with 20: 2026 yes, 26 and 1999 no. */
+export const parseHscBatch = (value: unknown): string => {
+  if (typeof value !== 'string') {
+    throw new ProfileValidationError('HSC batch is required');
+  }
+
+  const batch = value.trim();
+
+  if (!/^20[0-9]{2}$/.test(batch)) {
+    throw new ProfileValidationError('HSC batch must be a four-digit year');
+  }
+
+  return batch;
+};
+
+/** Rejects a stage payload that is not exactly the five fields the RPC returns. */
+export const parseStageResponse = (value: unknown): StageResponse => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ProfileValidationError('Stage response was invalid', 502);
+  }
+
+  const raw = value as Record<string, unknown>;
+  const stage = raw.stage;
+  const goal = raw.goal;
+
+  if (
+    typeof stage !== 'string' ||
+    !(STUDY_STAGES as readonly string[]).includes(stage) ||
+    typeof raw.needs_goal_gate !== 'boolean' ||
+    typeof raw.exam_ended !== 'boolean' ||
+    (raw.batch_year !== null && typeof raw.batch_year !== 'string') ||
+    (goal !== null && (typeof goal !== 'string' || !isStudyGoal(goal)))
+  ) {
+    throw new ProfileValidationError('Stage response was invalid', 502);
+  }
+
+  return {
+    stage: stage as StudyStage,
+    batch_year: (raw.batch_year as string | null) ?? null,
+    goal: (goal as StudyGoal | null) ?? null,
+    needs_goal_gate: raw.needs_goal_gate,
+    exam_ended: raw.exam_ended,
+  };
+};
 
 const PHONE_PATTERN = /^\+?[0-9][0-9\s-]{5,19}$/;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -123,12 +209,14 @@ const profileFields = {
     .optional(),
   institution: nullableText(200),
   institution_id: nullableText(100),
-  class_level: nullableText(50),
   group: nullableText(50),
   education_board: nullableText(100),
-  batch_year: nullableText(20),
   hsc_batch: z
-    .union([z.literal(''), z.string().trim().regex(/^[0-9]{4}$/, 'HSC batch must be a four-digit year'), z.null()])
+    .union([
+      z.literal(''),
+      z.string().trim().regex(/^20[0-9]{2}$/, 'HSC batch must be a four-digit year'),
+      z.null(),
+    ])
     .optional(),
   hsc_group: z
     .union([z.literal(''), z.enum(['science', 'humanities', 'business_studies']), z.null()])
@@ -151,7 +239,9 @@ const profileFields = {
     .optional(),
   other_admission_target: nullableText(100),
   guardian_phone: nullablePhone,
-  study_goal: nullableText(200),
+  study_goal: z
+    .union([z.enum(STUDY_GOALS), z.literal(''), z.null()])
+    .optional(),
   language_preference: z.enum(['bn', 'en'], {
     errorMap: () => ({ message: "Language preference must be either 'bn' or 'en'" }),
   }).optional(),

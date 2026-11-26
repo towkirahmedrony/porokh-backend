@@ -12,6 +12,7 @@ import authRoutes from './features/auth/auth.routes';
 import profileRoutes from './features/profile/profile.routes'; 
 import adminProfileRoutes from './features/profile/profile.admin.routes';
 import usersAdminRoutes from './features/users/users.admin.routes';
+import hscBatchesAdminRoutes from './features/hsc-batches/hscBatches.admin.routes';
 import contentRoutes from './features/content/content.routes'; 
 import communityAdminRoutes from './features/community/community.admin.routes';
 import communityUserRoutes from './features/community/community.user.routes';
@@ -121,6 +122,9 @@ import phoneVerifyRoutes from './modules/phone-verify/phone-verify.routes';
 app.use('/api/v1/phone', phoneVerifyRoutes);
 app.use('/api/v1/auth', authRoutes); 
 app.use('/api/v1/profiles', profileRoutes);
+// The student app was specified with the singular path, older clients use the
+// plural one. Both reach the same router so neither name can rot.
+app.use('/api/v1/profile', profileRoutes);
 
 // An installed APK that declares itself below the enforced minimum may not use
 // the student APIs. Auth, profiles and /system stay reachable so it can sign in
@@ -215,6 +219,7 @@ app.use('/api/v1/app-builder', appBuilderRoutes);
 // Admin & Management Routes
 app.use('/api/v1/admin/profile', adminProfileRoutes);
 app.use('/api/v1/admin/users', usersAdminRoutes);
+app.use('/api/v1/admin/hsc-batches', hscBatchesAdminRoutes);
 app.use('/api/v1/admin/groups', groupAdminRoutes);
 app.use('/api/v1/admin/access', accessRoutes.adminAccess);
 

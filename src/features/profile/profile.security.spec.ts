@@ -120,7 +120,9 @@ test('editable profile fields are allowed and sensitive fields are dropped', () 
   const payload = buildProfileUpdatePayload({
     full_name: '  New Name  ',
     bio: 'Hello',
+    hsc_batch: '2027',
     class_level: 'HSC',
+    batch_year: '2027',
     total_xp: 999999,
     coin_balance: 999999,
     subscription_status: 'premium',
@@ -133,10 +135,12 @@ test('editable profile fields are allowed and sensitive fields are dropped', () 
     user_id: 'user-2',
   });
 
+  // The legacy batch columns are accepted by an old client and then dropped:
+  // hsc_batch is the only batch field that reaches the row.
   assert.deepEqual(payload, {
     full_name: 'New Name',
     bio: 'Hello',
-    class_level: 'HSC',
+    hsc_batch: '2027',
   });
 });
 

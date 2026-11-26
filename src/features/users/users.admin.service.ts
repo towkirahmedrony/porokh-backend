@@ -2,6 +2,8 @@ import { supabase } from '../../config/supabase';
 import { createUserSupabaseClient } from '../../config/userSupabase';
 import { recordAdminAudit } from '../../lib/utils/adminAudit';
 import { isUuid } from '../../lib/utils/search';
+import { dhakaDayKey } from '../../lib/utils/time';
+import { computeStage } from '../../lib/utils/stage';
 import { evaluateAccountRisk, type RiskAuditRow, type RiskDeviceRow } from './users.risk';
 import {
   UsersAdminError,
@@ -24,7 +26,7 @@ interface GrantRow {
 }
 
 const DIRECTORY_COLUMNS =
-  'id, full_name, email, username, phone_number, account_status, subscription_status, class_level, institution, created_at, last_active_at, total_xp, coin_balance, current_streak';
+  'id, full_name, email, username, phone_number, account_status, subscription_status, hsc_batch, study_goal, goal_confirmed_at, institution, created_at, last_active_at, total_xp, coin_balance, current_streak';
 
 const GRANT_COLUMNS = 'id, user_id, scope, grant_type, features, starts_at, expires_at, revoked_at';
 
@@ -152,6 +154,26 @@ const EMPTY_RESULT = (query: DirectoryQuery): DirectoryResult => ({
 });
 
 /**
+ * Batch year to exam end date. A batch with no row, or a failed read, means
+ * "exam not finished", which is the safe direction: an admin screen never
+ * claims an exam is over because a table was unreachable.
+ */
+const readExamEndDates = async (): Promise<Map<string, string | null>> => {
+  const { data, error } = await supabase
+    .from('hsc_batches')
+    .select('batch_year, exam_end_date');
+
+  if (error) {
+    console.error('[users] batch dates unavailable:', error.message);
+    return new Map();
+  }
+
+  return new Map(
+    (data ?? []).map((row: any) => [String(row.batch_year), row.exam_end_date ?? null])
+  );
+};
+
+/**
  * Paginated, filtered and sorted user directory.
  *
  * Filtering happens in Postgres through PostgREST; the page's roles and grants
@@ -191,6 +213,9 @@ export const listUsers = async (query: DirectoryQuery): Promise<DirectoryResult>
   let queryBuilder = supabase.from('profiles').select(DIRECTORY_COLUMNS, { count: 'exact' });
 
   if (query.status !== 'all') queryBuilder = queryBuilder.eq('account_status', query.status);
+
+  if (query.batch !== 'all') queryBuilder = queryBuilder.eq('hsc_batch', query.batch);
+  if (query.goal !== 'all') queryBuilder = queryBuilder.eq('study_goal', query.goal);
 
   if (query.access === 'premium') {
     // Matches the access overview's definition of a premium user: an active
@@ -298,6 +323,11 @@ export const listUsers = async (query: DirectoryQuery): Promise<DirectoryResult>
     globalGrants = [...globalPremium, ...globalUnlimited];
   }
 
+  // One read of the batch table is enough to put a stage on every row; the
+  // stage rule itself stays in one place (lib/utils/stage.ts).
+  const examEndByBatch = await readExamEndDates();
+  const today = dhakaDayKey(new Date());
+
   const items: DirectoryRow[] = profiles.map((profile) => ({
     id: String(profile.id),
     full_name: profile.full_name ?? null,
@@ -306,7 +336,16 @@ export const listUsers = async (query: DirectoryQuery): Promise<DirectoryResult>
     phone_number: profile.phone_number ?? null,
     account_status: profile.account_status ?? null,
     role: rolesById.get(String(profile.id)) ?? 'student',
-    class_level: profile.class_level ?? null,
+    hsc_batch: profile.hsc_batch ?? null,
+    study_goal: profile.study_goal ?? null,
+    stage: computeStage(
+      {
+        study_goal: profile.study_goal ?? null,
+        goal_confirmed_at: profile.goal_confirmed_at ?? null,
+        exam_end_date: profile.hsc_batch ? examEndByBatch.get(profile.hsc_batch) ?? null : null,
+      },
+      today
+    ),
     institution: profile.institution ?? null,
     created_at: profile.created_at ?? null,
     last_active_at: profile.last_active_at ?? null,
@@ -477,8 +516,22 @@ export const getUser360Profile = async (userId: string): Promise<User360Response
     riskAuditRows
   );
 
+  const profileRow = profile as any;
+  const examEndByBatch = profileRow?.hsc_batch ? await readExamEndDates() : new Map();
+  const stage = computeStage(
+    {
+      study_goal: profileRow?.study_goal ?? null,
+      goal_confirmed_at: profileRow?.goal_confirmed_at ?? null,
+      exam_end_date: profileRow?.hsc_batch
+        ? examEndByBatch.get(profileRow.hsc_batch) ?? null
+        : null,
+    },
+    dhakaDayKey(new Date())
+  );
+
   return {
     profile: profile as User360Response['profile'],
+    stage,
     role: (roleResult.data as any)?.role ?? 'student',
     access: ((accessResult.data as any)?.access ?? {
       tier: 'free',

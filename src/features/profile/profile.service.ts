@@ -1,12 +1,24 @@
 import { supabase } from '../../config/supabase';
 import { supabaseAdmin } from '../../config/supabaseAdmin';
+import { createUserSupabaseClient } from '../../config/userSupabase';
 import { localizeRecord, parseLanguage } from '../../lib/utils/language';
 import { DHAKA_UTC_OFFSET_MS, dhakaDayKey, startOfDhakaDay } from '../../lib/utils/time';
-import { ActivityPoint, PlayerStats, UserProfile, VersusStats } from './profile.types';
+import {
+  ActivityPoint,
+  PlayerStats,
+  StageResponse,
+  StudyGoal,
+  UserProfile,
+  VersusStats,
+} from './profile.types';
 import { notifyXpAndProgression } from '../notifications/notifications.service';
 import {
   buildProfileUpdatePayload,
+  parseHscBatch,
+  parseStageResponse,
+  parseStudyGoal,
   parseThemePreference,
+  ProfileValidationError,
 } from './profile.validation';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -37,7 +49,71 @@ export class ProfileService {
     return sanitizeProfileRecord(data) as UserProfile;
   }
 
-  static async updateProfile(userId: string, data: unknown) {
+  /**
+   * Stage of the caller, read through their own JWT so `auth.uid()` inside the
+   * RPC is the student and not the service role.
+   */
+  static async getMyStage(accessToken: string | undefined): Promise<StageResponse> {
+    if (!accessToken) {
+      throw new ProfileValidationError('Session unavailable', 401);
+    }
+
+    const { data, error } = await createUserSupabaseClient(accessToken).rpc('get_my_stage');
+
+    if (error) {
+      const unauthenticated = (error as { code?: string }).code === '28000';
+      throw new ProfileValidationError(
+        unauthenticated ? 'Session unavailable' : 'Stage is temporarily unavailable',
+        unauthenticated ? 401 : 503
+      );
+    }
+
+    return parseStageResponse(data);
+  }
+
+  /**
+   * Records an explicit goal. This is the only write that confirms a goal, and
+   * it refuses `hsc` once the server says the HSC exam is over.
+   */
+  static async setGoal(
+    userId: string,
+    accessToken: string | undefined,
+    goal: unknown
+  ): Promise<StageResponse> {
+    if (!userId) throw new ProfileValidationError('Unauthorized', 401);
+
+    const current = await ProfileService.getMyStage(accessToken);
+    const next: StudyGoal = parseStudyGoal(goal, {
+      allowHsc: current.stage !== 'post_hsc',
+    });
+
+    const { error } = await supabaseAdmin
+      .from('profiles')
+      .update({ study_goal: next, goal_confirmed_at: new Date().toISOString() })
+      .eq('id', userId);
+
+    if (error) throw new Error(error.message);
+
+    return ProfileService.getMyStage(accessToken);
+  }
+
+  /** A batch a student can belong to is a batch the admin has created. */
+  private static async assertBatchExists(batch: string): Promise<void> {
+    const { data, error } = await supabase
+      .from('hsc_batches')
+      .select('batch_year')
+      .eq('batch_year', batch)
+      .maybeSingle();
+
+    if (error) throw new ProfileValidationError('HSC batch could not be verified', 503);
+    if (!data) throw new ProfileValidationError('Unknown HSC batch');
+  }
+
+  static async updateProfile(
+    userId: string,
+    data: unknown,
+    accessToken?: string
+  ) {
     if (!userId) throw new Error('Unauthorized');
 
     // Build an explicit allowlisted payload; never pass req.body to Supabase.
@@ -47,16 +123,34 @@ export class ProfileService {
       throw new Error('No editable profile fields supplied');
     }
 
+    if (safeUpdate.hsc_batch !== undefined && safeUpdate.hsc_batch !== null) {
+      await ProfileService.assertBatchExists(parseHscBatch(safeUpdate.hsc_batch));
+    }
+
+    // A goal change through the generic profile update is still a goal write,
+    // so it gets the same confirmation stamp and the same post-exam rule.
+    if ('study_goal' in safeUpdate) {
+      if (safeUpdate.study_goal === null) {
+        safeUpdate.goal_confirmed_at = null;
+      } else {
+        const current = await ProfileService.getMyStage(accessToken);
+        safeUpdate.study_goal = parseStudyGoal(safeUpdate.study_goal, {
+          allowHsc: current.stage !== 'post_hsc',
+        });
+        safeUpdate.goal_confirmed_at = new Date().toISOString();
+      }
+    }
+
     // আগের প্রোফাইল চেক করা হচ্ছে এক্সপি রিওয়ার্ডের জন্য
-    const { data: oldProfile } = await supabase.from('profiles').select('avatar_url, institution, class_level').eq('id', userId).single();
+    const { data: oldProfile } = await supabase.from('profiles').select('avatar_url, institution, hsc_batch').eq('id', userId).single();
     
     const { data: updated, error } = await supabase.from('profiles').update(safeUpdate).eq('id', userId).select().single();
     if (error) throw new Error(error.message);
 
     // প্রোফাইল ১০০% সম্পন্ন হলে XP দেওয়ার লজিক
     if (oldProfile && updated) {
-      const wasIncomplete = !oldProfile.avatar_url || !oldProfile.institution || !oldProfile.class_level;
-      const isNowComplete = updated.avatar_url && updated.institution && updated.class_level;
+      const wasIncomplete = !oldProfile.avatar_url || !oldProfile.institution || !oldProfile.hsc_batch;
+      const isNowComplete = updated.avatar_url && updated.institution && updated.hsc_batch;
 
       if (wasIncomplete && isNowComplete) {
         const { data: configData } = await supabaseAdmin.from('app_configs').select('value').eq('key', 'xp_rules').maybeSingle();
@@ -105,7 +199,7 @@ export class ProfileService {
   }
 
   static async getPublicProfile(identifier: string) {
-    let query = supabase.from('profiles').select('id, username, full_name, avatar_url, bio, total_xp, pvp_rating, current_streak, batch_year, institution, class_level');
+    let query = supabase.from('profiles').select('id, username, full_name, avatar_url, bio, total_xp, pvp_rating, current_streak, hsc_batch, study_goal, institution');
 
     if (isUuid(identifier)) query = query.eq('id', identifier);
     else query = query.eq('username', identifier);

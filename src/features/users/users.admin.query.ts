@@ -9,6 +9,7 @@ import {
   type DirectorySort,
 } from './users.admin.types';
 import { CANONICAL_ROLES, isCanonicalRole } from '../../middlewares/authorization';
+import { STUDY_GOALS } from '../profile/profile.types';
 import { SearchInputError, normalizeSearchTerm } from '../../lib/utils/search';
 
 export const DEFAULT_PAGE_SIZE = 20;
@@ -62,6 +63,16 @@ export const parseDirectoryQuery = (raw: Record<string, unknown>): DirectoryQuer
     throw new UsersAdminError(`role must be one of ${['all', ...CANONICAL_ROLES].join(', ')}`);
   }
 
+  const batch = asString(raw.batch) || 'all';
+  if (batch !== 'all' && !/^20[0-9]{2}$/.test(batch)) {
+    throw new UsersAdminError('batch must be a four-digit year or all');
+  }
+
+  const goal = asString(raw.goal) || 'all';
+  if (goal !== 'all' && !(STUDY_GOALS as readonly string[]).includes(goal)) {
+    throw new UsersAdminError(`goal must be one of ${['all', ...STUDY_GOALS].join(', ')}`);
+  }
+
   const sort = (asString(raw.sort) || 'created_at') as DirectorySort;
   if (!(DIRECTORY_SORTS as readonly string[]).includes(sort)) {
     throw new UsersAdminError(`sort must be one of ${DIRECTORY_SORTS.join(', ')}`);
@@ -93,6 +104,8 @@ export const parseDirectoryQuery = (raw: Record<string, unknown>): DirectoryQuer
     status: status as AccountStatus | 'all',
     access,
     role,
+    batch,
+    goal,
     created_from: createdFrom,
     created_to: createdTo,
     sort,

@@ -68,7 +68,8 @@ export interface SupportStudentSummary {
   full_name: string | null;
   username: string | null;
   email: string | null;
-  class_level?: string | null;
+  hsc_batch?: string | null;
+  study_goal?: string | null;
   avatar_url?: string | null;
 }
 
