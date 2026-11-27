@@ -27,6 +27,8 @@ export interface QuestionBankFilters {
   preparation_category?: string;
   /** Internal id scope resolved from the preparation junction table. */
   question_ids?: string[];
+  /** Tracks a question must carry at least one of. Empty or absent means no constraint. */
+  track_ids?: string[];
 }
 
 export interface QuestionBankStats {
@@ -58,6 +60,17 @@ const hasMedia = (q: any) => !!q.media_id || !!q.explanation_media_id;
 
 const QUESTION_BANK_SELECT = `
   id, body, options, explanation, difficulty_level, type, status, created_at, updated_at, subject_id, chapter_id, topic_id, tags, media_id, explanation_media_id, source_type, exam_references, is_active, confidence_score
+`;
+
+/**
+ * Same columns plus the track join used by the level filter.
+ *
+ * Written out rather than concatenated: the generated Database types parse this
+ * string at compile time, and a template literal narrows to `string`, which the
+ * parser rejects.
+ */
+const QUESTION_BANK_SELECT_WITH_TRACKS = `
+  id, body, options, explanation, difficulty_level, type, status, created_at, updated_at, subject_id, chapter_id, topic_id, tags, media_id, explanation_media_id, source_type, exam_references, is_active, confidence_score, question_preparation_tracks!inner(track_id)
 `;
 
 const STATUS_KEYS: Array<keyof Pick<QuestionBankStats, 'published' | 'approved' | 'pending' | 'review' | 'draft' | 'archived' | 'deleted' | 'rejected' | 'flagged'>> = [
@@ -428,7 +441,28 @@ export const getFilteredQuestions = async (filters: QuestionBankFilters, page: n
     filters = { ...filters, question_ids: preparationIds };
   }
 
-  let query = supabase.from('questions').select(QUESTION_BANK_SELECT, { count: 'exact' });
+  // A track filter has to be an embedded join: resolving 3400+ question ids and
+  // sending them as an `in` list would overflow the request URL.
+  const trackIds = (filters.track_ids ?? []).filter(Boolean);
+  const needsTrackJoin = trackIds.length > 0;
+
+  // `query` is untyped on purpose. The generated Database type has no
+  // questions -> question_preparation_tracks relationship, so the type parser
+  // rejects the joined column list even though PostgREST accepts it. Typing the
+  // builder as any here keeps the filter server-side; the rows it returns are
+  // still validated by the mapper further down.
+  let query: any = supabase
+    .from('questions')
+    .select(needsTrackJoin ? QUESTION_BANK_SELECT_WITH_TRACKS : QUESTION_BANK_SELECT, {
+      count: 'exact',
+    });
+
+  if (needsTrackJoin) {
+    query =
+      trackIds.length === 1
+        ? query.eq('question_preparation_tracks.track_id', trackIds[0])
+        : query.in('question_preparation_tracks.track_id', trackIds);
+  }
 
   // 🚀 1. Institution Dynamic Resolving & JSONB Filtering
   if (filters.institution_id && filters.institution_id !== 'all') {

@@ -3,6 +3,8 @@ import * as contentService from './content.service';
 import * as questionService from './question.service';
 import * as questionImportService from './question.import.service';
 import * as questionVerificationService from './question-verification.service';
+import * as questionLevelService from './question.level.service';
+import { resolveLevelFilter } from './question.level.controller';
 import catchAsync from '../../lib/utils/catchAsync';
 import sendResponse from '../../lib/utils/response';
 import { AuditFilterParams } from './content.types';
@@ -200,7 +202,12 @@ export const updateQuestionVerification = catchAsync(async (req: AuthReq, res: R
 export const getQuestionsBank = catchAsync(async (req: Request, res: Response) => {
   const page = parseInt(req.query.page as string) || 1;
   const limit = parseInt(req.query.limit as string) || 20;
-  
+
+  // A track pins the level with it, so the two filters are resolved together and
+  // a contradictory pair is rejected instead of silently narrowing the list.
+  const levelFilter = resolveLevelFilter(req.query);
+  const attentionIds = await questionLevelService.resolveAttentionQuestionIds(levelFilter);
+
   const filters = {
     subject_id: req.query.subject_id as string,
     chapter_id: req.query.chapter_id as string,
@@ -213,6 +220,8 @@ export const getQuestionsBank = catchAsync(async (req: Request, res: Response) =
     institution_id: req.query.institution_id as string,
     year: req.query.year as string,
     preparation_category: req.query.preparation_category as string,
+    track_ids: levelFilter.tracks,
+    ...(attentionIds !== null ? { question_ids: attentionIds } : {}),
   };
 
   const result = await questionService.getFilteredQuestions(filters, page, limit);
