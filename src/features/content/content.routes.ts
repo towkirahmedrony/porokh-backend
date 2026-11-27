@@ -3,6 +3,7 @@ import * as contentController from './content.controller';
 import { parseQuestionTextHandler } from './question.textparse.controller';
 import { importQuestionTextHandler } from './question.textimport.controller';
 import * as institutionController from './institution.controller';
+import * as questionLevelController from './question.level.controller';
 import * as institutionService from './institution.service';
 import { requireAuth } from '../../middlewares/requireAuth';
 import { rbacGuard } from '../../middlewares/rbacGuard';
@@ -49,6 +50,13 @@ router.patch('/questions/:id/verifications/:stage', rbacGuard(['admin', 'moderat
 // Question Bank Routes
 // ==========================================
 router.get('/questions', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.QUESTIONS_REVIEW), contentController.getQuestionsBank);
+
+// Level and track. The level is derived from the tracks, so these routes are the
+// only place an admin can override it, and every write is audit-logged.
+router.get('/questions/level-report', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.QUESTIONS_REVIEW), questionLevelController.getQuestionLevelReport);
+router.get('/questions/:id/tracks', rbacGuard(['admin', 'moderator']), requirePermission(PERMISSIONS.QUESTIONS_REVIEW), questionLevelController.getQuestionTracks);
+router.put('/questions/:id/tracks', rbacGuard(['admin']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), questionLevelController.updateQuestionTracks);
+router.post('/questions/tracks/bulk', rbacGuard(['admin']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), questionLevelController.bulkUpdateQuestionTracks);
 router.delete('/questions/:id/hard', rbacGuard(['admin']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), contentController.hardDeleteQuestion);
 
 router.post('/questions', rbacGuard(['admin', 'editor', 'teacher']), requirePermission(PERMISSIONS.QUESTIONS_MANAGE), contentController.createQuestion);
