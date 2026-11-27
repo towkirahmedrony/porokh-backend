@@ -47,6 +47,55 @@ export const CONFLICT_BUCKETS: readonly AttentionBucket[] = [
 
 export type QuestionLevel = 'hsc' | 'admission';
 
+/** Level as an admin list row shows it at a glance. */
+export type QuestionLevelSummaryValue = 'hsc' | 'admission' | 'both' | 'none';
+
+export interface QuestionLevelSummary {
+  track_ids: string[];
+  level: QuestionLevelSummaryValue;
+}
+
+/**
+ * Reads the `question_preparation_tracks` left join into the two fields the
+ * admin list shows.
+ *
+ * The join is a left join, so an untagged question still returns its row with a
+ * null embed. That case is `none` on purpose: those are the rows a human has to
+ * look at, and hiding them would hide the work. HSC alone is HSC, any admission
+ * track alone is admission, and both together is `both`, which the database
+ * also treats as admission level.
+ */
+export const summarizeQuestionTracks = (raw: unknown): QuestionLevelSummary => {
+  const rows = Array.isArray(raw) ? raw : [];
+  const trackIds = Array.from(
+    new Set(
+      rows
+        .map((row) =>
+          typeof row === 'string'
+            ? row
+            : (row as { track_id?: unknown } | null)?.track_id
+        )
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    )
+  );
+
+  const hasHsc = trackIds.includes('hsc');
+  const hasAdmission = trackIds.some((id) =>
+    ADMISSION_TRACK_IDS.includes(id as PreparationTrackId)
+  );
+
+  const level: QuestionLevelSummaryValue =
+    hasHsc && hasAdmission
+      ? 'both'
+      : hasAdmission
+        ? 'admission'
+        : hasHsc
+          ? 'hsc'
+          : 'none';
+
+  return { track_ids: trackIds, level };
+};
+
 const TRACK_ALIASES: Record<string, PreparationTrackId | 'untracked' | 'conflicting'> = {
   hsc: 'hsc',
   varsity: 'varsity',

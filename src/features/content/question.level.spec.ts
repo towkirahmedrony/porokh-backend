@@ -7,6 +7,7 @@ import {
   conflictingTracks,
   levelOfTrack,
   parseLevelFilter,
+  summarizeQuestionTracks,
 } from './question.level';
 
 test('no filter constrains nothing', () => {
@@ -107,4 +108,38 @@ test('a university reference with no admission tag is reported', () => {
 test('a manual admission tag without any reference is reported', () => {
   assert.deepEqual(conflictingTracks(['varsity'], false), ['varsity']);
   assert.deepEqual(conflictingTracks(['hsc', 'admission'], false), ['admission']);
+});
+
+test('an untagged question still reaches the list and reads as untagged', () => {
+  // A left join returns [] for a question with no track row. That row must not
+  // be filtered out: it is exactly the one an admin has to tag.
+  assert.deepEqual(summarizeQuestionTracks([]), { track_ids: [], level: 'none' });
+  assert.deepEqual(summarizeQuestionTracks(null), { track_ids: [], level: 'none' });
+});
+
+test('the row level is derived from the tracks the join returned', () => {
+  assert.deepEqual(summarizeQuestionTracks([{ track_id: 'hsc' }]), {
+    track_ids: ['hsc'],
+    level: 'hsc',
+  });
+  assert.equal(summarizeQuestionTracks([{ track_id: 'varsity' }]).level, 'admission');
+  assert.equal(summarizeQuestionTracks([{ track_id: 'engineering' }]).level, 'admission');
+  // The documented dual placement reads as both, and the database still counts
+  // it as admission level.
+  assert.equal(
+    summarizeQuestionTracks([{ track_id: 'hsc' }, { track_id: 'medical' }]).level,
+    'both'
+  );
+});
+
+test('the join is deduplicated before it is reported', () => {
+  const summary = summarizeQuestionTracks([
+    { track_id: 'hsc' },
+    { track_id: 'hsc' },
+    { track_id: null },
+    { track_id: 7 },
+  ]);
+
+  assert.deepEqual(summary.track_ids, ['hsc']);
+  assert.equal(summary.level, 'hsc');
 });
