@@ -12,6 +12,7 @@ import {
   setPreparationCategories,
   type PreparationCategoryAssignment,
 } from './question.preparation.service';
+import { summarizeQuestionTracks } from './question.level';
 
 export interface QuestionBankFilters {
   subject_id?: string;
@@ -58,8 +59,12 @@ const hasExplanation = (q: any) => !!q.explanation;
 const hasCorrectAnswer = (q: any) => !!q.options?.some((o: any) => o.is_correct);
 const hasMedia = (q: any) => !!q.media_id || !!q.explanation_media_id;
 
+// The track embed on the base list is a LEFT join (no `!inner`), so a question
+// with no preparation track still reaches the list with a null embed instead of
+// disappearing. Only the track *filter* needs the inner join below, because a
+// filter on a left-joined embed does not constrain the parent rows.
 const QUESTION_BANK_SELECT = `
-  id, body, options, explanation, difficulty_level, type, status, created_at, updated_at, subject_id, chapter_id, topic_id, tags, media_id, explanation_media_id, source_type, exam_references, is_active, confidence_score
+  id, body, options, explanation, difficulty_level, type, status, created_at, updated_at, subject_id, chapter_id, topic_id, tags, media_id, explanation_media_id, source_type, exam_references, is_active, confidence_score, question_preparation_tracks(track_id)
 `;
 
 /**
@@ -539,7 +544,18 @@ export const getFilteredQuestions = async (filters: QuestionBankFilters, page: n
   const total = count || 0;
   const totalPages = Math.max(1, Math.ceil(total / safeLimit));
   const stats = await buildQuestionBankStats(filters, rows, total);
-  const withPreparation = await attachPreparationCategories(rows);
+
+  // The level chip is derived from the join the query already returned. The
+  // raw join is dropped so the row contract stays the question, not PostgREST
+  // plumbing.
+  const withLevels = rows.map((row) => {
+    const { question_preparation_tracks, ...question } = row as typeof row & {
+      question_preparation_tracks?: unknown;
+    };
+    return { ...question, ...summarizeQuestionTracks(question_preparation_tracks) };
+  });
+
+  const withPreparation = await attachPreparationCategories(withLevels);
 
   return {
     data: withPreparation,
