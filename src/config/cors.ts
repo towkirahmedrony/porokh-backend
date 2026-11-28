@@ -22,6 +22,14 @@ export const FIREBASE_HOSTING_ORIGINS = [
   'https://parapoth-studio.web.app',
 ] as const;
 
+/**
+ * The public marketing site (porokh-website). It reads
+ * `GET /api/v1/releases/latest` from the browser to render the APK download
+ * section, so its origin has to pass the preflight. A custom domain belongs in
+ * CLIENT_URL rather than here.
+ */
+export const MARKETING_ORIGINS = ['https://proshno-nu.vercel.app'] as const;
+
 /** Local tooling only: these must never widen the production allowlist. */
 export const LOCAL_DEV_ORIGINS = [
   'http://localhost:5173',
@@ -61,6 +69,7 @@ export const buildAllowedOrigins = ({
   const origins = [
     ...CAPACITOR_ORIGINS,
     ...FIREBASE_HOSTING_ORIGINS,
+    ...MARKETING_ORIGINS,
     ...parseClientUrls(clientUrl),
   ];
 

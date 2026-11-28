@@ -56,6 +56,13 @@ import { contactRoutes } from './features/contact/contact.routes';
 import reportRoutes from './features/reports/reports.routes'; 
 import { accessRoutes } from './features/access/access.routes';
 
+// Android APK distribution (public download + admin publish/delete)
+import {
+  publicReleaseRoutes,
+  adminReleaseRoutes,
+} from './features/releases/releases.routes';
+import { APK_MIME_TYPE } from './features/releases/releases.constants';
+
 // অ্যাপ-বিল্ডার রাউট ইম্পোর্ট (system থেকে মুভ করা কনফিগারেশনের জন্য)
 import appBuilderRoutes from './features/app-builder/app-builder.routes';
 
@@ -98,6 +105,16 @@ app.use(
 app.use(
   ['/api/v1/support', '/api/v1/admin/support'],
   express.json({ limit: '12mb' })
+);
+// The APK is uploaded as the raw request body, not multipart: there is exactly
+// one file and no fields, so a single buffer avoids a parser dependency. The
+// ceiling mirrors the Storage bucket limit; the service validates the bytes.
+app.use(
+  '/api/v1/admin/releases/apk',
+  express.raw({
+    type: [APK_MIME_TYPE, 'application/octet-stream'],
+    limit: '100mb',
+  })
 );
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -212,6 +229,10 @@ app.use('/api/v1/growth', growthRoutes);
 app.use('/api/v1/referral', referralRoutes); 
 app.use('/api/v1/contact', contactRoutes);
 app.use('/api/v1/me/access', accessRoutes.userAccess);
+
+// 📦 Android APK: public "latest" metadata and the admin publish/delete API
+app.use('/api/v1/releases', publicReleaseRoutes);
+app.use('/api/v1/admin/releases', adminReleaseRoutes);
 
 // 🛠️ App Builder (configs, home-grids, daily_quote fix)
 app.use('/api/v1/app-builder', appBuilderRoutes);
