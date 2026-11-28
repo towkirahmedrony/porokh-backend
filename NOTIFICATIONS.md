@@ -54,9 +54,10 @@ inactive. Nothing fires it; do not wire it to a guess.
 2. `premium_granted` / `premium_purchased` bypass the cap and the gap.
 3. Category toggles (`notification_preferences`) and `push_enabled` deny a push;
    the in-app row already exists.
-4. Quiet hours (default 23:00–07:00, user timezone): denied with
-   `retry_after = next quiet_end`. The dispatcher defers, or drops the row when
-   `expires_at <= retry_after`.
+4. Quiet hours are no longer a product rule. `can_send_push` still returns a
+   `quiet_hours` denial and the `quiet_start` / `quiet_end` columns remain, but
+   the dispatcher ignores that reason and always sends. Do not defer on it
+   again unless the UI offers the window.
 5. At most 2 accepted pushes per Asia/Dhaka day, counted from
    `notification_push_log` (distinct notifications, not devices).
 6. At least 3 hours between two pushes.

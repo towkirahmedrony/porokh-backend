@@ -209,6 +209,13 @@ const dispatchOne = async (
     return 'deferred';
   }
 
+  // Quiet hours are no longer a product rule. The client no longer offers a
+  // window, so honouring this denial would defer every push overnight for a
+  // preference nobody can see or change. The columns stay in the schema.
+  if (!decision.allowed && decision.reason === 'quiet_hours') {
+    decision = { allowed: true, reason: 'quiet_hours_ignored', retryAfter: null };
+  }
+
   if (!decision.allowed) {
     if (isTerminalDenial(decision.reason)) {
       await closeRow(row.id, {
