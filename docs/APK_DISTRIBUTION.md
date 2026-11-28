@@ -66,7 +66,7 @@ left whole and the caller gets `502`.
 
 | Secret | Value |
 |---|---|
-| `SUPABASE_URL` | `https://<project-ref>.supabase.co` |
+| `SUPABASE_URL` | `https://<project-ref>.supabase.co` (falls back to `VITE_SUPABASE_URL`, which already holds the same URL) |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service-role key (server-side only) |
 
 Without them the publish step fails with an explicit `::error::` naming the
